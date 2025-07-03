@@ -1,4 +1,3 @@
-# Language-Guided-Endoscopy-Localization
 # Stage the changes for commit
 git add .
 
