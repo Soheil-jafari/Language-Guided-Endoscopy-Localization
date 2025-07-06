@@ -14,12 +14,6 @@ This repository contains the official PyTorch implementation for the research pa
 
 Traditional video analysis models are limited to a predefined list of event classes. Our framework breaks this limitation by learning the deep semantic relationship between visual data and text. It can localize events based on free-form text queries (e.g., "a polyp being removed by a snare") and, crucially, provides visual explanations for its predictions, addressing the critical need for trust and transparency in clinical AI.
 
-<p align="center">
-  <img src="https://i.imgur.com/k2xJ5YF.png" alt="Architectural Diagram" width="800"/>
-  <br>
-  <em>High-level overview of the multi-stage architecture.</em>
-</p>
-
 
 ## ✨ Key Features
 
