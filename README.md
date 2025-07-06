@@ -98,12 +98,7 @@ If you find this work useful in your research, please consider citing our paper:
 
 @article{jafari2025query,
   title={Query, Localize, Explain: A Language-Guided Framework for Open-Set Event Localization in Medical Video},
-  author={Jafari, Soheil and [Your Supervisor's Name]},
+  author={Jafari, Soheil and Dr. Zhuangzhuang Dai},
   journal={arXiv preprint arXiv:25XX.XXXXX},
   year={2025}
 }
-
-🙏 Acknowledgements
-This research was supported by [Your University/Funding Body]. We would like to thank [Any other acknowledgements].
-
-</markdown>
