@@ -1,6 +1,5 @@
 # train.py
-# The professional-grade training script for the Language-Guided Localization Framework.
-# Includes training and validation loops, accuracy metrics, and robust checkpointing.
+# CORRECTED VERSION: This script now works with batches of video clips.
 
 import os
 
@@ -13,10 +12,11 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 import numpy as np
+import argparse
 
 import config
 from models import LocalizationFramework
-from dataset import create_dataloaders
+from dataset import create_dataloaders  # This will now use the clip-based dataset
 
 
 class DualObjectiveLoss(nn.Module):
@@ -26,12 +26,13 @@ class DualObjectiveLoss(nn.Module):
         self.temporal_weight = temporal_weight
 
     def forward(self, refined_scores, raw_scores, ground_truth_relevance):
-        primary_loss = self.relevance_loss(refined_scores.squeeze(-1), ground_truth_relevance)
+        # refined_scores and ground_truth_relevance are now [B, T]
+        primary_loss = self.relevance_loss(refined_scores, ground_truth_relevance)
 
         temporal_loss = 0.0
         if self.temporal_weight > 0 and refined_scores.shape[1] > 1:
-            scores_t = refined_scores[:, 1:, :]
-            scores_t_minus_1 = refined_scores[:, :-1, :]
+            scores_t = refined_scores[:, 1:]
+            scores_t_minus_1 = refined_scores[:, :-1]
             temporal_loss = torch.mean(torch.abs(scores_t - scores_t_minus_1))
 
         total_loss = primary_loss + (self.temporal_weight * temporal_loss)
@@ -41,17 +42,24 @@ class DualObjectiveLoss(nn.Module):
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
-    progress_bar = tqdm(dataloader, desc="Training", unit="batch")
+    progress_bar = tqdm(dataloader, desc="Training", unit="batch", leave=False)
 
-    for batch in progress_bar:
-        frames, input_ids, attention_mask, relevance = [b.to(device) for b in batch]
-        # Our dataset creates single frames, but model expects clips. We unsqueeze to add a time dimension of 1.
-        frames = frames.unsqueeze(1)  # [B, 1, C, H, W]
-        relevance = relevance.unsqueeze(1)  # [B, 1]
+    for video_clip, input_ids, attention_mask, relevance in progress_bar:
+        # Move all tensors to the GPU
+        video_clip, input_ids, attention_mask, relevance = video_clip.to(device), input_ids.to(
+            device), attention_mask.to(device), relevance.to(device)
 
         optimizer.zero_grad()
-        raw_scores, refined_scores = model(frames, input_ids, attention_mask)
-        loss, _, _ = criterion(refined_scores, raw_scores, relevance)
+
+        # The model now directly accepts the video clip
+        raw_scores, refined_scores = model(video_clip, input_ids, attention_mask)
+
+        # Squeeze the last dimension of scores to match relevance shape [B, T]
+        loss, _, _ = criterion(refined_scores.squeeze(-1), raw_scores.squeeze(-1), relevance)
+
+        if isinstance(loss, torch.Tensor) and loss.numel() > 1:
+            loss = loss.mean()
+
         loss.backward()
         optimizer.step()
 
@@ -63,26 +71,25 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
 
 def validate_one_epoch(model, dataloader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    all_preds = []
-    all_labels = []
-    progress_bar = tqdm(dataloader, desc="Validating", unit="batch")
+    running_loss, all_preds, all_labels = 0.0, [], []
+    progress_bar = tqdm(dataloader, desc="Validating", unit="batch", leave=False)
 
     with torch.no_grad():
-        for batch in progress_bar:
-            frames, input_ids, attention_mask, relevance = [b.to(device) for b in batch]
-            frames = frames.unsqueeze(1)
-            relevance = relevance.unsqueeze(1)
+        for video_clip, input_ids, attention_mask, relevance in progress_bar:
+            video_clip, input_ids, attention_mask, relevance = video_clip.to(device), input_ids.to(
+                device), attention_mask.to(device), relevance.to(device)
 
-            raw_scores, refined_scores = model(frames, input_ids, attention_mask)
-            loss, _, _ = criterion(refined_scores, raw_scores, relevance)
+            raw_scores, refined_scores = model(video_clip, input_ids, attention_mask)
+            loss, _, _ = criterion(refined_scores.squeeze(-1), raw_scores.squeeze(-1), relevance)
+
+            if isinstance(loss, torch.Tensor) and loss.numel() > 1:
+                loss = loss.mean()
 
             running_loss += loss.item()
 
-            # For accuracy calculation
             preds = torch.sigmoid(refined_scores.squeeze(-1)) > 0.5
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(relevance.cpu().numpy())
+            all_preds.extend(preds.flatten().cpu().numpy())
+            all_labels.extend(relevance.flatten().cpu().numpy())
 
     avg_loss = running_loss / len(dataloader)
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
@@ -90,26 +97,41 @@ def validate_one_epoch(model, dataloader, criterion, device):
     return avg_loss, accuracy
 
 
-def main():
+def main(args):
+    # (This main function logic remains largely the same)
     print("--- Starting Training Pipeline ---")
     device = torch.device(config.DEVICE)
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
 
-    print("Initializing model...")
     model = LocalizationFramework().to(device)
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
 
-    print("Creating dataloaders...")
-    train_loader, val_loader = create_dataloaders(config.TRIPLETS_CSV_PATH)
+    if args.debug:
+        print("--- RUNNING IN DEBUG MODE ---")
+        train_csv = config.TRAIN_TRIPLETS_CSV_PATH.replace(".csv", "_DEBUG.csv")
+        val_csv = config.VAL_TRIPLETS_CSV_PATH.replace(".csv", "_DEBUG.csv")
+        epochs = 1
+    else:
+        train_csv = config.TRAIN_TRIPLETS_CSV_PATH
+        val_csv = config.VAL_TRIPLETS_CSV_PATH
+        epochs = config.EPOCHS
 
-    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
+    train_loader, val_loader = create_dataloaders(
+        train_csv_path=train_csv,
+        val_csv_path=val_csv,
+        clip_length=config.CLIP_LENGTH  # Pass clip length from config
+    )
+
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config.LEARNING_RATE)
     criterion = DualObjectiveLoss()
 
     best_val_loss = float('inf')
     print("\n--- Beginning Training and Validation Epochs ---")
 
-    for epoch in range(config.EPOCHS):
-        print(f"\n===== Epoch {epoch + 1}/{config.EPOCHS} =====")
-
+    for epoch in range(epochs):
+        print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_accuracy = validate_one_epoch(model, val_loader, criterion, device)
 
@@ -118,23 +140,22 @@ def main():
         print(f"\tValidation Loss: {val_loss:.4f}")
         print(f"\tValidation Accuracy: {val_accuracy:.4f} ({val_accuracy:.2%})")
 
-        # --- Checkpointing ---
-        # Save a checkpoint after every epoch
-        checkpoint_path = os.path.join(config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}.pth")
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"\tCheckpoint saved to {checkpoint_path}")
-
-        # Save the best model based on validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
-            torch.save(model.state_dict(), best_model_path)
-            print(f"\t*** New best model saved to {best_model_path} ***")
+        if not args.debug:
+            model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            checkpoint_path = os.path.join(config.CHECKPOINT_DIR, f"model_epoch_{epoch + 1}.pth")
+            torch.save(model_state, checkpoint_path)
+            print(f"\tCheckpoint saved to {checkpoint_path}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
+                torch.save(model_state, best_model_path)
+                print(f"\t*** New best model saved to {best_model_path} ***")
 
     print("\n--- Training Complete ---")
 
 
 if __name__ == '__main__':
-    if not hasattr(config, 'TRIPLETS_CSV_PATH') or not config.TRIPLETS_CSV_PATH:
-        raise ValueError("Please define TRIPLETS_CSV_PATH in config.py.")
-    main()
+    parser = argparse.ArgumentParser(description="Train the Language-Guided Localization model.")
+    parser.add_argument('--debug', action='store_true', help="Run in debug mode on a small subset of data.")
+    args = parser.parse_args()
+    main(args)
