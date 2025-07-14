@@ -1,6 +1,3 @@
-# dataset.py
-# CORRECTED VERSION: This script now loads short video clips, not single frames.
-
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 import pandas as pd
@@ -11,7 +8,7 @@ from transformers import AutoTokenizer
 import sys
 import random
 import re
-
+import numpy as np
 import config
 
 
@@ -29,7 +26,7 @@ class EndoscopyLocalizationDataset(Dataset):
 
         self.image_transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((config.IMG_SIZE, config.IMG_SIZE)),
+            transforms.Resize((config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE)), # Use config.DATA.TRAIN_CROP_SIZE
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
@@ -45,20 +42,24 @@ class EndoscopyLocalizationDataset(Dataset):
 
         # --- Clip Loading Logic ---
         frames = []
-        # Extract the directory and the frame number from the anchor path
-        # e.g., from 'CHOLEC80_video01/frame_0000125.jpg'
+
         directory = os.path.dirname(anchor_frame_path)
 
         match = re.search(r'(\d+)\.jpg$', anchor_frame_path)
         if not match:
             # Fallback if regex fails, return a random valid sample
+            print(f"Warning: Could not parse frame number from {anchor_frame_path}. Returning random sample.", file=sys.stderr)
             return self.__getitem__(random.randint(0, len(self) - 1))
 
         anchor_frame_num = int(match.group(1))
 
-        # Load a sequence of 'clip_length' frames starting from the anchor
+        # Determine the start frame for the clip to center it around the anchor, if possible
+        # This prevents going out of bounds at the beginning of the video
+        start_frame_num = max(1, anchor_frame_num - self.clip_length // 2)
+
+        # Loop to collect frames for the clip
         for i in range(self.clip_length):
-            current_frame_num = anchor_frame_num + i
+            current_frame_num = start_frame_num + i
             # Construct the path for the current frame in the sequence
             current_frame_filename = f"frame_{current_frame_num:07d}.jpg"  # Assumes 7-digit padding
             full_frame_path = os.path.join(config.EXTRACTED_FRAMES_DIR, directory, current_frame_filename)
@@ -66,27 +67,33 @@ class EndoscopyLocalizationDataset(Dataset):
             try:
                 frame = cv2.imread(full_frame_path)
                 if frame is None:
-                    # If a frame is missing (e.g., at the end of a video), repeat the last valid frame
-                    frame = cv2.imread(os.path.join(config.EXTRACTED_FRAMES_DIR, anchor_frame_path))
+
+                    if frames:
+                        frame = frames[-1]
+                    else:
+                        frame = np.zeros((config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE, 3), dtype=np.uint8)
+                        print(f"Warning: Could not load initial frame {full_frame_path}. Using black image.", file=sys.stderr)
 
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame = self.image_transform(frame)
                 frames.append(frame)
             except Exception as e:
-                # If there's an error, just append the anchor frame again as a fallback
-                print(f"Warning: Error loading frame {full_frame_path}: {e}. Re-using anchor frame.", file=sys.stderr)
-                anchor_img = cv2.imread(os.path.join(config.EXTRACTED_FRAMES_DIR, anchor_frame_path))
-                anchor_img = cv2.cvtColor(anchor_img, cv2.COLOR_BGR2RGB)
-                anchor_img = self.image_transform(anchor_img)
-                frames.append(anchor_img)
+                # Fallback if I/O or processing error
+                print(f"Error loading/processing frame {full_frame_path}: {e}. Skipping.", file=sys.stderr)
+                # If an error occurs for a frame, fill with a dummy (e.g., black) frame
+                dummy_frame = torch.zeros(3, config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE)
+                frames.append(dummy_frame)
+
 
         # Stack the list of frames into a single tensor
-        video_clip = torch.stack(frames)  # Shape: [T, C, H, W]
+        video_clip = torch.stack(frames)  # Original Shape: [T, C, H, W]
+
+        video_clip = video_clip.permute(1, 0, 2, 3) # New Shape: [C, T, H, W]
 
         # --- Text and Label Preparation ---
         text_inputs = self.tokenizer(
             text_query, padding='max_length', truncation=True,
-            max_length=config.MAX_TEXT_LENGTH, return_tensors="pt"
+            max_length=config.DATA.MAX_TEXT_LENGTH, return_tensors="pt" # Use config.DATA.MAX_TEXT_LENGTH
         )
         input_ids = text_inputs['input_ids'].squeeze(0)
         attention_mask = text_inputs['attention_mask'].squeeze(0)
@@ -98,7 +105,8 @@ class EndoscopyLocalizationDataset(Dataset):
 
 
 def create_dataloaders(train_csv_path, val_csv_path, clip_length=16):
-    tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
+    # Use config.MODEL.TEXT_ENCODER_MODEL for consistency
+    tokenizer = AutoTokenizer.from_pretrained(config.MODEL.TEXT_ENCODER_MODEL)
 
     print(f"Loading training data from: {train_csv_path}")
     train_dataset = EndoscopyLocalizationDataset(train_csv_path, tokenizer, clip_length)
@@ -106,9 +114,9 @@ def create_dataloaders(train_csv_path, val_csv_path, clip_length=16):
     print(f"Loading validation data from: {val_csv_path}")
     val_dataset = EndoscopyLocalizationDataset(val_csv_path, tokenizer, clip_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS,
-                              pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS,
-                            pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config.TRAIN.BATCH_SIZE, shuffle=True, # Use config.TRAIN.BATCH_SIZE
+                              num_workers=config.DATA.NUM_WORKERS, pin_memory=True) # Use config.DATA.NUM_WORKERS
+    val_loader = DataLoader(val_dataset, batch_size=config.TRAIN.BATCH_SIZE, shuffle=False, # Use config.TRAIN.BATCH_SIZE
+                            num_workers=config.DATA.NUM_WORKERS, pin_memory=True) # Use config.DATA.NUM_WORKERS
 
     return train_loader, val_loader

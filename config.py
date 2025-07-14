@@ -1,78 +1,117 @@
-# config.py
-# Final version for server training.
-
 import torch
 import os
 
-# --- Project Paths & Directories ---
-# Base directory for all medical video data on the server
-UNIFIED_MEDICAL_VIDEOS_DIR = "/data/unified_medical_videos/"
+class Config:
+    def __init__(self):
+        # --- Base Directories on ML Server ---
+        # Assuming '/home/240331715/' is your user's home directory on the server
+        self.ML_SERVER_HOME = "/home/240331715/"
 
-# Path to the directory containing all extracted frames
-EXTRACTED_FRAMES_DIR = os.path.join(UNIFIED_MEDICAL_VIDEOS_DIR, "extracted_frames/")
+        # Base directory for all data (unified_medical_videos as per your structure)
+        self.UNIFIED_MEDICAL_VIDEOS_DIR = os.path.join(self.ML_SERVER_HOME, "data", "unified_medical_videos")
 
-# Path to the directory where you will save the train/val/test split files
-SPLIT_FILES_DIR = os.path.join(UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets/cholec80_splits/")
+        # Your project's root directory on the server
+        self.PROJECT_ROOT = os.path.join(self.ML_SERVER_HOME, "data", "project_folder", "Language-Guided-Endoscopy-Localization")
 
-# --- NEW: Paths to the final triplet CSVs ---
-TRAIN_TRIPLETS_CSV_PATH = os.path.join(UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets/cholec80_train_triplets.csv")
-VAL_TRIPLETS_CSV_PATH = os.path.join(UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets/cholec80_val_triplets.csv")
-# The test set will be used later with inference.py
-TEST_TRIPLETS_CSV_PATH = os.path.join(UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets/cholec80_test_triplets.csv")
+        # --- Data Paths (derived from UNIFIED_MEDICAL_VIDEOS_DIR) ---
+        self.EXTRACTED_FRAMES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "extracted_frames")
+        self.SPLIT_FILES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "cholec80_splits")
+        self.TRAIN_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "cholec80_train_triplets.csv")
+        self.VAL_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "cholec80_val_triplets.csv")
+        self.TEST_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "cholec80_test_triplets.csv")
+        self.VIDEO_ROOT_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "extracted_frames") # Assuming videos are extracted frames
 
-
-# --- Other Paths ---
-BACKBONE_WEIGHTS_PATH = "./pretrained/checkpoint.pth"
-CHECKPOINT_DIR = "./checkpoints/cholec80/"
-OUTPUT_DIR = "./outputs/cholec80/"
-
-
-# --- Training Hyperparameters ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-LEARNING_RATE = 1e-4
-BATCH_SIZE = 16
-EPOCHS = 50
-TEMPORAL_LOSS_WEIGHT = 0.5
+        # --- Model & Checkpoint Paths (derived from PROJECT_ROOT) ---
+        # Path to your pre-trained M2CRL backbone weights
+        self.BACKBONE_WEIGHTS_PATH = os.path.join(self.PROJECT_ROOT, "pretrained", "checkpoint.pth")
+        # Directory to save training checkpoints
+        self.CHECKPOINT_DIR = os.path.join(self.PROJECT_ROOT, "checkpoints", "cholec80")
+        # Directory for model outputs (e.g., inference results, visualizations)
+        self.OUTPUT_DIR = os.path.join(self.PROJECT_ROOT, "outputs", "cholec80")
 
 
-# --- Cholec80 Label to Text Query Mapping ---
-LABEL_TO_TEXT_QUERY = {
-    'Preparation': 'the preparation phase of surgery',
-    'CalotTriangleDissection': 'the dissection of the Calot triangle',
-    'ClippingCutting': 'clipping and cutting',
-    'GallbladderDissection': 'the dissection of the gallbladder',
-    'GallbladderPackaging': 'packaging the gallbladder in a bag',
-    'CleaningCoagulation': 'cleaning and coagulation',
-    'GallbladderRetraction': 'the retraction of the gallbladder',
-    'Grasper': 'a grasper tool is present',
-    'Bipolar': 'a bipolar tool is present',
-    'Hook': 'a hook tool is present',
-    'Scissors': 'scissors are present',
-    'Clipper': 'a clipper tool is present',
-    'Irrigator': 'an irrigator tool is present',
-    'SpecimenBag': 'a specimen bag is present',
-}
+        # --- Data Parameters (consistent with your previous configuration) ---
+        self.DATA = self.DataConfig()
+
+        # --- Model Architecture Parameters (consistent with your previous configuration) ---
+        self.MODEL = self.ModelConfig()
+
+        # --- Training Hyperparameters (consistent with your previous configuration) ---
+        self.TRAIN = self.TrainConfig()
+
+        # --- TimeSformer (M²CRL Backbone) Specific Parameters ---
+        self.TIMESFORMER = self.TimesformerConfig()
+
+        # --- Cholec80 Label to Text Query Mapping ---
+        self.LABEL_TO_TEXT_QUERY = {
+            'Preparation': 'the preparation phase of surgery',
+            'CalotTriangleDissection': 'the dissection of the Calot triangle',
+            'ClippingCutting': 'clipping and cutting',
+            'GallbladderDissection': 'the dissection of the gallbladder',
+            'GallbladderPackaging': 'packaging the gallbladder in a bag',
+            'CleaningCoagulation': 'cleaning and coagulation',
+            'GallbladderRetraction': 'the retraction of the gallbladder',
+            'Grasper': 'a grasper tool is present',
+            'Bipolar': 'a bipolar tool is present',
+            'Hook': 'a hook tool is present',
+            'Scissors': 'scissors are present',
+            'Clipper': 'a clipper tool is present',
+            'Irrigator': 'an irrigator tool is present',
+            'SpecimenBag': 'a specimen bag is present',
+        }
 
 
-# --- Model & Architecture Config ---
-TEXT_MODEL_NAME = "openai/clip-vit-base-patch32"
-TEXT_EMBED_DIM = 512
-IMG_SIZE = 224
-FUSION_HEAD_DEPTH = 2
-FUSION_HEAD_NUM_HEADS = 8
-TEMPORAL_HEAD_DEPTH = 2
-TEMPORAL_HEAD_NUM_HEADS = 8
+    class DataConfig:
+        def __init__(self):
+            self.TRAIN_CROP_SIZE = 224
+            self.AUGMENT_PROB = 0.5
+            self.NUM_FRAMES = 16  # Number of frames in a video clip for spatio-temporal backbone
+            self.FRAME_RATE = 30 # Original video frame rate
+            self.CLIP_LENGTH = 16 # Keep consistent with NUM_FRAMES
+            self.NUM_INFERENCE_FRAMES = 50 # From your original config snippet
+            self.MAX_TEXT_LENGTH = 77 # From your original config snippet
+            self.NUM_WORKERS = 4 # From your original config snippet
+
+    class ModelConfig:
+        def __init__(self):
+            self.VISION_BACKBONE_MODEL = "vit_base_patch16_224" # Name for the backbone
+            self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32" # Example CLIP model
+            self.HEAD_NUM_ATTENTION_HEADS = 8 # Used by LanguageGuidedHead and TemporalHead
+            self.HEAD_NUM_LAYERS = 2 # Used by LanguageGuidedHead and TemporalHead
+            self.EMBED_DIM = 768 # Should match backbone's embed_dim for ViT-B
+
+    class TrainConfig:
+        def __init__(self):
+            self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu" # From your original config snippet
+            self.LEARNING_RATE = 1e-4 # From your original config snippet
+            self.BATCH_SIZE = 16 # From your original config snippet
+            self.NUM_EPOCHS = 50 # From your original config snippet, renamed from EPOCHS
+            self.TEMPORAL_LOSS_WEIGHT = 0.5 # From your original config snippet
+
+            self.WEIGHT_DECAY = 1e-2 # Added for full training config, common default
+            self.GRADIENT_ACCUMULATION_STEPS = 1 # Added for full training config, common default
+            self.LOG_INTERVAL = 10 # Added for training logging
+            self.SAVE_INTERVAL = 5 # Added for checkpointing
+            self.USE_CUDA = torch.cuda.is_available() # Ensures device is set correctly
+
+            # PEFT LoRA Config for Text Encoder (consistent with your original config snippet)
+            self.USE_PEFT = True
+            self.LORA_R = 8 # Renamed from PEFT_LORA_R for consistency
+            self.LORA_ALPHA = 16 # Renamed from PEFT_LORA_ALPHA for consistency
+            self.LORA_DROPOUT = 0.05 # Renamed from PEFT_LORA_DROPOUT for consistency
+            self.LORA_TARGET_MODULES = ["q_proj", "v_proj"] # From your original config snippet
+
+            # LoRA Configuration for Vision Backbone (added in previous turn)
+            self.USE_LORA_BACKBONE = True # Set to True to apply conceptual LoRA to the backbone
+            self.LORA_R_BACKBONE = 8
+            self.LORA_ALPHA_BACKBONE = 16
+            self.LORA_DROPOUT_BACKBONE = 0.1
+
+    class TimesformerConfig:
+        def __init__(self):
+            self.ATTENTION_TYPE = 'divided_space_time' # Crucial for spatio-temporal M²CRL
+            self.PRETRAINED_MODEL = "" # Optional: If using a TimeSformer-specific pre-trained model URL/path
 
 
-# --- PEFT LoRA Config ---
-USE_PEFT = True
-LORA_R = 8
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.05
-LORA_TARGET_MODULES = ["q_proj", "v_proj"]
-
-
-# --- Dataset & Dataloader Config ---
-NUM_INFERENCE_FRAMES = 50
-MAX_TEXT_LENGTH = 77
-NUM_WORKERS = 4
+# Instantiate the config for use in other scripts
+config = Config()

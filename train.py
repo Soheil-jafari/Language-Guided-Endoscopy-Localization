@@ -1,6 +1,3 @@
-# train.py
-# CORRECTED VERSION: This script now works with batches of video clips.
-
 import os
 
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -14,18 +11,19 @@ from tqdm import tqdm
 import numpy as np
 import argparse
 
-import config
+import config # Import the config object
 from models import LocalizationFramework
 from dataset import create_dataloaders  # This will now use the clip-based dataset
 
 
 class DualObjectiveLoss(nn.Module):
-    def __init__(self, temporal_weight=config.TEMPORAL_LOSS_WEIGHT):
+    # Access temporal_weight from the config object
+    def __init__(self, temporal_weight=config.TRAIN.TEMPORAL_LOSS_WEIGHT):
         super().__init__()
         self.relevance_loss = nn.BCEWithLogitsLoss()
         self.temporal_weight = temporal_weight
 
-    def forward(self, refined_scores, raw_scores, ground_truth_relevance):
+    def forward(self, refined_scores, raw_relevance_scores, ground_truth_relevance): # Renamed raw_scores to raw_relevance_scores for clarity
         # refined_scores and ground_truth_relevance are now [B, T]
         primary_loss = self.relevance_loss(refined_scores, ground_truth_relevance)
 
@@ -51,11 +49,13 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
 
         optimizer.zero_grad()
 
-        # The model now directly accepts the video clip
-        raw_scores, refined_scores = model(video_clip, input_ids, attention_mask)
+        # IMPORTANT: The model's forward method now returns 3 values.
+        # It's refined_scores, raw_relevance_scores, and attention_weights_for_xai.
+        refined_scores, raw_relevance_scores, _ = model(video_clip, input_ids, attention_mask)
 
         # Squeeze the last dimension of scores to match relevance shape [B, T]
-        loss, _, _ = criterion(refined_scores.squeeze(-1), raw_scores.squeeze(-1), relevance)
+        # Pass raw_relevance_scores to criterion's forward method
+        loss, _, _ = criterion(refined_scores.squeeze(-1), raw_relevance_scores.squeeze(-1), relevance)
 
         if isinstance(loss, torch.Tensor) and loss.numel() > 1:
             loss = loss.mean()
@@ -79,8 +79,10 @@ def validate_one_epoch(model, dataloader, criterion, device):
             video_clip, input_ids, attention_mask, relevance = video_clip.to(device), input_ids.to(
                 device), attention_mask.to(device), relevance.to(device)
 
-            raw_scores, refined_scores = model(video_clip, input_ids, attention_mask)
-            loss, _, _ = criterion(refined_scores.squeeze(-1), raw_scores.squeeze(-1), relevance)
+            # IMPORTANT: The model's forward method now returns 3 values.
+            refined_scores, raw_relevance_scores, _ = model(video_clip, input_ids, attention_mask)
+            # Pass raw_relevance_scores to criterion's forward method
+            loss, _, _ = criterion(refined_scores.squeeze(-1), raw_relevance_scores.squeeze(-1), relevance)
 
             if isinstance(loss, torch.Tensor) and loss.numel() > 1:
                 loss = loss.mean()
@@ -98,12 +100,13 @@ def validate_one_epoch(model, dataloader, criterion, device):
 
 
 def main(args):
-    # (This main function logic remains largely the same)
     print("--- Starting Training Pipeline ---")
-    device = torch.device(config.DEVICE)
+    # Access device from config.TRAIN
+    device = torch.device(config.TRAIN.DEVICE)
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
 
-    model = LocalizationFramework().to(device)
+    # IMPORTANT: Pass the config object to LocalizationFramework constructor
+    model = LocalizationFramework(config=config).to(device)
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
         model = nn.DataParallel(model)
@@ -116,16 +119,19 @@ def main(args):
     else:
         train_csv = config.TRAIN_TRIPLETS_CSV_PATH
         val_csv = config.VAL_TRIPLETS_CSV_PATH
-        epochs = config.EPOCHS
+        # Access epochs from config.TRAIN
+        epochs = config.TRAIN.NUM_EPOCHS
 
     train_loader, val_loader = create_dataloaders(
         train_csv_path=train_csv,
         val_csv_path=val_csv,
-        clip_length=config.CLIP_LENGTH  # Pass clip length from config
+        # Pass clip_length from config.DATA
+        clip_length=config.DATA.CLIP_LENGTH
     )
 
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config.LEARNING_RATE)
-    criterion = DualObjectiveLoss()
+    # Access learning_rate from config.TRAIN
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config.TRAIN.LEARNING_RATE)
+    criterion = DualObjectiveLoss() # temporal_weight is now fetched from config inside DualObjectiveLoss __init__
 
     best_val_loss = float('inf')
     print("\n--- Beginning Training and Validation Epochs ---")

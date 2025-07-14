@@ -1,187 +1,241 @@
-# models.py
-# This script defines the complete end-to-end model architecture.
-# It integrates the Vision Transformer backbone, Text Encoder,
-# a true Cross-Attention Language-Guided Head, and a Temporal Transformer Head.
-
 import torch
 import torch.nn as nn
+from functools import partial
 from transformers import AutoTokenizer, CLIPTextModel
-from peft import LoraConfig, get_peft_model
 import os
-import sys
+import torch.nn.functional as F
 
-# Import our project's configuration and backbone
-import config
-from backbone.vision_transformer import VisionTransformer
+# Import the VisionTransformer class directly from the new, self-contained backbone file
+from backbone.vision_transformer import VisionTransformer  # This now contains all necessary helpers
 
 
-# --- 1. Text Encoder (with PEFT) ---
-class TextEncoder(nn.Module):
-    """
-    A pre-trained transformer-based text encoder (from CLIP).
-    Adapted using PEFT (LoRA) for efficient fine-tuning.
-    """
+# --- Conceptual LoRA Implementation (You would typically use a library like Hugging Face's PEFT) ---
+class LoRALinear(nn.Linear):
+    def __init__(self, linear_layer, r=8, alpha=16, dropout=0.0):
+        super().__init__(linear_layer.in_features, linear_layer.out_features, linear_layer.bias is not None)
+        self.r = r
+        self.alpha = alpha
+        self.dropout = nn.Dropout(dropout)
+        self.original_weight = linear_layer.weight
+        self.original_bias = linear_layer.bias
+        self.lora_A = nn.Parameter(torch.zeros(linear_layer.in_features, r))
+        self.lora_B = nn.Parameter(torch.zeros(r, linear_layer.out_features))
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_B)
 
-    def __init__(self):
-        super().__init__()
-        self.text_model = CLIPTextModel.from_pretrained(config.TEXT_MODEL_NAME)
+    def forward(self, x):
+        original_output = F.linear(x, self.original_weight, self.original_bias)
+        lora_output = (self.dropout(x @ self.lora_A) @ self.lora_B) * (self.alpha / self.r)
+        return original_output + lora_output
 
-        if config.USE_PEFT:
-            lora_config = LoraConfig(
-                r=config.LORA_R,
-                lora_alpha=config.LORA_ALPHA,
-                lora_dropout=config.LORA_DROPOUT,
-                bias="none",
-                target_modules=config.LORA_TARGET_MODULES,
-            )
-            self.text_model = get_peft_model(self.text_model, lora_config)
-            print("PEFT (LoRA) enabled for Text Encoder.")
-            self.text_model.print_trainable_parameters()
+
+def apply_lora_to_linear_layers(model, r=8, alpha=16, dropout=0.0):
+    for name, module in model.named_children():
+        if isinstance(module, nn.Linear):
+            # Only apply LoRA to layers that are typically targeted (e.g., Q, K, V projections, MLP layers)
+            # You might want to refine this condition based on specific layer names
+            setattr(model, name, LoRALinear(module, r, alpha, dropout))
         else:
-            for param in self.text_model.parameters():
-                param.requires_grad = False
-            print("Text Encoder is frozen (PEFT not enabled).")
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-        return outputs.last_hidden_state
+            apply_lora_to_linear_layers(module, r, alpha, dropout)  # Recurse for nested modules
 
 
-# --- 2. Language-Guided Head (True Cross-Attention) ---
-class LanguageGuidedHead(nn.Module):
-    """
-    A true Cross-Modal Transformer that fuses visual patch features with text token features.
-    """
+# --- End Conceptual LoRA Implementation ---
 
-    def __init__(self, visual_embed_dim=768, text_embed_dim=512, depth=config.FUSION_HEAD_DEPTH,
-                 num_heads=config.FUSION_HEAD_NUM_HEADS):
+
+class TextEncoder(nn.Module):
+    def __init__(self, config):
         super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(config.MODEL.TEXT_ENCODER_MODEL)
+        self.text_encoder = CLIPTextModel.from_pretrained(config.MODEL.TEXT_ENCODER_MODEL)
+        self.embed_dim = self.text_encoder.config.hidden_size
+
+        if config.TRAIN.USE_PEFT:
+            apply_lora_to_linear_layers(self.text_encoder, r=config.TRAIN.PEFT_LORA_R,
+                                        alpha=config.TRAIN.PEFT_LORA_ALPHA,
+                                        dropout=config.TRAIN.PEFT_LORA_DROPOUT)
+            print("Conceptual LoRA applied to Text Encoder!")
+
+    def forward(self, text_queries):
+        inputs = self.tokenizer(text_queries, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(self.text_encoder.device) for k, v in inputs.items()}
+        outputs = self.text_encoder(**inputs)
+        return outputs.last_hidden_state, inputs.attention_mask
+
+
+class LanguageGuidedHead(nn.Module):
+    def __init__(self, visual_embed_dim, text_embed_dim, output_dim, num_attention_heads=8, num_layers=2):
+        super().__init__()
+        self.transformer_decoder_layer = nn.TransformerDecoderLayer(
+            d_model=visual_embed_dim,
+            nhead=num_attention_heads,
+            dim_feedforward=visual_embed_dim * 4,
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(self.transformer_decoder_layer, num_layers=num_layers)
+        self.fc_relevance = nn.Linear(visual_embed_dim, output_dim)
         self.text_proj = nn.Linear(text_embed_dim, visual_embed_dim)
-        self.decoder_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model=visual_embed_dim,
-                nhead=num_heads,
-                batch_first=True
-            ) for _ in range(depth)
-        ])
-        self.relevance_head = nn.Linear(visual_embed_dim, 1)
 
     def forward(self, visual_features, text_features, text_attention_mask):
-        text_memory = self.text_proj(text_features)
-        fused_output = visual_features
-        for layer in self.decoder_layers:
-            fused_output = layer(tgt=fused_output, memory=text_memory,
-                                 memory_key_padding_mask=(1 - text_attention_mask).bool())
-        frame_embedding = fused_output.mean(dim=1)
-        relevance_score = self.relevance_head(frame_embedding)
+        # visual_features: (B*T, N_patches, C_visual) - spatio-temporal patches flattened across batch and time
+        # text_features: (B, L, C_text)
+        # text_attention_mask: (B, L)
+
+        B_T, N_patches, C_visual = visual_features.shape  # B_T is (Original_B * T_frames)
+
+        # Expand text features and mask to match the (B*T) dimension of visual_features
+        # Get original batch size (B) from text_features
+        B_original = text_features.shape[0]
+        # Infer T (number of frames per original batch item)
+        T_frames = B_T // B_original
+
+        # Project text features and expand to match (B*T) for cross-attention
+        text_features_expanded = self.text_proj(text_features).unsqueeze(1).expand(-1, T_frames, -1, -1).reshape(B_T,
+                                                                                                                 text_features.shape[
+                                                                                                                     1],
+                                                                                                                 C_visual)
+        text_mask_expanded = text_attention_mask.unsqueeze(1).expand(-1, T_frames, -1).reshape(B_T,
+                                                                                               text_attention_mask.shape[
+                                                                                                   1])
+
+        fused_features = self.transformer_decoder(
+            tgt=visual_features,
+            memory=text_features_expanded,
+            memory_key_padding_mask=~text_mask_expanded.bool()
+        )
+        # Average across patches to get per-frame relevance score
+        relevance_score = self.fc_relevance(fused_features.mean(dim=1))
         attention_weights_for_xai = None
+
         return relevance_score, attention_weights_for_xai
 
 
-# --- 3. Temporal Head (Temporal Transformer) ---
 class TemporalHead(nn.Module):
-    """
-    A small Temporal Transformer that models the sequence of frame relevance scores.
-    """
-
-    def __init__(self, input_dim=1, model_dim=64, depth=config.TEMPORAL_HEAD_DEPTH,
-                 num_heads=config.TEMPORAL_HEAD_NUM_HEADS):
+    def __init__(self, input_dim, output_dim, num_attention_heads=8, num_layers=2):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, model_dim)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, batch_first=True)
-        self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.output_proj = nn.Linear(model_dim, 1)
+        self.transformer_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=input_dim,
+            nhead=num_attention_heads,
+            dim_feedforward=input_dim * 4,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(self.transformer_encoder_layer, num_layers=num_layers)
+        self.fc_output = nn.Linear(input_dim, output_dim)
 
-    def forward(self, score_sequence):
-        x = self.input_proj(score_sequence)
-        x = self.temporal_transformer(x)
-        refined_scores = self.output_proj(x)
+    def forward(self, frame_relevance_scores_seq):
+        # frame_relevance_scores_seq: (B, T, 1) or (B, T, some_feature_dim)
+        temporal_fused_scores = self.transformer_encoder(frame_relevance_scores_seq)
+        refined_scores = self.fc_output(temporal_fused_scores)
         return refined_scores
 
 
-# --- 4. Full End-to-End Model ---
 class LocalizationFramework(nn.Module):
-    """
-    Integrates all components into a single end-to-end model.
-    """
-
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        # 1. Vision Backbone (M²CRL)
-        print("Initializing Vision Backbone...")
-        self.vision_backbone = VisionTransformer(
-            img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12
-        )
-        if os.path.exists(config.BACKBONE_WEIGHTS_PATH):
-            print(f"Loading backbone weights from {config.BACKBONE_WEIGHTS_PATH}")
-            # --- CORRECTED LINE ---
-            # Added weights_only=False to handle checkpoints saved with older PyTorch versions
-            # or those containing non-tensor data.
-            state_dict = torch.load(config.BACKBONE_WEIGHTS_PATH, map_location='cpu', weights_only=False)
-            if 'model' in state_dict:
-                state_dict = state_dict['model']
-            self.vision_backbone.load_state_dict(state_dict, strict=False)
-        else:
-            print(f"Warning: Backbone weights not found at {config.BACKBONE_WEIGHTS_PATH}. Using random init.",
-                  file=sys.stderr)
+        self.config = config
 
-        for param in self.vision_backbone.parameters():
-            param.requires_grad = False
-        print("Vision Backbone is frozen.")
+        # 1. Vision Backbone (Spatio-Temporal M²CRL)
+        self.vision_backbone = VisionTransformer(
+            img_size=config.DATA.TRAIN_CROP_SIZE,
+            patch_size=16,  # Assuming patch size 16 based on vit_base_patch16_224
+            in_chans=3,
+            num_classes=0,  # No head needed as we extract features
+            embed_dim=768,  # Base ViT embed dim
+            depth=12,  # Base ViT depth
+            num_heads=12,  # Base ViT num_heads
+            mlp_ratio=4.,
+            qkv_bias=True,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            drop_rate=0.,
+            attn_drop_rate=0.,
+            drop_path_rate=0.1,
+            num_frames=config.DATA.NUM_FRAMES,  # Number of frames for the backbone
+            attention_type=config.TIMESFORMER.ATTENTION_TYPE  # 'divided_space_time'
+        )
+        self.vision_embed_dim = self.vision_backbone.embed_dim
+
+        # Load pretrained weights (from the helper function now included in vision_transformer.py)
+        # Assuming load_pretrained is a static method or imported correctly
+        # This calls the load_pretrained function which is now part of the backbone/vision_transformer.py scope
+        # You might need to adjust `pretrained_model` to point to your M2CRL weights
+        from backbone.vision_transformer import load_pretrained, _cfg, _conv_filter
+        if config.MODEL.BACKBONE_WEIGHTS_PATH:
+            load_pretrained(
+                self.vision_backbone,
+                cfg=_cfg(),  # Use a default config structure if not available from pretrained source
+                num_classes=0,  # No classifier head needed
+                img_size=config.DATA.TRAIN_CROP_SIZE,
+                num_frames=config.DATA.NUM_FRAMES,
+                num_patches=self.vision_backbone.patch_embed.num_patches,
+                attention_type=config.TIMESFORMER.ATTENTION_TYPE,
+                pretrained_model=config.MODEL.BACKBONE_WEIGHTS_PATH
+            )
+            print(f"Loaded pretrained weights for Vision Backbone from {config.MODEL.BACKBONE_WEIGHTS_PATH}")
+
+        # Apply LoRA to Vision Backbone if configured
+        if config.TRAIN.USE_LORA_BACKBONE:
+            apply_lora_to_linear_layers(self.vision_backbone, r=config.TRAIN.LORA_R_BACKBONE,
+                                        alpha=config.TRAIN.LORA_ALPHA_BACKBONE,
+                                        dropout=config.TRAIN.LORA_DROPOUT_BACKBONE)
+            print("Conceptual LoRA applied to Vision Backbone!")
 
         # 2. Text Encoder
-        print("Initializing Text Encoder...")
-        self.text_encoder = TextEncoder()
+        self.text_encoder = TextEncoder(config)
+        self.text_embed_dim = self.text_encoder.embed_dim
 
-        # 3. Language-Guided Head
-        print("Initializing Language-Guided Head...")
+        # 3. Language-Guided Head (Cross-Modal Fusion)
         self.language_guided_head = LanguageGuidedHead(
-            visual_embed_dim=768,
-            text_embed_dim=config.TEXT_EMBED_DIM
+            visual_embed_dim=self.vision_embed_dim,  # Embed dim from the backbone
+            text_embed_dim=self.text_embed_dim,
+            output_dim=1,  # Outputs a single relevance score per patch/frame
+            num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
+            num_layers=config.MODEL.HEAD_NUM_LAYERS
         )
 
         # 4. Temporal Head
-        print("Initializing Temporal Head...")
-        self.temporal_head = TemporalHead()
+        # The input to this head is the sequence of (B, T, 1) relevance scores
+        self.temporal_head = TemporalHead(
+            input_dim=1,
+            output_dim=1,
+            num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
+            num_layers=config.MODEL.HEAD_NUM_LAYERS
+        )
 
-    def forward(self, video_clip, input_ids, attention_mask):
-        B, T, C, H, W = video_clip.shape
-        frames = video_clip.reshape(B * T, C, H, W)
-        visual_features = self.vision_backbone(frames)
-        text_features = self.text_encoder(input_ids, attention_mask)
-        text_features_expanded = text_features.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, text_features.shape[1],
-                                                                                          -1)
-        text_mask_expanded = attention_mask.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
-        raw_scores, _ = self.language_guided_head(visual_features, text_features_expanded, text_mask_expanded)
-        raw_scores_sequence = raw_scores.view(B, T, 1)
-        refined_scores_sequence = self.temporal_head(raw_scores_sequence)
-        return raw_scores_sequence, refined_scores_sequence
+    def forward(self, video_clip, text_query):
+        # video_clip: (B, C, T, H, W)
+        # text_query: list of strings
 
+        # 1. Feature Extraction (Spatio-Temporal Backbone)
+        # Use forward_features with get_all=True to get all tokens (CLS + patches)
+        # all_tokens shape: (B, 1 + num_patches * T, embed_dim)
+        all_tokens = self.vision_backbone.forward_features(video_clip, get_all=True)
 
-if __name__ == '__main__':
-    print("Testing the full LocalizationFramework...")
+        # Extract only the patch tokens (remove the CLS token)
+        # patch_tokens shape: (B, num_patches * T, embed_dim)
+        patch_tokens = all_tokens[:, 1:, :]
 
-    if not os.path.exists(config.BACKBONE_WEIGHTS_PATH):
-        print(f"Creating dummy backbone weights at {config.BACKBONE_WEIGHTS_PATH} for testing.")
-        os.makedirs(os.path.dirname(config.BACKBONE_WEIGHTS_PATH), exist_ok=True)
-        dummy_backbone = VisionTransformer()
-        torch.save(dummy_backbone.state_dict(), config.BACKBONE_WEIGHTS_PATH)
-        del dummy_backbone
+        B_original = video_clip.shape[0]  # Original batch size
+        T_frames = video_clip.shape[2]  # Number of frames in the clip (from input)
+        # Calculate num_patches_per_frame based on backbone's patch embedding
+        num_patches_per_frame = self.vision_backbone.patch_embed.num_patches
 
-    model = LocalizationFramework().to(config.DEVICE)
+        # Reshape patch_tokens to (B * T, num_patches_per_frame, embed_dim)
+        # This prepares it for the LanguageGuidedHead's batch_first expectation
+        visual_features_for_head = patch_tokens.reshape(B_original * T_frames, num_patches_per_frame,
+                                                        self.vision_embed_dim)
 
-    B, T = 2, 16
-    dummy_video = torch.randn(B, T, 3, 224, 224).to(config.DEVICE)
+        # 2. Text Encoding
+        text_features, text_attention_mask = self.text_encoder(text_query)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
-    dummy_text = ["a polyp being removed", "healthy cecum tissue"]
-    inputs = tokenizer(dummy_text, padding=True, return_tensors="pt").to(config.DEVICE)
+        # 3. Spatial-Semantic Fusion (Language-Guided Head)
+        raw_relevance_scores_flat, attention_weights_for_xai = self.language_guided_head(
+            visual_features_for_head,
+            text_features,
+            text_attention_mask
+        )
+        # Reshape relevance scores back to (B, T, 1) for the temporal head
+        raw_relevance_scores = raw_relevance_scores_flat.reshape(B_original, T_frames, 1)
 
-    with torch.no_grad():
-        raw_scores, refined_scores = model(dummy_video, inputs.input_ids, inputs.attention_mask)
+        # 4. Temporal Context Modeling (Temporal Head)
+        refined_scores = self.temporal_head(raw_relevance_scores)
 
-    print("\n--- Model Test Successful ---")
-    print(f"Input video shape: {dummy_video.shape}")
-    print(f"Output raw scores shape: {raw_scores.shape}")
-    print(f"Output refined scores shape: {refined_scores.shape}")
-    print("---------------------------\n")
+        return refined_scores, raw_relevance_scores, attention_weights_for_xai
