@@ -13,24 +13,36 @@ from backbone.vision_transformer import load_pretrained, _cfg, _conv_filter
 
 
 # --- Conceptual LoRA Implementation (You would typically use a library like Hugging Face's PEFT) ---
+# In models.py
 class LoRALinear(nn.Linear):
     def __init__(self, linear_layer, r=8, alpha=16, dropout=0.0):
         super().__init__(linear_layer.in_features, linear_layer.out_features, linear_layer.bias is not None)
         self.r = r
         self.alpha = alpha
         self.dropout = nn.Dropout(dropout)
+        # Store the original weights and explicitly freeze them
         self.original_weight = linear_layer.weight
-        self.original_bias = linear_layer.bias
+        self.original_weight.requires_grad = False  # <--- ADD THIS LINE
+        if linear_layer.bias is not None:
+            self.original_bias = linear_layer.bias
+            self.original_bias.requires_grad = False  # <--- ADD THIS LINE
+        else:
+            self.original_bias = None
+
+        # LoRA parameters, which will be the *only* trainable parameters for this layer
         self.lora_A = nn.Parameter(torch.zeros(linear_layer.in_features, r))
         self.lora_B = nn.Parameter(torch.zeros(r, linear_layer.out_features))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))  # Use math.sqrt(5) for consistency
+        # Initialize LoRA matrices
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
+        # Calculate the output from the frozen original layer
         original_output = F.linear(x, self.original_weight, self.original_bias)
+        # Calculate the output from the trainable LoRA matrices
         lora_output = (self.dropout(x @ self.lora_A) @ self.lora_B) * (self.alpha / self.r)
+        # Combine them
         return original_output + lora_output
-
 
 def apply_lora_to_linear_layers(model, r=8, alpha=16, dropout=0.0):
     for name, module in model.named_children():
@@ -38,6 +50,7 @@ def apply_lora_to_linear_layers(model, r=8, alpha=16, dropout=0.0):
             # Apply LoRA to common linear layers within Attention (qkv, proj) and Mlp (fc1, fc2)
             # You might refine target_modules if using Hugging Face PEFT or specific layer names
             setattr(model, name, LoRALinear(module, r, alpha, dropout))
+            print(f"  Applied LoRA to: {name}")
         else:
             apply_lora_to_linear_layers(module, r, alpha, dropout)  # Recurse for nested modules
 
