@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 import sys
 
 # Import our project components
-import config
+import project_config
 from models import LocalizationFramework
 
 
@@ -50,7 +50,7 @@ def process_video_for_inference(video_path, num_frames):
 
         # Preprocess frame: BGR to RGB, resize, normalize
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (config.IMG_SIZE, config.IMG_SIZE))
+        frame = cv2.resize(frame, (project_config.IMG_SIZE, project_config.IMG_SIZE))
         frame = torch.tensor(frame, dtype=torch.float32).permute(2, 0, 1) / 255.0
         # NOTE: Add normalization here if your final M²CRL model used it during pre-training
 
@@ -72,7 +72,7 @@ def run_inference(args):
     Main function to run the inference process.
     """
     print("--- Starting Inference ---")
-    device = torch.device(config.DEVICE)
+    device = torch.device(project_config.DEVICE)
 
     # --- 1. Initialize Model ---
     print("Initializing model architecture...")
@@ -105,12 +105,12 @@ def run_inference(args):
     video_clip = video_clip.to(device)
 
     print(f"Tokenizing text query: '{args.text_query}'")
-    tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(project_config.TEXT_MODEL_NAME)
     text_inputs = tokenizer(
         args.text_query,
         padding="max_length",
         truncation=True,
-        max_length=config.MAX_TEXT_LENGTH,
+        max_length=project_config.MAX_TEXT_LENGTH,
         return_tensors="pt"
     ).to(device)
 

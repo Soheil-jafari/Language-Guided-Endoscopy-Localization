@@ -9,7 +9,7 @@ import sys
 import re  # For extracting numbers from filenames
 
 # We need to import config to know where to save the split files
-import config
+import project_config
 
 
 def create_video_splits(video_dir, train_split=0.7, val_split=0.15):
@@ -66,8 +66,8 @@ def create_video_splits(video_dir, train_split=0.7, val_split=0.15):
     print(f"  Validation videos: {len(val_ids)}")
     print(f"  Test videos: {len(test_ids)}")
 
-    # --- Save the lists to .txt files in the directory specified in config.py ---
-    output_dir = config.SPLIT_FILES_DIR
+    # --- Save the lists to .txt files in the directory specified in project_config.py ---
+    output_dir = project_config.SPLIT_FILES_DIR
     os.makedirs(output_dir, exist_ok=True)  # Ensure the directory exists
 
     with open(os.path.join(output_dir, 'train_videos.txt'), 'w') as f:

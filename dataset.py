@@ -9,7 +9,7 @@ import sys
 import random
 import re
 import numpy as np
-import config
+from project_config import config
 
 
 class EndoscopyLocalizationDataset(Dataset):
