@@ -8,10 +8,11 @@ import torch.cuda.amp
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 import numpy as np
+import math
 import argparse
-# import project_config # REMOVE THIS LINE - you already import 'config' from it
 from project_config import config  # Keep this line - this is the instance you need
 from models import LocalizationFramework
 from dataset import create_dataloaders  # This will now use the clip-based dataset
@@ -25,17 +26,58 @@ class DualObjectiveLoss(nn.Module):
         self.temporal_weight = temporal_weight
 
     def forward(self, refined_scores, raw_relevance_scores, ground_truth_relevance):
-        primary_loss = self.relevance_loss(refined_scores, ground_truth_relevance)
+        """
+        Calculates a dual objective loss combining BCE on both refined and raw scores,
+        plus an optional temporal consistency loss.
+
+        Args:
+            refined_scores (torch.Tensor): Output from the TemporalHead (B, T, 1).
+            raw_relevance_scores (torch.Tensor): Output from the LanguageGuidedHead (B, T, 1).
+            ground_truth_relevance (torch.Tensor): Ground truth relevance labels (B, T).
+
+        Returns:
+            tuple: (total_loss, primary_loss, temporal_loss)
+        """
+        # Ensure scores are squeezed to (B, T) to match ground_truth_relevance
+        # BCEWithLogitsLoss expects inputs and targets of the same shape.
+        refined_scores_squeezed = refined_scores.squeeze(-1)
+        raw_relevance_scores_squeezed = raw_relevance_scores.squeeze(-1)
+
+        primary_loss_refined = self.relevance_loss(refined_scores_squeezed, ground_truth_relevance)
+        primary_loss_raw = self.relevance_loss(raw_relevance_scores_squeezed, ground_truth_relevance)
+
+        # Combine the two primary loss components.
+        # You can sum them or average them. Summing gives equal weighting by default.
+        primary_loss = primary_loss_refined + primary_loss_raw
 
         temporal_loss = 0.0
-        if self.temporal_weight > 0 and refined_scores.shape[1] > 1:
-            scores_t = refined_scores[:, 1:]
-            scores_t_minus_1 = refined_scores[:, :-1]
+        # Calculate temporal consistency loss if weight > 0 and clip has more than one frame
+        if self.temporal_weight > 0 and refined_scores_squeezed.shape[1] > 1:
+            # Calculate absolute difference between consecutive refined scores
+            scores_t = refined_scores_squeezed[:, 1:]
+            scores_t_minus_1 = refined_scores_squeezed[:, :-1]
             temporal_loss = torch.mean(torch.abs(scores_t - scores_t_minus_1))
 
+        # Total loss is the sum of primary and weighted temporal loss
         total_loss = primary_loss + (self.temporal_weight * temporal_loss)
+
         return total_loss, primary_loss, temporal_loss
 
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+    """
+    Create a schedule with a learning rate that linearly increases during
+    `num_warmup_steps` and then decreases following a cosine curve.
+    """
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
@@ -142,7 +184,27 @@ def main(args):
 
     # Access learning_rate from config.TRAIN
     # CHANGED from project_config.TRAIN.LEARNING_RATE
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config.TRAIN.LEARNING_RATE)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config.TRAIN.LEARNING_RATE,
+        weight_decay=config.TRAIN.WEIGHT_DECAY
+    )
+    # --- Learning Rate Scheduler Setup ---
+    num_training_epochs = config.TRAIN.NUM_EPOCHS
+    num_warmup_epochs = config.TRAIN.WARMUP_EPOCHS
+
+    if num_warmup_epochs >= num_training_epochs:
+        print(f"Warning: Warmup epochs ({num_warmup_epochs}) is >= total epochs ({num_training_epochs}).")
+        print(f"Setting warmup to 10% of total epochs for effective cosine decay.")
+        num_warmup_epochs = max(1, int(num_training_epochs * 0.1))
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_epochs,
+        num_training_steps=num_training_epochs
+    )
+    print(
+        f"Learning rate scheduler initialized: Warmup for {num_warmup_epochs} epochs, then cosine decay over {num_training_epochs} epochs.")
 
     criterion = DualObjectiveLoss()  # temporal_weight is now fetched from config inside DualObjectiveLoss __init__
 
@@ -169,6 +231,9 @@ def main(args):
                 best_model_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
                 torch.save(model_state, best_model_path)
                 print(f"\t*** New best model saved to {best_model_path} ***")
+
+        scheduler.step()
+        print(f"\tLearning rate for next epoch: {optimizer.param_groups[0]['lr']:.6f}")
 
     print("\n--- Training Complete ---")
 

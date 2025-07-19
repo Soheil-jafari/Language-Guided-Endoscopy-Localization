@@ -83,24 +83,37 @@ class Config:
 
     class ModelConfig:
         def __init__(self):
-            self.VISION_BACKBONE_MODEL = "vit_base_patch16_224"  # Name for the backbone
-            self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"  # Example CLIP model
-            self.HEAD_NUM_ATTENTION_HEADS = 8  # Used by LanguageGuidedHead and TemporalHead
-            self.HEAD_NUM_LAYERS = 2  # Used by LanguageGuidedHead and TemporalHead
-            self.EMBED_DIM = 768  # Should match backbone's embed_dim for ViT-B
+            # --- Backbone Selection ---
+            # Choose your backbone: 'M2CRL' or 'EndoMamba'
+            self.VISION_BACKBONE_NAME = "EndoMamba"
+
+            # --- Backbone-Specific Paths ---
+            # Path for your original M2CRL weights
+            self.M2CRL_WEIGHTS_PATH = os.path.join(config.PROJECT_ROOT, "pretrained", "checkpoint.pth")
+            # Path for the downloaded EndoMamba weights
+            self.ENDOMAMBA_WEIGHTS_PATH = os.path.join(config.PROJECT_ROOT, "pretrained",
+                                                       "endomamba_small_b48_seqlen16_withteacher_MIX12_checkpoint-499.pth")
+
+            # --- General Model Parameters ---
+            self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"
+            self.HEAD_NUM_ATTENTION_HEADS = 8
+            self.HEAD_NUM_LAYERS = 2
+            # NOTE: This embed_dim is for the text encoder and heads.
+            # The vision_embed_dim will be set dynamically in the model itself.
+            self.EMBED_DIM = 768
 
     class TrainConfig:
         def __init__(self):
             self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # From your original config snippet
-            self.LEARNING_RATE = 1e-4  # From your original config snippet
+            self.LEARNING_RATE = 1e-3  # From your original config snippet
             self.BATCH_SIZE = 24  # From your original config snippet
             self.NUM_EPOCHS = 10  # From your original config snippet, renamed from EPOCHS
             self.TEMPORAL_LOSS_WEIGHT = 0.5  # From your original config snippet
-
+            self.WARMUP_EPOCHS = 1
             self.WEIGHT_DECAY = 1e-2  # Added for full training config, common default
             self.GRADIENT_ACCUMULATION_STEPS = 1  # Added for full training config, common default
             self.LOG_INTERVAL = 10  # Added for training logging
-            self.SAVE_INTERVAL = 5  # Added for checkpointing
+            self.SAVE_INTERVAL = 2  # Added for checkpointing
             self.USE_CUDA = torch.cuda.is_available()  # Ensures device is set correctly
 
             # PEFT LoRA Config for Text Encoder (consistent with your original config snippet)
