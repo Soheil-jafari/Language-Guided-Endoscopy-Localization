@@ -5,23 +5,19 @@ import os
 class Config:
     def __init__(self):
         # --- Base Directories on ML Server ---
-        # Assuming '/home/240331715/' is your user's home directory on the server
         self.ML_SERVER_HOME = "/home/240331715/"
 
-        # Base directory for all data (unified_medical_videos as per your structure)
         self.UNIFIED_MEDICAL_VIDEOS_DIR = os.path.join(self.ML_SERVER_HOME, "data", "unified_medical_videos")
 
-        # Your project's root directory on the server
+
         self.PROJECT_ROOT = os.path.join(self.ML_SERVER_HOME, "data", "project_folder",
                                          "Language-Guided-Endoscopy-Localization")
 
-        # --- Data Paths (derived from UNIFIED_MEDICAL_VIDEOS_DIR) ---
         self.EXTRACTED_FRAMES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "extracted_frames")
-        # Direct paths needed by prepare_cholec80.py and dataset.py
         self.SPLIT_FILES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "cholec80_splits")
-        self.OUTPUT_TRIPLETS_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets")  # ADDED THIS LINE
+        self.OUTPUT_TRIPLETS_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets")
         self.CHOLEC80_PARSED_ANNOTATIONS = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "parsed_annotations",
-                                                        "CHOLEC80_parsed_annotations.csv")  # ADDED THIS LINE
+                                                        "CHOLEC80_parsed_annotations.csv")
 
         self.TRAIN_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
                                                     "cholec80_train_triplets.csv")
@@ -30,25 +26,20 @@ class Config:
         self.TEST_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
                                                    "cholec80_test_triplets.csv")
         self.VIDEO_ROOT_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR,
-                                            "extracted_frames")  # Assuming videos are extracted frames
+                                            "extracted_frames")
 
         # --- Model & Checkpoint Paths (derived from PROJECT_ROOT) ---
-        # Path to your pre-trained M2CRL backbone weights
         self.BACKBONE_WEIGHTS_PATH = os.path.join(self.PROJECT_ROOT, "pretrained", "checkpoint.pth")
         # Directory to save training checkpoints
         self.CHECKPOINT_DIR = os.path.join(self.PROJECT_ROOT, "checkpoints", "cholec80")
         # Directory for model outputs (e.g., inference results, visualizations)
         self.OUTPUT_DIR = os.path.join(self.PROJECT_ROOT, "outputs", "cholec80")
 
-        # --- Data Parameters (consistent with your previous configuration) ---
         self.DATA = self.DataConfig()
 
-        # --- Model Architecture Parameters (consistent with your previous configuration) ---
-        self.MODEL = self.ModelConfig()
-
-        # --- Training Hyperparameters (consistent with your previous configuration) ---
         self.TRAIN = self.TrainConfig()
 
+        self.MODEL = self.ModelConfig(project_root=self.PROJECT_ROOT)
         # --- TimeSformer (M²CRL Backbone) Specific Parameters ---
         self.TIMESFORMER = self.TimesformerConfig()
 
@@ -74,56 +65,54 @@ class Config:
         def __init__(self):
             self.TRAIN_CROP_SIZE = 224
             self.AUGMENT_PROB = 0.5
-            self.NUM_FRAMES = 16  # Number of frames in a video clip for spatio-temporal backbone
-            self.FRAME_RATE = 30  # Original video frame rate
-            self.CLIP_LENGTH = 16  # Keep consistent with NUM_FRAMES
-            self.NUM_INFERENCE_FRAMES = 50  # From your original config snippet
-            self.MAX_TEXT_LENGTH = 77  # From your original config snippet
-            self.NUM_WORKERS = 4  # From your original config snippet
+            self.NUM_FRAMES = 16
+            self.FRAME_RATE = 30
+            self.CLIP_LENGTH = 16
+            self.NUM_INFERENCE_FRAMES = 50
+            self.MAX_TEXT_LENGTH = 77
+            self.NUM_WORKERS = 4
 
     class ModelConfig:
-        def __init__(self):
+        def __init__(self, project_root):
             # --- Backbone Selection ---
-            # Choose your backbone: 'M2CRL' or 'EndoMamba'
             self.VISION_BACKBONE_NAME = "EndoMamba"
 
             # --- Backbone-Specific Paths ---
-            # Path for your original M2CRL weights
-            self.M2CRL_WEIGHTS_PATH = os.path.join(config.PROJECT_ROOT, "pretrained", "checkpoint.pth")
-            # Path for the downloaded EndoMamba weights
-            self.ENDOMAMBA_WEIGHTS_PATH = os.path.join(config.PROJECT_ROOT, "pretrained",
-                                                       "endomamba_small_b48_seqlen16_withteacher_MIX12_checkpoint-499.pth")
+            self.M2CRL_WEIGHTS_PATH = os.path.join(project_root, "pretrained", "checkpoint.pth")
+            self.ENDOMAMBA_WEIGHTS_PATH = os.path.join(project_root, "pretrained", "checkpoint-499.pth")
 
             # --- General Model Parameters ---
             self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"
             self.HEAD_NUM_ATTENTION_HEADS = 8
             self.HEAD_NUM_LAYERS = 2
+            self.TEMPORAL_HEAD_TYPE = 'SSM'
+            self.USE_UNCERTAINTY = True
             # NOTE: This embed_dim is for the text encoder and heads.
             # The vision_embed_dim will be set dynamically in the model itself.
             self.EMBED_DIM = 768
 
     class TrainConfig:
         def __init__(self):
-            self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # From your original config snippet
-            self.LEARNING_RATE = 1e-3  # From your original config snippet
-            self.BATCH_SIZE = 24  # From your original config snippet
-            self.NUM_EPOCHS = 10  # From your original config snippet, renamed from EPOCHS
-            self.TEMPORAL_LOSS_WEIGHT = 0.5  # From your original config snippet
+            self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+            self.LEARNING_RATE = 1e-3
+            self.BATCH_SIZE = 24
+            self.NUM_EPOCHS = 10
+            self.TEMPORAL_LOSS_WEIGHT = 0.5
             self.WARMUP_EPOCHS = 1
-            self.WEIGHT_DECAY = 1e-2  # Added for full training config, common default
-            self.GRADIENT_ACCUMULATION_STEPS = 1  # Added for full training config, common default
-            self.LOG_INTERVAL = 10  # Added for training logging
-            self.SAVE_INTERVAL = 2  # Added for checkpointing
-            self.USE_CUDA = torch.cuda.is_available()  # Ensures device is set correctly
+            self.WEIGHT_DECAY = 1e-2
+            self.EVIDENTIAL_LAMBDA = 0.2
+            self.GRADIENT_ACCUMULATION_STEPS = 1
+            self.LOG_INTERVAL = 10
+            self.SAVE_INTERVAL = 2
+            self.USE_CUDA = torch.cuda.is_available()
 
-            # PEFT LoRA Config for Text Encoder (consistent with your original config snippet)
             self.USE_PEFT = True
-            self.LORA_R = 8  # Renamed from PEFT_LORA_R for consistency
-            self.LORA_ALPHA = 16  # Renamed from PEFT_LORA_ALPHA for consistency
-            self.LORA_DROPOUT = 0.05  # Renamed from PEFT_LORA_DROPOUT for consistency
-            self.LORA_TARGET_MODULES = ["q_proj", "v_proj"]  # From your original config snippet
+            self.LORA_R = 8
+            self.LORA_ALPHA = 16
+            self.LORA_DROPOUT = 0.05
+            self.LORA_TARGET_MODULES = ["q_proj", "v_proj"]
 
-            # LoRA Configuration for Vision Backbone (added in previous turn)
+            # LoRA Configuration for Vision Backbone
             self.USE_LORA_BACKBONE = True  # Set to True to apply conceptual LoRA to the backbone
             self.LORA_R_BACKBONE = 8
             self.LORA_ALPHA_BACKBONE = 16
