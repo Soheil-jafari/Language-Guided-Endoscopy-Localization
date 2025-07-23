@@ -6,20 +6,13 @@ from typing import Optional, List
 import os
 import math
 
-# =========================================================================================
-# OFFICIAL IMPORTS (These will now work correctly)
-# =========================================================================================
 from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
-# This import now works because you have installed the mamba-ssm package
 from mamba_ssm.modules.mamba_simple import Mamba
-from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn
+from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm
 
 
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 1. POSITIONAL ENCODING
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len, device):
         super(PositionalEncoding, self).__init__()
@@ -37,9 +30,6 @@ class PositionalEncoding(nn.Module):
         return self.encoding[:seq_len, :]
 
 
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 2. CORE BUILDING BLOCKS
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class Block(nn.Module):
     def __init__(self, dim, mixer_cls, norm_cls=nn.LayerNorm, fused_add_norm=True, residual_in_fp32=True, drop_path=0.):
         super().__init__()
@@ -95,9 +85,6 @@ class PatchEmbed(nn.Module):
         return self.proj(x)
 
 
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 3. OFFICIAL ENDOMAMBA MODEL (ADAPTED FOR FINETUNING)
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class OriginalEndoMamba(nn.Module):
     def __init__(self, img_size=224, patch_size=16, depth=24, embed_dim=192, channels=3, num_classes=0,
                  drop_path_rate=0.1, ssm_cfg=None, norm_epsilon=1e-5, fused_add_norm=True, rms_norm=True,
@@ -180,9 +167,6 @@ class OriginalEndoMamba(nn.Module):
         return hidden_states
 
 
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 4. OUR PROJECT-SPECIFIC WRAPPER
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 class EndoMambaBackbone(nn.Module):
     def __init__(self, config):
         super().__init__()

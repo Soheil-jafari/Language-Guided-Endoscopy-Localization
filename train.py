@@ -211,30 +211,24 @@ def main(args):
         weight_decay=config.TRAIN.WEIGHT_DECAY
     )
 
-    # Your scheduler setup (unchanged)
     num_training_steps = len(train_loader) * epochs
     num_warmup_steps = len(train_loader) * config.TRAIN.WARMUP_EPOCHS
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps,
-                                                num_training_steps=num_training_steps)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
 
-    # === THIS BLOCK SELECTS THE CORRECT LOSS FUNCTION ===
     if config.MODEL.USE_UNCERTAINTY:
-        print("\n==============================================")
-        print("=== Training with UNCERTAINTY (Evidential Loss) ===")
-        print("==============================================")
+        print("\n=== Training with UNCERTAINTY (Evidential Loss) ===")
         criterion = EvidentialLoss()
     else:
-        print("\n======================================================")
-        print("=== Training without uncertainty (Dual Objective Loss) ===")
-        print("======================================================")
+        print("\n=== Training without uncertainty (Dual Objective Loss) ===")
         criterion = DualObjectiveLoss()
 
     best_val_loss = float('inf')
     print("\n--- Beginning Training and Validation Epochs ---")
 
+    # Your training loop was already correct and does not need to be changed.
     for epoch in range(epochs):
         print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_accuracy = validate_one_epoch(model, val_loader, criterion, device)
 
         print(f"\nEpoch {epoch + 1} Summary:")
@@ -243,14 +237,10 @@ def main(args):
         print(f"\tValidation Accuracy: {val_accuracy:.4f} ({val_accuracy:.2%})")
 
         if not args.debug:
-            # ONLY save the best model based on validation loss
-            # This block checks if the current validation loss is better than the previous best.
             if val_loss < best_val_loss:
-                best_val_loss = val_loss  # Update the best validation loss
+                best_val_loss = val_loss
                 best_model_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
-
                 model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-
                 torch.save(model_state, best_model_path)
                 print(f"\t*** New best model saved to {best_model_path} ***")
 
