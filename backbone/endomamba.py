@@ -10,8 +10,7 @@ from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 from mamba_ssm.modules.mamba_simple import Mamba
-from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm
-
+from mamba_ssm.ops.triton.layer_norm import RMSNorm
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len, device):
@@ -41,18 +40,18 @@ class Block(nn.Module):
         self.bimamba = mixer_cls.keywords.get('bimamba', True)
 
     def forward(self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None):
-        if not self.fused_add_norm:
-            residual = (residual + self.drop_path(hidden_states)) if residual is not None else hidden_states
-            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
-            if self.residual_in_fp32:
-                residual = residual.to(torch.float32)
+        # This simplified logic works with the newer mamba-ssm versions
+        if residual is None:
+            residual = hidden_states
         else:
-            fused_add_norm_fn = rms_norm_fn
-            hidden_states, residual = fused_add_norm_fn(
-                hidden_states if residual is None else self.drop_path(hidden_states),
-                self.norm.weight, self.norm.bias, residual=residual, prenorm=True,
-                residual_in_fp32=self.residual_in_fp32, eps=self.norm.eps,
-            )
+            residual = residual + self.drop_path(hidden_states)
+
+        # The normalization is now done directly
+        hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+
+        if self.residual_in_fp32:
+            residual = residual.to(torch.float32)
+
         hidden_states = self.mixer(hidden_states, inference_params=inference_params)
         return hidden_states, residual
 
@@ -63,7 +62,10 @@ def create_block(d_model, ssm_cfg=None, norm_epsilon=1e-5, drop_path=0., rms_nor
     if ssm_cfg is None: ssm_cfg = {}
     mixer_cls = partial(Mamba, layer_idx=layer_idx, bimamba=bimamba, **ssm_cfg, return_last_state=return_last_state,
                         **factory_kwargs)
+
+    # This line correctly uses the imported RMSNorm
     norm_cls = partial(RMSNorm, eps=norm_epsilon)
+
     block = Block(d_model, mixer_cls, norm_cls=norm_cls, drop_path=drop_path, fused_add_norm=fused_add_norm,
                   residual_in_fp32=residual_in_fp32)
     block.layer_idx = layer_idx
@@ -161,9 +163,10 @@ class OriginalEndoMamba(nn.Module):
                 hidden_states = rearrange(hidden_states, 'b (t n) m -> b t n m', n=x.shape[1], t=T)
                 if residual is not None: residual = rearrange(residual, 'b (t n) m -> b t n m', n=x.shape[1], t=T)
 
-        fused_add_norm_fn = rms_norm_fn
-        hidden_states = fused_add_norm_fn(hidden_states, self.norm_f.weight, self.norm_f.bias, eps=self.norm_f.eps,
-                                          residual=residual, prenorm=False, residual_in_fp32=True)
+        if residual is not None:
+            hidden_states = (hidden_states + residual).to(dtype=hidden_states.dtype)
+        hidden_states = self.norm_f(hidden_states)
+
         return hidden_states
 
 

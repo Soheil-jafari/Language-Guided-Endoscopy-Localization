@@ -75,7 +75,7 @@ class Config:
     class ModelConfig:
         def __init__(self, project_root):
             # --- Backbone Selection ---
-            self.VISION_BACKBONE_NAME = "EndoMamba"
+            self.VISION_BACKBONE_NAME = "M2CRL"
 
             # --- Backbone-Specific Paths ---
             self.M2CRL_WEIGHTS_PATH = os.path.join(project_root, "pretrained", "checkpoint.pth")
@@ -87,6 +87,7 @@ class Config:
             self.HEAD_NUM_LAYERS = 2
             self.TEMPORAL_HEAD_TYPE = 'SSM'
             self.USE_UNCERTAINTY = True
+            self.USE_CONFIDENCE_FUSION = True
             # NOTE: This embed_dim is for the text encoder and heads.
             # The vision_embed_dim will be set dynamically in the model itself.
             self.EMBED_DIM = 768
@@ -94,16 +95,19 @@ class Config:
     class TrainConfig:
         def __init__(self):
             self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            self.LEARNING_RATE = 1e-3
+            self.LEARNING_RATE = 1e-5
             self.BATCH_SIZE = 24
-            self.NUM_EPOCHS = 10
+            self.NUM_EPOCHS = 20
             self.TEMPORAL_LOSS_WEIGHT = 0.5
             self.WARMUP_EPOCHS = 1
-            self.WEIGHT_DECAY = 1e-2
+            self.WEIGHT_DECAY = 4e-2
             self.EVIDENTIAL_LAMBDA = 0.2
             self.GRADIENT_ACCUMULATION_STEPS = 1
             self.LOG_INTERVAL = 10
             self.SAVE_INTERVAL = 2
+            self.USE_BILEVEL_CONSISTENCY = True
+            self.SEMANTIC_LOSS_WEIGHT = 0.3
+            self.OPTICAL_FLOW_LOSS_WEIGHT = 0.5
             self.USE_CUDA = torch.cuda.is_available()
 
             self.USE_PEFT = True

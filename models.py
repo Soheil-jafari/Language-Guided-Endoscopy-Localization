@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from project_config import config
 from backbone.vision_transformer import VisionTransformer
 from backbone.vision_transformer import load_pretrained, _cfg, _conv_filter
-from backbone.endomamba import EndoMambaBackbone
 
 
 
@@ -45,6 +44,34 @@ def apply_lora_to_linear_layers(model, r=8, alpha=16, dropout=0.0):
         else:
             apply_lora_to_linear_layers(module, r, alpha, dropout)
 
+class ConfidenceAwareFusion(nn.Module):
+    """
+    Calculates a confidence score for each frame based on its semantic
+    relevance to the text query, as inspired by VTD-CLIP.
+    """
+    def __init__(self, embed_dim):
+        super().__init__()
+        # A small network to predict the confidence score from combined features
+        self.confidence_network = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim // 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim // 2, 1),
+            nn.Sigmoid() # Squeezes the output to a score between 0 and 1
+        )
+
+    def forward(self, visual_features, text_features_expanded):
+        # visual_features: (B*T, N_patches, C)
+        # text_features_expanded: (B*T, L, C)
+
+        # Create a single summary vector for all visual patches and all text tokens
+        avg_visual = visual_features.mean(dim=1) # Shape: (B*T, C)
+        avg_text = text_features_expanded.mean(dim=1) # Shape: (B*T, C)
+
+        # Concatenate the summaries and compute the confidence score
+        combined_features = torch.cat([avg_visual, avg_text], dim=1)
+        confidence_scores = self.confidence_network(combined_features) # Shape: (B*T, 1)
+
+        return confidence_scores
 
 # --- Start Self-Contained Mamba Block Implementation ---
 class MambaBlock(nn.Module):
@@ -61,31 +88,47 @@ class MambaBlock(nn.Module):
             in_channels=self.d_inner, out_channels=self.d_inner,
             bias=True, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1,
         )
-        self.x_proj = nn.Linear(self.d_inner, self.d_model + 2 * self.d_state, bias=False)
+        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)  # Simplified this line slightly
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
         self.act = nn.SiLU()
+
         self.A_log = nn.Parameter(torch.log(torch.ones(self.d_inner, self.d_state)))
         self.B = nn.Parameter(torch.randn(self.d_inner, self.d_state))
         self.C = nn.Parameter(torch.randn(self.d_inner, self.d_state))
         self.D = nn.Parameter(torch.ones(self.d_inner))
-        self.dt_proj = nn.Linear(self.d_model, self.d_inner, bias=True)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
 
     def ssm_scan(self, x):
         delta = F.softplus(self.dt_proj(x))
         A = -torch.exp(self.A_log.float())
+
         delta_A = torch.exp(delta.unsqueeze(-1) * A)
         delta_B_x = (delta.unsqueeze(-1) * self.B.unsqueeze(0)) * x.unsqueeze(-1)
+
         h = torch.zeros(x.size(0), self.d_inner, self.d_state, device=x.device)
         ys = []
         for i in range(x.size(1)):
             h = delta_A[:, i] * h + delta_B_x[:, i]
-            y = (h @ self.C.unsqueeze(-1)).squeeze(-1)
+
+            y = (h * self.C).sum(dim=-1)
             ys.append(y)
-        return torch.stack(ys, dim=1) + x * self.D
+
+        y = torch.stack(ys, dim=1)
+
+        return y + x * self.D
 
     def forward(self, x):
+
         (x_proj, res) = self.in_proj(x).split(split_size=[self.d_inner, self.d_inner], dim=-1)
-        x_conv = self.act(self.conv1d(x_proj.transpose(1, 2))).transpose(1, 2)
+
+        x_proj_transposed = x_proj.transpose(1, 2)
+
+        x_conv_transposed = self.conv1d(x_proj_transposed)
+
+        x_conv_transposed = x_conv_transposed[:, :, :x.size(1)]
+
+        x_conv = self.act(x_conv_transposed).transpose(1, 2)
+
         x_ssm = self.ssm_scan(x_conv)
         x_out = self.out_proj(x_ssm * self.act(res))
         return x_out
@@ -120,19 +163,39 @@ class LanguageGuidedHead(nn.Module):
         self.fc_relevance = nn.Linear(visual_embed_dim, 1)
         self.text_proj = nn.Linear(text_embed_dim, visual_embed_dim)
 
+        if config.MODEL.USE_CONFIDENCE_FUSION:
+            self.confidence_module = ConfidenceAwareFusion(visual_embed_dim)
+        else:
+            self.confidence_module = None
+
     def forward(self, visual_features, text_features, text_attention_mask):
         B_T, _, C_visual = visual_features.shape
         B_original, L_text, _ = text_features.shape
         T_frames = B_T // B_original
-        text_features_expanded = self.text_proj(text_features).unsqueeze(1).expand(-1, T_frames, -1, -1).reshape(B_T,
-                                                                                                                 L_text,
-                                                                                                                 C_visual)
-        text_mask_expanded = text_attention_mask.unsqueeze(1).expand(-1, T_frames, -1).reshape(B_T, L_text)
-        fused_features = self.transformer_decoder(tgt=visual_features, memory=text_features_expanded,
-                                                  memory_key_padding_mask=~text_mask_expanded.bool())
-        frame_features_for_temporal_head = fused_features.mean(dim=1)
-        return frame_features_for_temporal_head, None  # None is placeholder for XAI weights
 
+        text_features_proj = self.text_proj(text_features)
+        text_features_expanded = text_features_proj.unsqueeze(1).expand(-1, T_frames, -1, -1).reshape(B_T, L_text,
+                                                                                                      C_visual)
+        text_mask_expanded = text_attention_mask.unsqueeze(1).expand(-1, T_frames, -1).reshape(B_T, L_text)
+
+        if self.confidence_module is not None:
+            confidence_scores = self.confidence_module(visual_features, text_features_expanded)
+            weighted_visual_features = visual_features * confidence_scores.unsqueeze(1)
+        else:
+            weighted_visual_features = visual_features
+
+        # This is the full spatial feature map (needed for optical flow)
+        fused_spatial_features = self.transformer_decoder(
+            tgt=weighted_visual_features,
+            memory=text_features_expanded,
+            memory_key_padding_mask=~text_mask_expanded.bool()
+        )
+
+        # This is the averaged semantic feature vector (for the temporal head)
+        frame_features_for_temporal_head = fused_spatial_features.mean(dim=1)
+
+        # === THIS IS THE FIX: Return all three values as expected ===
+        return frame_features_for_temporal_head, fused_spatial_features, None
 
 # --- Kept Original Temporal Head ---
 class TemporalHead(nn.Module):
@@ -155,7 +218,7 @@ class TemporalHead(nn.Module):
         else:
             return logits
 
-# --- New SSM Temporal Head ---
+# --- SSM Temporal Head ---
 class TemporalHeadSSM(nn.Module):
     def __init__(self, input_dim, output_dim, num_layers=4):
         super().__init__()
@@ -204,7 +267,7 @@ class LocalizationFramework(nn.Module):
 
         elif config.MODEL.VISION_BACKBONE_NAME == 'EndoMamba':
             print("Initializing Vision Backbone: EndoMamba")
-            self.vision_backbone = EndoMambaBackbone(config)
+            #self.vision_backbone = EndoMambaBackbone(config)
 
             if config.TRAIN.USE_LORA_BACKBONE:
                 apply_lora_to_linear_layers(
@@ -228,8 +291,7 @@ class LocalizationFramework(nn.Module):
                                                        num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
                                                        num_layers=config.MODEL.HEAD_NUM_LAYERS)
 
-        # 4. SELECTABLE Temporal Head with UNCERTAINTY
-        # Determine the output dimension based on the uncertainty setting
+
         output_dim = 4 if config.MODEL.USE_UNCERTAINTY else 1
 
         if config.MODEL.TEMPORAL_HEAD_TYPE == 'SSM':
@@ -247,32 +309,32 @@ class LocalizationFramework(nn.Module):
             raise ValueError(f"Unknown TEMPORAL_HEAD_TYPE: {config.MODEL.TEMPORAL_HEAD_TYPE}")
 
     def forward(self, video_clip, input_ids, attention_mask):
-        B_original, _, T_frames, _, _ = video_clip.shape
-        # ... (forward pass for backbone, text encoder, language head remains the same) ...
+        B_original, _, T_frames, H, W = video_clip.shape
+        num_patches_h = H // self.vision_backbone.patch_embed.patch_size[0]
+        num_patches_w = W // self.vision_backbone.patch_embed.patch_size[1]
+
         all_tokens = self.vision_backbone.forward_features(video_clip, get_all=True)
         visual_features_for_head = all_tokens[:, 1:, :].reshape(B_original * T_frames, -1, self.vision_embed_dim)
-
         text_features, _ = self.text_encoder(input_ids, attention_mask)
 
-        frame_features, xai_weights = self.language_guided_head(visual_features_for_head, text_features, attention_mask)
-        frame_features_reshaped = frame_features.reshape(B_original, T_frames, self.vision_embed_dim)
+        semantic_features_1d, spatial_features_2d, xai_weights = self.language_guided_head(visual_features_for_head,
+                                                                                           text_features,
+                                                                                           attention_mask)
 
-        raw_relevance_scores = self.language_guided_head.fc_relevance(frame_features).reshape(B_original, T_frames, 1)
+        semantic_features_reshaped = semantic_features_1d.reshape(B_original, T_frames, self.vision_embed_dim)
 
-        # 4. Temporal Context Modeling
-        # This will return either (B, T, 1) or (B, T, 4) depending on the config
-        final_output = self.temporal_head(frame_features_reshaped)
+        # Reshape 2D features for the loss function
+        spatial_features_reshaped = spatial_features_2d.reshape(B_original, T_frames, num_patches_h, num_patches_w,
+                                                                self.vision_embed_dim)
 
-        # The 'refined_scores' are now the first part of the model output.
-        # When not using uncertainty, final_output is refined_scores.
-        # When using uncertainty, we still need a primary score for evaluation.
-        # We can calculate it from the evidential parameters (alpha / (alpha + beta)).
+        raw_relevance_scores = self.language_guided_head.fc_relevance(semantic_features_1d).reshape(B_original,
+                                                                                                    T_frames, 1)
+        final_output = self.temporal_head(semantic_features_reshaped)
         if self.config.MODEL.USE_UNCERTAINTY:
             alpha = final_output[..., 0:1] + 1
             beta = final_output[..., 1:2] + 1
             refined_scores = alpha / (alpha + beta)
-            return final_output, refined_scores, raw_relevance_scores, xai_weights
+            return final_output, refined_scores, raw_relevance_scores, xai_weights, semantic_features_reshaped, spatial_features_reshaped
         else:
-            # If not using uncertainty, the output is just the scores.
             refined_scores = final_output
-            return refined_scores, raw_relevance_scores, xai_weights
+            return refined_scores, raw_relevance_scores, xai_weights, semantic_features_reshaped, spatial_features_reshaped
