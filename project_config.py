@@ -85,9 +85,9 @@ class Config:
             self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"
             self.HEAD_NUM_ATTENTION_HEADS = 8
             self.HEAD_NUM_LAYERS = 2
-            self.TEMPORAL_HEAD_TYPE = 'SSM'
-            self.USE_UNCERTAINTY = True
-            self.USE_CONFIDENCE_FUSION = True
+            self.TEMPORAL_HEAD_TYPE = 'TRANSFORMER'
+            self.USE_UNCERTAINTY = False
+            self.USE_CONFIDENCE_FUSION = False
             # NOTE: This embed_dim is for the text encoder and heads.
             # The vision_embed_dim will be set dynamically in the model itself.
             self.EMBED_DIM = 768
@@ -97,15 +97,15 @@ class Config:
             self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
             self.LEARNING_RATE = 1e-5
             self.BATCH_SIZE = 24
-            self.NUM_EPOCHS = 20
-            self.TEMPORAL_LOSS_WEIGHT = 0.5
+            self.NUM_EPOCHS = 30
+            self.TEMPORAL_LOSS_WEIGHT = 0.2
             self.WARMUP_EPOCHS = 1
-            self.WEIGHT_DECAY = 4e-2
+            self.WEIGHT_DECAY = 0.1
             self.EVIDENTIAL_LAMBDA = 0.2
             self.GRADIENT_ACCUMULATION_STEPS = 1
             self.LOG_INTERVAL = 10
-            self.SAVE_INTERVAL = 2
-            self.USE_BILEVEL_CONSISTENCY = True
+            self.SAVE_INTERVAL = 1
+            self.USE_BILEVEL_CONSISTENCY = False
             self.SEMANTIC_LOSS_WEIGHT = 0.3
             self.OPTICAL_FLOW_LOSS_WEIGHT = 0.5
             self.USE_CUDA = torch.cuda.is_available()
@@ -113,14 +113,14 @@ class Config:
             self.USE_PEFT = True
             self.LORA_R = 8
             self.LORA_ALPHA = 16
-            self.LORA_DROPOUT = 0.05
+            self.LORA_DROPOUT = 0.1
             self.LORA_TARGET_MODULES = ["q_proj", "v_proj"]
 
             # LoRA Configuration for Vision Backbone
             self.USE_LORA_BACKBONE = True  # Set to True to apply conceptual LoRA to the backbone
             self.LORA_R_BACKBONE = 8
             self.LORA_ALPHA_BACKBONE = 16
-            self.LORA_DROPOUT_BACKBONE = 0.1
+            self.LORA_DROPOUT_BACKBONE = 0.2
 
     class TimesformerConfig:
         def __init__(self):

@@ -4,7 +4,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-import torch.cuda.amp
+from torch.cuda.amp import GradScaler, autocast
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -31,7 +31,6 @@ class EvidentialLoss(nn.Module):
         self.regularizer_weight = regularizer_weight
 
     def forward(self, evidential_output, target):
-
         target = target.unsqueeze(-1)
 
         evidence = F.softplus(evidential_output)
@@ -43,142 +42,130 @@ class EvidentialLoss(nn.Module):
         log_likelihood_positive = torch.log(S) - torch.log(alpha)
         log_likelihood_negative = torch.log(S) - torch.log(beta)
 
-        # This multiplication now works correctly
         loss = target * log_likelihood_positive + (1 - target) * log_likelihood_negative
 
         regularizer = (2.0 + alpha + beta) / S
         loss += self.regularizer_weight * (target - (alpha / S)).abs() * regularizer
 
-        # Return three values to match the signature of the other loss functions
         total_loss = loss.mean()
-        return total_loss, total_loss, torch.tensor(0.0)
-
-class DualObjectiveLoss(nn.Module):
-    # Access temporal_weight from the config object
-    def __init__(self, temporal_weight=config.TRAIN.TEMPORAL_LOSS_WEIGHT):
-        super().__init__()
-        self.relevance_loss = nn.BCEWithLogitsLoss()
-        self.temporal_weight = temporal_weight
-
-    def forward(self, refined_scores, raw_relevance_scores, ground_truth_relevance):
-        """
-        Calculates a dual objective loss combining BCE on both refined and raw scores,
-        plus an optional temporal consistency loss.
-
-        Args:
-            refined_scores (torch.Tensor): Output from the TemporalHead (B, T, 1).
-            raw_relevance_scores (torch.Tensor): Output from the LanguageGuidedHead (B, T, 1).
-            ground_truth_relevance (torch.Tensor): Ground truth relevance labels (B, T).
-
-        Returns:
-            tuple: (total_loss, primary_loss, temporal_loss)
-        """
-        refined_scores_squeezed = refined_scores.squeeze(-1)
-        raw_relevance_scores_squeezed = raw_relevance_scores.squeeze(-1)
-
-        primary_loss_refined = self.relevance_loss(refined_scores_squeezed, ground_truth_relevance)
-        primary_loss_raw = self.relevance_loss(raw_relevance_scores_squeezed, ground_truth_relevance)
-
-        # Combine the two primary loss components.
-        primary_loss = primary_loss_refined + primary_loss_raw
-
-        temporal_loss = 0.0
-        # Calculate temporal consistency loss if weight > 0 and clip has more than one frame
-        if self.temporal_weight > 0 and refined_scores_squeezed.shape[1] > 1:
-            # Calculate absolute difference between consecutive refined scores
-            scores_t = refined_scores_squeezed[:, 1:]
-            scores_t_minus_1 = refined_scores_squeezed[:, :-1]
-            temporal_loss = torch.mean(torch.abs(scores_t - scores_t_minus_1))
-
-        # Total loss is the sum of primary and weighted temporal loss
-        total_loss = primary_loss + (self.temporal_weight * temporal_loss)
-
-        return total_loss, primary_loss, temporal_loss
+        return total_loss, total_loss, torch.tensor(0.0) # Return three values to match signature
 
 
-class BilevelConsistencyLoss(nn.Module):
+class MasterLoss(nn.Module):
+    """
+    A unified loss function that provides full, independent control over
+    using evidential loss for uncertainty and bilevel consistency for regularization.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.relevance_loss = nn.BCEWithLogitsLoss()
-        self.consistency_loss = nn.L1Loss()
+        self.use_uncertainty = config.MODEL.USE_UNCERTAINTY
+        self.use_bilevel_consistency = config.TRAIN.USE_BILEVEL_CONSISTENCY
 
-        self.optical_flow_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(config.TRAIN.DEVICE)
-        self.optical_flow_model.eval()
+        # Initialize all potential loss components
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        if self.use_uncertainty:
+            self.evidential_loss = EvidentialLoss()
 
-    def warp_features(self, features, flow):
-        """Warps features from frame t to t+1 using the optical flow field."""
-        B, T, H_feat, W_feat, C = features.shape  # Note: H_feat and W_feat are feature map dimensions (e.g., 14x14)
-
-        # === THIS IS THE FIX: Downsample the flow field ===
-        # The flow has shape [B*(T-1), 2, H_img, W_img]. We need to downsample it to [B*(T-1), 2, H_feat, W_feat]
-        downsampled_flow = F.interpolate(flow, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-
-        # Scale the flow vectors to match the new, smaller resolution
-        scale_factor_h = H_feat / flow.shape[2]
-        scale_factor_w = W_feat / flow.shape[3]
-        downsampled_flow[:, 0, :, :] *= scale_factor_w
-        downsampled_flow[:, 1, :, :] *= scale_factor_h
-
-        # 1. Create the base grid of pixel coordinates for the FEATURE MAP
-        grid_y, grid_x = torch.meshgrid(torch.arange(H_feat, device=flow.device),
-                                        torch.arange(W_feat, device=flow.device), indexing="ij")
-        grid = torch.stack((grid_x, grid_y), 2).float()  # Shape: [H_feat, W_feat, 2]
-
-        # 2. Expand the grid to match the batch size
-        grid = grid.unsqueeze(0).expand(B * (T - 1), -1, -1, -1)  # Shape: [B*(T-1), H_feat, W_feat, 2]
-
-        # 3. Permute the downsampled flow to match grid dimensions
-        downsampled_flow = downsampled_flow.permute(0, 2, 3, 1)  # Shape: [B*(T-1), H_feat, W_feat, 2]
-
-        # 4. Add the grid and flow to get the new sampling coordinates. This will now work.
-        new_grid = grid + downsampled_flow
-
-        # 5. Normalize grid values for grid_sample
-        new_grid[..., 0] = 2.0 * new_grid[..., 0] / max(W_feat - 1, 1) - 1.0
-        new_grid[..., 1] = 2.0 * new_grid[..., 1] / max(H_feat - 1, 1) - 1.0
-
-        # 6. Reshape features and warp them
-        features_to_warp = features[:, :-1].reshape(B * (T - 1), H_feat, W_feat, C).permute(0, 3, 1, 2)
-        warped_features = F.grid_sample(features_to_warp, new_grid, padding_mode='border', align_corners=True)
-
-        # 7. Reshape back to the original format
-        warped_features = warped_features.permute(0, 2, 3, 1).reshape(B, T - 1, H_feat, W_feat, C)
-        return warped_features
+        if self.use_bilevel_consistency:
+            self.consistency_loss_l1 = nn.L1Loss()
+            self.optical_flow_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(
+                config.TRAIN.DEVICE)
+            self.optical_flow_model.eval()
 
     def forward(self, model_outputs, video_clip, ground_truth_relevance):
-        refined_scores, raw_scores, _, semantic_features, spatial_features = model_outputs
+        # --- 1. Primary Relevance Loss Calculation ---
+        primary_loss = torch.tensor(0.0, device=self.config.TRAIN.DEVICE)
 
-        primary_loss = self.relevance_loss(raw_scores.squeeze(-1), ground_truth_relevance)
+        if self.use_uncertainty:
+            evidential_output, *_ = model_outputs
+            primary_loss, _, _ = self.evidential_loss(evidential_output, ground_truth_relevance)
+        else:
+            refined_scores, raw_scores, *_ = model_outputs
+            loss_refined = self.bce_loss(refined_scores.squeeze(-1), ground_truth_relevance)
+            loss_raw = self.bce_loss(raw_scores.squeeze(-1), ground_truth_relevance)
+            primary_loss = loss_refined + loss_raw
 
-        semantic_loss = torch.tensor(0.0, device=refined_scores.device)
-        if self.config.TRAIN.SEMANTIC_LOSS_WEIGHT > 0 and semantic_features.shape[1] > 1:
-            semantic_loss = self.consistency_loss(semantic_features[:, 1:], semantic_features[:, :-1])
+        # --- 2. Consistency Regularization Calculation ---
+        consistency_loss = torch.tensor(0.0, device=self.config.TRAIN.DEVICE)
 
-        flow_loss = torch.tensor(0.0, device=refined_scores.device)
-        if self.config.TRAIN.OPTICAL_FLOW_LOSS_WEIGHT > 0 and video_clip.shape[2] > 1:
-            with torch.no_grad():
-                B, C, T, H, W = video_clip.shape
-                video_permuted = video_clip.permute(0, 2, 1, 3, 4)
-                video_t = video_permuted[:, :-1].reshape(-1, C, H, W)
-                video_t_plus_1 = video_permuted[:, 1:].reshape(-1, C, H, W)
+        if self.use_bilevel_consistency:
+            _, _, _, semantic_features, spatial_features, _ = model_outputs
 
-                video_t = normalize(video_t, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-                video_t_plus_1 = normalize(video_t_plus_1, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            if semantic_features is not None and spatial_features is not None:
+                # Semantic Consistency
+                semantic_loss = torch.tensor(0.0, device=primary_loss.device)
+                if self.config.TRAIN.SEMANTIC_LOSS_WEIGHT > 0 and semantic_features.shape[1] > 1:
+                    semantic_loss = self.consistency_loss_l1(semantic_features[:, 1:], semantic_features[:, :-1])
 
-                flow = self.optical_flow_model(video_t, video_t_plus_1)[-1]
+                # Optical Flow Consistency
+                flow_loss = torch.tensor(0.0, device=primary_loss.device)
+                if self.config.TRAIN.OPTICAL_FLOW_LOSS_WEIGHT > 0 and video_clip.shape[2] > 1:
+                    with torch.no_grad():
+                        B, C, T, H, W = video_clip.shape
+                        video_permuted = video_clip.permute(0, 2, 1, 3, 4)
 
-            warped_spatial_features = self.warp_features(spatial_features, flow)
-            actual_next_features = spatial_features[:, 1:]
-            flow_loss = self.consistency_loss(warped_spatial_features, actual_next_features)
+                        # === THIS IS THE FINAL, CORRECT FIX ===
+                        # The reshape operation on a permuted tensor can create a non-contiguous tensor.
+                        # We force it to be contiguous right before it's used.
+                        video_t = video_permuted[:, :-1].reshape(-1, C, H, W).contiguous()
+                        video_t_plus_1 = video_permuted[:, 1:].reshape(-1, C, H, W).contiguous()
 
-        total_loss = (primary_loss +
-                      self.config.TRAIN.SEMANTIC_LOSS_WEIGHT * semantic_loss +
-                      self.config.TRAIN.OPTICAL_FLOW_LOSS_WEIGHT * flow_loss)
+                        flow = self.optical_flow_model(normalize(video_t, [0.5] * 3, [0.5] * 3),
+                                                       normalize(video_t_plus_1, [0.5] * 3, [0.5] * 3))[-1]
 
-        return total_loss, primary_loss, semantic_loss + flow_loss
+                    warped_spatial = self.warp_features(spatial_features, flow)
+                    actual_next = spatial_features[:, 1:]
+                    flow_loss = self.consistency_loss_l1(warped_spatial, actual_next)
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=1, last_epoch=-1):
+                consistency_loss = (self.config.TRAIN.SEMANTIC_LOSS_WEIGHT * semantic_loss +
+                                    self.config.TRAIN.OPTICAL_FLOW_LOSS_WEIGHT * flow_loss)
+            else:
+                print(
+                    "\nWARNING: Bilevel consistency is ON, but model did not return consistency features. Skipping consistency loss for this batch.\n",
+                    flush=True)
+
+        # --- 3. Final Loss Combination ---
+        total_loss = primary_loss + consistency_loss
+        return total_loss, primary_loss, consistency_loss
+
+    def warp_features(self, features, flow):
+        # This helper function is correct and needs no changes.
+        B, T, H_feat, W_feat, C = features.shape
+        downsampled_flow = F.interpolate(flow, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+        scale_factor_h, scale_factor_w = H_feat / flow.shape[2], W_feat / flow.shape[3]
+        downsampled_flow[:, 0, :, :] *= scale_factor_w
+        downsampled_flow[:, 1, :, :] *= scale_factor_h
+        grid_y, grid_x = torch.meshgrid(torch.arange(H_feat, device=flow.device),
+                                        torch.arange(W_feat, device=flow.device), indexing="ij")
+        grid = torch.stack((grid_x, grid_y), 2).float().unsqueeze(0).expand(B * (T - 1), -1, -1, -1)
+        new_grid = grid + downsampled_flow.permute(0, 2, 3, 1)
+        new_grid[..., 0] = 2.0 * new_grid[..., 0] / max(W_feat - 1, 1) - 1.0
+        new_grid[..., 1] = 2.0 * new_grid[..., 1] / max(H_feat - 1, 1) - 1.0
+        features_to_warp = features[:, :-1].reshape(B * (T - 1), H_feat, W_feat, C).permute(0, 3, 1, 2)
+        warped_features = F.grid_sample(features_to_warp, new_grid, padding_mode='border', align_corners=True)
+        return warped_features.permute(0, 2, 3, 1).reshape(B, T - 1, H_feat, W_feat, C)
+
+    def warp_features(self, features, flow):
+        # Helper function for optical flow - no changes needed
+        B, T, H_feat, W_feat, C = features.shape
+        downsampled_flow = F.interpolate(flow, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+        scale_factor_h, scale_factor_w = H_feat / flow.shape[2], W_feat / flow.shape[3]
+        downsampled_flow[:, 0, :, :] *= scale_factor_w
+        downsampled_flow[:, 1, :, :] *= scale_factor_h
+        grid_y, grid_x = torch.meshgrid(torch.arange(H_feat, device=flow.device),
+                                        torch.arange(W_feat, device=flow.device), indexing="ij")
+        grid = torch.stack((grid_x, grid_y), 2).float().unsqueeze(0).expand(B * (T - 1), -1, -1, -1)
+        new_grid = grid + downsampled_flow.permute(0, 2, 3, 1)
+        new_grid[..., 0] = 2.0 * new_grid[..., 0] / max(W_feat - 1, 1) - 1.0
+        new_grid[..., 1] = 2.0 * new_grid[..., 1] / max(H_feat - 1, 1) - 1.0
+        features_to_warp = features[:, :-1].reshape(B * (T - 1), H_feat, W_feat, C).permute(0, 3, 1, 2)
+        warped_features = F.grid_sample(features_to_warp, new_grid, padding_mode='border', align_corners=True)
+        return warped_features.permute(0, 2, 3, 1).reshape(B, T - 1, H_feat, W_feat, C)
+
+# Corrected get_cosine_schedule_with_warmup: num_cycles=1.0
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=1.0, last_epoch=-1):
     """
     Create a schedule with a learning rate that linearly increases during
     `num_warmup_steps` and then decreases following a cosine curve.
@@ -194,75 +181,67 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device):
+# Corrected train_one_epoch signature for optimizer and criterion order
+def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device):
     model.train()
-    total_loss_tracker = 0.0
-
+    running_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
-    for batch in progress_bar:
-        video_clip = batch['video_clip'].to(device)
+
+    # Correctly initialized GradScaler
+    scaler = GradScaler()
+
+    for i, batch in enumerate(progress_bar):
+        # === THIS IS THE FIX: Ensure tensor is in contiguous memory ===
+        video_clip = batch['video_clip'].to(device).contiguous()
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device).float()
+        relevance = batch['labels'].to(device)
 
-        optimizer.zero_grad()
-        outputs = model(video_clip, input_ids, attention_mask)
+        # Correctly uses the imported autocast
+        with autocast():
+            outputs = model(video_clip, input_ids, attention_mask)
+            loss, _, _ = criterion(outputs, video_clip, relevance)
+            if isinstance(loss, torch.Tensor) and loss.numel() > 1:
+                loss = loss.mean()
 
-        # --- THIS IS THE FIX ---
-        if config.MODEL.USE_UNCERTAINTY:
-            evidential_output, _, _, _, _, _ = outputs
-            loss, _, _ = criterion(evidential_output, labels)
-        elif config.TRAIN.USE_BILEVEL_CONSISTENCY:
-            # The bilevel loss function expects the entire outputs tuple
-            loss, _, _ = criterion(outputs, video_clip, labels)
-        else:
-            # The baseline DualObjectiveLoss only needs the first two tensors
-            refined_scores, raw_scores, _, _, _ = outputs
-            loss, _, _ = criterion(refined_scores, raw_scores, labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        running_loss += loss.item()
+        progress_bar.set_postfix(loss=f"{running_loss / (i + 1):.4f}")
 
-        loss.backward()
-        optimizer.step()
+    return running_loss / len(dataloader)
 
-        total_loss_tracker += loss.item()
-        progress_bar.set_postfix(loss=loss.item())
-
-    return total_loss_tracker / len(dataloader)
-
-
+# Corrected validate_one_epoch signature for optimizer and criterion order
 def validate_one_epoch(model, dataloader, criterion, device):
     model.eval()
     running_loss, all_preds, all_labels = 0.0, [], []
     progress_bar = tqdm(dataloader, desc="Validating", unit="batch", leave=False)
 
     with torch.no_grad():
-        for batch in progress_bar:
-            video_clip = batch['video_clip'].to(device)
+        for i, batch in enumerate(progress_bar):
+            # === THIS IS THE FIX: Ensure tensor is in contiguous memory ===
+            video_clip = batch['video_clip'].to(device).contiguous()
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device).float()
-
+            relevance = batch['labels'].to(device)
             outputs = model(video_clip, input_ids, attention_mask)
 
-            # --- THIS IS THE FIX ---
-            if config.MODEL.USE_UNCERTAINTY:
-                evidential_output, refined_scores, _, _, _, _ = outputs
-                loss, _, _ = criterion(evidential_output, labels)
-                preds = refined_scores.squeeze(-1) > 0.5
-            elif config.TRAIN.USE_BILEVEL_CONSISTENCY:
-                refined_scores, _, _, _, _ = outputs
-                loss, _, _ = criterion(outputs, video_clip, labels)
-                preds = torch.sigmoid(refined_scores.squeeze(-1)) > 0.5
-            else:
-                refined_scores, raw_scores, _, _, _ = outputs
-                loss, _, _ = criterion(refined_scores, raw_scores, labels)
-                preds = torch.sigmoid(refined_scores.squeeze(-1)) > 0.5
-
+            # The call to criterion is now simple and direct.
+            loss, _, _ = criterion(outputs, video_clip, relevance)
             if isinstance(loss, torch.Tensor) and loss.numel() > 1:
                 loss = loss.mean()
 
+            # Prediction logic must now handle both uncertainty and standard modes
+            if config.MODEL.USE_UNCERTAINTY:
+                _, refined_scores, *_ = outputs
+            else:
+                refined_scores, *_ = outputs
+            preds = torch.sigmoid(refined_scores.squeeze(-1)) > 0.5
+
             running_loss += loss.item()
             all_preds.extend(preds.flatten().cpu().numpy())
-            all_labels.extend(labels.flatten().cpu().numpy())
+            all_labels.extend(relevance.flatten().cpu().numpy())
 
     avg_loss = running_loss / len(dataloader)
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
@@ -278,21 +257,28 @@ def main(args):
         print(f"Using {torch.cuda.device_count()} GPUs!")
         model = nn.DataParallel(model)
 
+    # --- Get the tokenizer instance from the model's text encoder ---
+    tokenizer_for_dataloaders = model.module.text_encoder.tokenizer if isinstance(model,
+                                                                                  nn.DataParallel) else model.text_encoder.tokenizer
+
     if args.debug:
+        print("--- RUNNING IN DEBUG MODE ---")
         train_csv = config.TRAIN_TRIPLETS_CSV_PATH.replace(".csv", "_DEBUG.csv")
         val_csv = config.VAL_TRIPLETS_CSV_PATH.replace(".csv", "_DEBUG.csv")
         epochs = 1
+        current_subset_ratio = 0.01
     else:
         train_csv = config.TRAIN_TRIPLETS_CSV_PATH
         val_csv = config.VAL_TRIPLETS_CSV_PATH
         epochs = config.TRAIN.NUM_EPOCHS
+        current_subset_ratio = 0.3
 
     train_loader, val_loader = create_dataloaders(
         train_csv_path=train_csv,
         val_csv_path=val_csv,
+        tokenizer=tokenizer_for_dataloaders,  # Pass the tokenizer
         clip_length=config.DATA.CLIP_LENGTH,
-        batch_size=config.TRAIN.BATCH_SIZE,
-        num_workers=config.DATA.NUM_WORKERS
+        subset_ratio=current_subset_ratio  # Pass the subset ratio
     )
 
     optimizer = optim.AdamW(
@@ -301,27 +287,24 @@ def main(args):
         weight_decay=config.TRAIN.WEIGHT_DECAY
     )
 
-    num_training_steps = len(train_loader) * epochs
-    num_warmup_steps = len(train_loader) * config.TRAIN.WARMUP_EPOCHS
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps)
+    # Scheduler setup is now per-epoch
+    num_training_steps_for_scheduler = epochs # Total epochs for scheduler
+    num_warmup_steps_for_scheduler = config.TRAIN.WARMUP_EPOCHS # Warmup epochs
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps_for_scheduler, num_training_steps=num_training_steps_for_scheduler)
 
-    if config.MODEL.USE_UNCERTAINTY:
-        print("\n=== Training with UNCERTAINTY (Evidential Loss) ===")
-        criterion = EvidentialLoss()
-    elif config.TRAIN.USE_BILEVEL_CONSISTENCY:
-        print("\n=== Training with BILEVEL CONSISTENCY Loss ===")
-        criterion = BilevelConsistencyLoss(config)
-    else:
-        print("\n=== Training with Dual Objective Loss ===")
-        criterion = DualObjectiveLoss()
+    criterion = MasterLoss(config)
+
+    print(f"\n=== Training with MasterLoss ===")
+    print(f"Uncertainty Mode: {criterion.use_uncertainty}")
+    print(f"Bilevel Consistency Mode: {criterion.use_bilevel_consistency}")
 
     best_val_loss = float('inf')
     print("\n--- Beginning Training and Validation Epochs ---")
 
-    # This training loop is correct and does not need to be changed.
     for epoch in range(epochs):
         print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device)
         val_loss, val_accuracy = validate_one_epoch(model, val_loader, criterion, device)
 
         print(f"\nEpoch {epoch + 1} Summary:")
@@ -329,14 +312,42 @@ def main(args):
         print(f"\tValidation Loss: {val_loss:.4f}")
         print(f"\tValidation Accuracy: {val_accuracy:.4f} ({val_accuracy:.2%})")
 
-        if not args.debug:
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
+        # === START: ROBUST CHECKPOINT SAVING LOGIC ===
+
+        # 1. Skip saving if debug mode is on
+        if args.debug:
+            print("\tDEBUG mode is on. Skipping checkpoint save.")
+            scheduler.step()
+            continue  # Go to the next epoch
+
+        # 2. Check for invalid validation loss values (NaN or Infinity)
+        if not math.isfinite(val_loss):
+            print(
+                f"\tWARNING: Validation loss is {val_loss}. Cannot save model. Check for exploding gradients or other issues.")
+            scheduler.step()
+            continue  # Go to the next epoch
+
+        # 3. Compare with the best validation loss so far with explicit logging
+        print(f"\tCurrent Best Validation Loss: {best_val_loss:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
+
+            print(f"\t*** New best model found! Attempting to save to {best_model_path} ***")
+
+            try:
+                # Get the model's state dictionary, handling DataParallel correctly
                 model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
                 torch.save(model_state, best_model_path)
-                print(f"\t*** New best model saved to {best_model_path} ***")
+                print(f"\t--- Successfully saved new best model. ---")
+            except Exception as e:
+                print(f"\tXXX ERROR: FAILED TO SAVE MODEL. Reason: {e} XXX")
+                print(f"\tPlease check file permissions for the directory: {config.CHECKPOINT_DIR}")
+        else:
+            print(f"\tValidation loss did not improve. Not saving model.")
+        # === END: ROBUST CHECKPOINT SAVING LOGIC ===
 
+        # Step the learning rate scheduler
         scheduler.step()
         print(f"\tLearning rate for next epoch: {optimizer.param_groups[0]['lr']:.6f}")
 
