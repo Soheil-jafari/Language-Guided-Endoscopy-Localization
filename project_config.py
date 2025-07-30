@@ -85,9 +85,9 @@ class Config:
             self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"
             self.HEAD_NUM_ATTENTION_HEADS = 8
             self.HEAD_NUM_LAYERS = 2
-            self.TEMPORAL_HEAD_TYPE = 'TRANSFORMER'
-            self.USE_UNCERTAINTY = False
-            self.USE_CONFIDENCE_FUSION = False
+            self.TEMPORAL_HEAD_TYPE = 'SSM'
+            self.USE_UNCERTAINTY = True
+            self.USE_CONFIDENCE_FUSION = True
             # NOTE: This embed_dim is for the text encoder and heads.
             # The vision_embed_dim will be set dynamically in the model itself.
             self.EMBED_DIM = 768
@@ -95,7 +95,7 @@ class Config:
     class TrainConfig:
         def __init__(self):
             self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            self.LEARNING_RATE = 1e-5
+            self.LEARNING_RATE = 8e-6
             self.BATCH_SIZE = 24
             self.NUM_EPOCHS = 30
             self.TEMPORAL_LOSS_WEIGHT = 0.2
