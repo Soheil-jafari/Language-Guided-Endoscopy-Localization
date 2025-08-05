@@ -85,9 +85,9 @@ class Config:
             self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"
             self.HEAD_NUM_ATTENTION_HEADS = 8
             self.HEAD_NUM_LAYERS = 2
-            self.TEMPORAL_HEAD_TYPE = 'SSM'
-            self.USE_UNCERTAINTY = True
-            self.USE_CONFIDENCE_FUSION = True
+            self.TEMPORAL_HEAD_TYPE = 'TRANSFORMER'
+            self.USE_UNCERTAINTY = False
+            self.USE_CONFIDENCE_FUSION = False
             # NOTE: This embed_dim is for the text encoder and heads.
             # The vision_embed_dim will be set dynamically in the model itself.
             self.EMBED_DIM = 768

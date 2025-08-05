@@ -305,7 +305,6 @@ class LocalizationFramework(nn.Module):
 
         semantic_features_reshaped = semantic_features_for_temporal.reshape(B, T, self.vision_embed_dim)
 
-        # --- THIS IS THE FIX: Ensure spatial features are correctly shaped for the loss function ---
         if spatial_features_for_loss is not None:
             spatial_features_reshaped = spatial_features_for_loss.reshape(
                 B, T, num_patches_h, num_patches_w, self.vision_embed_dim
@@ -316,25 +315,23 @@ class LocalizationFramework(nn.Module):
         raw_relevance_scores = self.language_guided_head.fc_relevance(semantic_features_for_temporal).reshape(B, T, 1)
         final_output = self.temporal_head(semantic_features_reshaped)
 
-        # --- THIS IS THE SECOND, CRITICAL FIX: The return signature is now stable ---
-        # The MasterLoss function expects a 6-element tuple in a specific order.
-        # Order: (primary_score, secondary_score, tertiary_score, semantic_features, spatial_features, xai_weights)
-
         if self.config.MODEL.USE_UNCERTAINTY:
-            # primary_score = evidential output
-            # secondary_score = refined scores (for validation)
-            # tertiary_score = raw_scores
+            # The four evidential parameters are the final output for the loss function.
+            evidential_params = final_output
+
+            # The single 'refined_score' is for validation/inference, not the primary loss here.
             alpha = final_output[..., 0:1] + 1
             beta = final_output[..., 1:2] + 1
-            refined_scores = alpha / (alpha + beta)
+            refined_scores_for_val_and_unpacker = alpha / (alpha + beta)
 
-            return (final_output, refined_scores, raw_relevance_scores,
-                    semantic_features_reshaped, spatial_features_reshaped, xai_weights)
+            # Return the tuple in the order the MasterLoss expects.
+            # (refined_score_placeholder, raw_score, unused, semantic, spatial, EVIDENTIAL_PARAMS)
+            return (refined_scores_for_val_and_unpacker, raw_relevance_scores, None,
+                    semantic_features_reshaped, spatial_features_reshaped, evidential_params)
         else:
-            # primary_score = refined_scores
-            # secondary_score = raw_scores
-            # tertiary_score = None (placeholder)
+            # When uncertainty is off, the final output IS the refined score.
             refined_scores = final_output
 
+            # The evidential_output is None.
             return (refined_scores, raw_relevance_scores, None,
-                    semantic_features_reshaped, spatial_features_reshaped, xai_weights)
+                    semantic_features_reshaped, spatial_features_reshaped, None)
