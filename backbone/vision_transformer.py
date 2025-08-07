@@ -264,7 +264,6 @@ class Block(nn.Module):
             self.temporal_norm1 = norm_layer(dim)
             self.temporal_attn = Attention(
                 dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-            self.temporal_fc = nn.Linear(dim, dim)  # This layer will fuse temporal attention output
 
         # drop path
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -301,8 +300,6 @@ class Block(nn.Module):
             # Reshape temporal attention output back to (B, T*num_patches, dim)
             res_temporal_output = rearrange(res_temporal_output, '(b h w) t m -> b (h w t) m', b=B, h=H, w=W, t=T)
 
-            # Apply linear fusion
-            res_temporal_output = self.temporal_fc(res_temporal_output)
 
             # Add temporal residual to the ORIGINAL patch tokens (patch_tokens_for_block_start)
             patch_tokens_after_temporal = patch_tokens_for_block_start + res_temporal_output
@@ -431,7 +428,7 @@ class VisionTransformer(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         # Time-specific embeddings (learnable)
-        self.time_embed = nn.Parameter(torch.zeros(1, num_frames, embed_dim))  # Time embedding for each frame
+        self.temporal_embed = nn.Parameter(torch.zeros(1, num_frames, embed_dim))  # Time embedding for each frame
         self.time_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -447,20 +444,9 @@ class VisionTransformer(nn.Module):
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
-        trunc_normal_(self.time_embed, std=.02)  # Initialize time embedding
+        trunc_normal_(self.temporal_embed, std=.02)  # Initialize time embedding
         self.apply(self._init_weights)
 
-        # Initialization of temporal attention weights' linear layers
-        if self.attention_type == 'divided_space_time':
-            i = 0
-            for m in self.blocks.modules():
-                m_str = str(m)
-                if 'Block' in m_str:
-                    if hasattr(m, 'temporal_fc'):  # Only if temporal_fc exists
-                        if i > 0:  # Apply to all but the first block if needed
-                            nn.init.constant_(m.temporal_fc.weight, 0)
-                            nn.init.constant_(m.temporal_fc.bias, 0)
-                    i += 1
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -473,7 +459,7 @@ class VisionTransformer(nn.Module):
 
     @torch.jit.ignore
     def no_weight_decay(self):
-        return {'pos_embed', 'cls_token', 'time_embed'}
+        return {'pos_embed', 'cls_token', 'temporal_embed'}
 
     def get_classifier(self):
         return self.head
@@ -552,10 +538,10 @@ class VisionTransformer(nn.Module):
 
         # Expand time_embed to apply to all spatial patches within each frame
         # time_embed: (1, num_frames, embed_dim) -> (B, num_frames, 1, embed_dim)
-        time_embed_expanded = self.time_embed.unsqueeze(2).expand(-1, -1, num_patches, -1)
+        temporal_embed_expanded = self.temporal_embed.unsqueeze(2).expand(-1, -1, num_patches, -1)
 
         # Add time embedding and reshape back to (B, T*num_patches, embed_dim)
-        patch_tokens_with_time = (patch_tokens_reshaped + time_embed_expanded).reshape(B, T * num_patches,
+        patch_tokens_with_time = (patch_tokens_reshaped + temporal_embed_expanded).reshape(B, T * num_patches,
                                                                                        self.embed_dim)
         patch_tokens_with_time = self.time_drop(patch_tokens_with_time)
 

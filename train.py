@@ -67,6 +67,11 @@ class MasterLoss(nn.Module):
         if self.use_bilevel:
             self.optical_flow_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(
                 config.TRAIN.DEVICE)
+
+            if torch.cuda.device_count() > 1:
+                print("Parallelizing RAFT model for Bi-Level Consistency Loss.")
+                self.optical_flow_model = nn.DataParallel(self.optical_flow_model)
+
             self.optical_flow_model.eval()
 
     def _get_bilevel_consistency_loss(self, semantic_features, spatial_features, video_clip):
@@ -78,15 +83,34 @@ class MasterLoss(nn.Module):
 
         loss_flow = torch.tensor(0.0, device=video_clip.device)
         if self.config.TRAIN.OPTICAL_FLOW_LOSS_WEIGHT > 0 and spatial_features is not None and video_clip.shape[2] > 1:
-            with autocast(enabled=False):
+            with torch.no_grad(), autocast(enabled=False):
                 video_clip_fp32 = video_clip.float()
                 B, C, T, H, W = video_clip_fp32.shape
-                video_permuted = video_clip_fp32.permute(0, 2, 1, 3, 4)
-                video_t = video_permuted[:, :-1].reshape(-1, C, H, W)
+
+                # Downsample to 50% resolution before flow computation
+                video_permuted = video_clip_fp32.permute(0, 2, 1, 3, 4)  # (B, T, C, H, W)
+                video_t = video_permuted[:, :-1].reshape(-1, C, H, W)  # (B*(T-1), C, H, W)
                 video_t_plus_1 = video_permuted[:, 1:].reshape(-1, C, H, W)
-                video_t_norm = normalize(video_t, mean=[0.5] * 3, std=[0.5] * 3)
-                video_t_plus_1_norm = normalize(video_t_plus_1, mean=[0.5] * 3, std=[0.5] * 3)
-                flow = self.optical_flow_model(video_t_norm, video_t_plus_1_norm)[-1]
+
+                # The RAFT model's internal pyramid downsamples by 8. To get a feature map of at least 16x16,
+                # the input image must be at least 128x128 (128 / 8 = 16).
+                # Our previous 224 * 0.5 = 112px was too small. We now use a safe target size.
+                target_raft_size = (128, 128)
+
+                # Downsample frames to the required minimum size for RAFT
+                video_t_small = F.interpolate(video_t, size=target_raft_size, mode='bilinear', align_corners=False)
+                video_t_plus_1_small = F.interpolate(video_t_plus_1, size=target_raft_size, mode='bilinear',
+                                                     align_corners=False)
+                video_t_norm = normalize(video_t_small, mean=[0.5] * 3, std=[0.5] * 3)
+                video_t_plus_1_norm = normalize(video_t_plus_1_small, mean=[0.5] * 3, std=[0.5] * 3)
+
+                # Compute flow on downsampled frames
+                flow_small = self.optical_flow_model(video_t_norm, video_t_plus_1_norm)[-1]
+
+                # Upscale flow to original feature resolution
+                feature_res = (H // 16, W // 16)  # For patch size 16
+                flow = F.interpolate(flow_small, size=feature_res, mode='bilinear') * (feature_res[0] / target_raft_size[0])
+
             warped_spatial = self.warp_features(spatial_features, flow)
             actual_next = spatial_features[:, 1:]
             loss_flow = self.l1_loss(warped_spatial, actual_next)
@@ -160,6 +184,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device):
 
     # Zero the gradients once before the loop begins.
     optimizer.zero_grad()
+    torch.backends.cudnn.benchmark = True
 
     for i, batch in enumerate(progress_bar):
         video_clip = batch['video_clip'].to(device, non_blocking=True)
@@ -169,7 +194,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device):
 
         # Use autocast for mixed-precision training to save memory and speed up training.
         with autocast():
-            outputs = model(video_clip, input_ids, attention_mask)
+            with torch.backends.cuda.sdp_kernel(enable_flash=True):  # <-- ADD THIS
+                outputs = model(video_clip, input_ids, attention_mask)
             loss, _, _ = criterion(outputs, video_clip, relevance)
             if isinstance(loss, torch.Tensor) and loss.numel() > 1:
                 loss = loss.mean()
@@ -246,16 +272,50 @@ def validate_one_epoch(model, dataloader, criterion, device):
     return avg_loss, accuracy
 
 
+def save_model(model_state, save_path, epoch=None):
+    """Robust model saving with verification and error handling"""
+    try:
+        # Create directory if needed
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        # Save model
+        torch.save(model_state, save_path)
+
+        # Verify save was successful
+        if os.path.exists(save_path) and os.path.getsize(save_path) > 1024:  # 1KB minimum
+            msg = f"Successfully saved {'best' if epoch is None else f'epoch {epoch}'} model to {save_path}"
+            print(f"\t--- {msg} ---")
+            return True
+        else:
+            print(f"\tXXX ERROR: Saved file is too small or missing at {save_path} XXX")
+            return False
+    except Exception as e:
+        print(f"\tXXX CRITICAL SAVE ERROR: {str(e)} XXX")
+        print(f"\tAttempted path: {save_path}")
+        return False
+
+
 def main(args):
     print("--- Starting Training Pipeline ---")
     device = torch.device(config.TRAIN.DEVICE)
 
+    # Enhanced checkpoint directory handling
+    checkpoint_dir = os.path.abspath(config.CHECKPOINT_DIR)
+    print(f"Checkpoint directory: {checkpoint_dir}")
+
     try:
-        os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-        print(f"Checkpoints will be saved to: {config.CHECKPOINT_DIR}")
-    except OSError as e:
-        print(f"XXX CRITICAL ERROR: Could not create checkpoint directory at {config.CHECKPOINT_DIR} XXX")
-        print(f"Please check folder permissions. Reason: {e}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"Created checkpoint directory: {checkpoint_dir}")
+        # Test write access
+        test_file = os.path.join(checkpoint_dir, "write_test.txt")
+        with open(test_file, "w") as f:
+            f.write("Write test successful")
+        os.remove(test_file)
+        print("Verified write access to checkpoint directory")
+    except Exception as e:
+        print(f"XXX CRITICAL DIRECTORY ERROR: {str(e)} XXX")
+        print(f"Failed to create/access checkpoint directory at {checkpoint_dir}")
+        print("Please check permissions or specify a different location in project_config.py")
         return
 
     model = LocalizationFramework(config=config).to(device)
@@ -313,34 +373,25 @@ def main(args):
         print(f"\tValidation Accuracy: {val_accuracy:.4f} ({val_accuracy:.2%})")
         print(f"\tCurrent Learning Rate: {current_lr:.6f}")
 
-        if args.debug:
-            print("\tDEBUG mode is on. Saving checkpoint for verification.")
-
         model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
 
-        latest_model_path = os.path.join(config.CHECKPOINT_DIR, f"latest_model_epoch_{epoch + 1}.pth")
-        try:
-            torch.save(model_state, latest_model_path)
-            print(f"\t--- Successfully saved latest model for epoch {epoch + 1}. ---")
-        except Exception as e:
-            print(f"\tXXX ERROR: FAILED TO SAVE LATEST MODEL. Reason: {e} XXX")
+        # Save latest model with verification
+        latest_model_path = os.path.join(checkpoint_dir, f"latest_model_epoch_{epoch + 1}.pth")
+        save_success = save_model(model_state, latest_model_path, epoch=epoch + 1)
 
-        if not math.isfinite(val_loss):
-            print(f"\tWARNING: Validation loss is {val_loss}. Cannot determine 'best_model'.")
-        elif val_loss < best_val_loss:
+        # Save best model if validation loss improves
+        if math.isfinite(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_model_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
-            print(f"\t*** New best model found! Saving to {best_model_path} ***")
-            try:
-                torch.save(model_state, best_model_path)
-                print(f"\t--- Successfully saved new best model. ---")
-            except Exception as e:
-                print(f"\tXXX ERROR: FAILED TO SAVE BEST MODEL. Reason: {e} XXX")
-        else:
-            print(
-                f"\tValidation loss ({val_loss:.4f}) did not improve from best ({best_val_loss:.4f}). Not saving 'best_model'.")
+            best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
+            print(f"\t*** New best model found! Validation loss: {val_loss:.4f} ***")
+            if save_model(model_state, best_model_path):
+                print(f"\t--- New best model saved ---")
+            else:
+                print(f"\tXXX Failed to save best model XXX")
 
     print("\n--- Training Complete ---")
+    print(f"Final models saved in: {checkpoint_dir}")
+    print("Use: `ls -lh \"{}\"` to verify files".format(checkpoint_dir.replace('"', '\\"')))
 
 
 if __name__ == '__main__':

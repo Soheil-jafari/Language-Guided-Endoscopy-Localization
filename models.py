@@ -86,8 +86,8 @@ class MambaBlock(nn.Module):
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner, out_channels=self.d_inner,
-            bias=True, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1,
-        )
+            bias=True, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, padding_mode='zeros'
+        ).to(memory_format=torch.channels_last)
         self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)  # Simplified this line slightly
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
         self.act = nn.SiLU()
