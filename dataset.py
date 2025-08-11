@@ -110,7 +110,7 @@ class EndoscopyLocalizationDataset(Dataset):
                     frames.append(last_valid_frame.copy())
                 else:
                     # Create black frame as fallback
-                    frames.append(np.zeros((config.DATA.HEIGHT, config.DATA.WIDTH, 3), dtype=np.uint8))
+                    frames.append(np.zeros((config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE, 3), dtype=np.uint8))
             else:
                 frames.append(frame)
                 last_valid_frame = frame
@@ -120,14 +120,12 @@ class EndoscopyLocalizationDataset(Dataset):
 
         # Apply the single, unified transform pipeline.
         # This will return a single tensor of shape (T, C, H, W).
-        if self.is_training:
-            transformed_frames = self.train_transforms(pil_frames)
-        else:
-            transformed_frames = self.val_transforms(pil_frames)
+        transform = self.train_transforms if self.is_training else self.val_transforms
+        transformed_frames = [transform(img) for img in pil_frames]
 
         # 💡 Manually stack the list of tensors into a single tensor.
         # The shape will become (T, C, H, W).
-        video_clip = torch.stack(transformed_frames)
+        video_clip = torch.stack(transformed_frames, dim=0)
 
         # Now that `video_clip` is a single tensor, we can permute it.
         # The shape becomes (C, T, H, W).

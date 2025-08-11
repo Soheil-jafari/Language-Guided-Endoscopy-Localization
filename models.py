@@ -7,8 +7,7 @@ from transformers import AutoTokenizer, CLIPTextModel
 import torch.nn.functional as F
 
 from project_config import config
-from backbone.vision_transformer import VisionTransformer
-from backbone.vision_transformer import load_pretrained, _cfg, _conv_filter
+from backbone.vision_transformer import VisionTransformer, load_pretrained, _cfg, _conv_filter
 
 
 
@@ -169,6 +168,20 @@ class LanguageGuidedHead(nn.Module):
             self.confidence_module = None
 
     def forward(self, visual_features, text_features, text_attention_mask):
+        xai_weights = None
+        attn_holder = {}
+        def _xai_hook(mod, inp, out):
+            # out can be Tensor or (attn_output, attn_weights) depending on PyTorch version
+            try:
+                if isinstance(out, tuple) and len(out) == 2:
+                    attn_holder['w'] = out[1]
+            except Exception:
+                pass
+        # Try to hook the cross-attention module inside the first decoder layer
+        try:
+            handle = self.transformer_decoder_layer.multihead_attn.register_forward_hook(_xai_hook)
+        except Exception:
+            handle = None
         B_T, _, C_visual = visual_features.shape
         B_original, L_text, _ = text_features.shape
         T_frames = B_T // B_original
@@ -194,7 +207,13 @@ class LanguageGuidedHead(nn.Module):
 
         # === THIS IS THE FIX: Return the correct features ===
         # Return both the semantic vector for the temporal head AND the full spatial map for the loss function
-        return semantic_features_for_temporal_head, fused_spatial_features, None
+        xai_weights = attn_holder.get('w', None)
+        # Clean up hook
+        try:
+            handle.remove()
+        except Exception:
+            pass
+        return semantic_features_for_temporal_head, fused_spatial_features, xai_weights
 
 # --- Kept Original Temporal Head ---
 class TemporalHead(nn.Module):

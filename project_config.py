@@ -108,6 +108,7 @@ class Config:
             self.USE_BILEVEL_CONSISTENCY = False
             self.SEMANTIC_LOSS_WEIGHT = 0.3
             self.OPTICAL_FLOW_LOSS_WEIGHT = 0.5
+            self.SUBSET_RATIO = 0.5
             self.USE_CUDA = torch.cuda.is_available()
 
             self.USE_PEFT = True
