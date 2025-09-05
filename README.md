@@ -146,21 +146,14 @@ python inference.py \
 📊 Baselines and Comparisons
 This repository includes the necessary code and instructions to benchmark our framework against three key families of models:
 
-General Vision-Language Models: For open-set, text-driven evaluation.
-
-CLIP: Zero-shot and linear-probe per-frame relevance scoring.
-
-X-CLIP: A powerful video-language model for scoring short clips.
-
-Temporal Grounding Models: For the direct task of localizing events from text.
-
-Moment-DETR: Predicts start/end boundaries from a language query.
-
-Surgical Specialist Models: Closed-set baselines trained specifically for Cholec80.
-
-TeCNO: A temporal convolutional network for surgical phase recognition.
-
-The code for these baselines can be found in the comparison_models/ directory. Each subfolder contains a README with specific instructions for running that model.
+* **General Vision-Language Models: For open-set, text-driven evaluation.
+* **CLIP: Zero-shot and linear-probe per-frame relevance scoring.
+* **X-CLIP: A powerful video-language model for scoring short clips.
+* **Temporal Grounding Models: For the direct task of localizing events from text.
+* **Moment-DETR: Predicts start/end boundaries from a language query.
+* **Surgical Specialist Models: Closed-set baselines trained specifically for Cholec80.
+* **TeCNO: A temporal convolutional network for surgical phase recognition.
+* **The code for these baselines can be found in the comparison_models/ directory. Each subfolder contains a README with specific instructions for running that model.
 
 ### 📚 Citation
 If you use this framework or ideas from our work in your research, please cite the following dissertation:
