@@ -8,88 +8,179 @@
 
 ---
 
-This repository contains the official PyTorch implementation for the research paper: **"Query, Localize, Explain: A Language-Guided Framework for Open-Set Event Localization in Medical Video"**. Our work introduces a new paradigm for video analysis that moves beyond rigid, "closed-set" detectors, enabling users to find any temporal event that can be described with natural language.
+An explainable, language-guided framework for open-set temporal action localization (TAL) on endoscopic videos.
+This repository contains the official implementation accompanying the dissertation “An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos” by Soheil Jafarifard Bidgoli (MSc Computer Science, Aston University).
 
-## 🌟 Overview
+🚀 Overview
 
-Traditional video analysis models are limited to a predefined list of event classes. Our framework breaks this limitation by learning the deep semantic relationship between visual data and text. It can localize events based on free-form text queries (e.g., "a polyp being removed by a snare") and, crucially, provides visual explanations for its predictions, addressing the critical need for trust and transparency in clinical AI.
+Surgical and endoscopic procedures generate long, complex videos where clinicians may wish to localize arbitrary events described in natural language (e.g., “when the clipper is applied”).
+Traditional methods are closed-set: they only recognize fixed phases or tools. Our framework goes further:
+
+Open-vocabulary localization – Query with free-form clinical language, not just predefined labels.
+
+Efficient temporal modeling – Supports long untrimmed videos via Transformer and State-Space (Mamba) backbones.
+
+Explainability & trustworthiness – Produces attention heatmaps and uncertainty estimates for clinical safety.
+
+🏗️ Framework Architecture
+
+The system is a multi-stage pipeline combining computer vision, natural language processing, and temporal reasoning:
+
+Vision Backbone
+
+Default: M²CRL pretrained video transformer for robust spatio-temporal features.
+
+Alternative: EndoMamba backbone (structured state-space model) for efficient long-video scaling.
+
+Text Encoder
+
+CLIP-based transformer encoder.
+
+Fine-tuned with LoRA (parameter-efficient tuning) for medical terminology.
+
+Language-Guided Fusion Head
+
+Cross-modal transformer aligns video features with text queries.
+
+Outputs frame-level relevance scores + attention heatmaps.
+
+Temporal Head
+
+Baseline: Lightweight Transformer for sequence modeling.
+
+SOTA Upgrade: Mamba-based SSM for linear-complexity long-sequence analysis.
+
+Uncertainty & Explainability
+
+Evidential Deep Learning (EDL) adds calibrated uncertainty scores.
+
+Cross-attention maps provide visual explanations.
+
+📂 Repository Structure
+Language-Guided-Endoscopy-Localization/
+│
+├── datasets/                # Preprocessing scripts for Cholec80 and others
+│   ├── extract_cholec80_frames.py
+│   ├── prepare_cholec80.py
+│   ├── create_splits.py
+│
+├── models/                  # Core model components
+│   ├── vision_transformer.py
+│   ├── temporal_head.py
+│   ├── cross_modal_head.py
+│   └── evidential_loss.py
+│
+├── training/                # Training loop and loss functions
+│   ├── train.py
+│   ├── master_loss.py
+│   └── utils/
+│
+├── evaluation/              # Metrics and baselines
+│   ├── metrics.py
+│   ├── visualize_attention.py
+│   └── compare_baselines.py
+│
+├── configs/                 # YAML configs for different experiments
+├── results/                 # Logs, checkpoints, visualizations
+└── README.md                # Project documentation
+
+📊 Baselines & Comparisons
+
+We benchmark against three families of baselines
+:
+
+Vision–Language Models (open-vocabulary)
+
+CLIP (zero-shot & linear-probe)
+
+VideoCLIP / X-CLIP
+
+Temporal Grounding Models (language → time interval)
+
+Moment-DETR
+
+UniVTG
+
+Surgical Specialists (closed-set baselines)
+
+TeCNO
+
+MS-TCN / MS-TCN++
+
+ResNet + LSTM
+
+📈 Evaluation Protocol
+
+Frame-level Relevance (main task): AUROC, AUPRC, mAP@frame
+
+Temporal Grounding: mAP@tIoU=0.3/0.5/0.7, R@1/R@5
+
+Phase & Tool Recognition: Accuracy, Macro-F1, mAP
+
+Uncertainty calibration and explainability are also reported via EDL and attention maps.
+
+🧑‍⚕️ Dataset
+
+Cholec80 laparoscopic cholecystectomy dataset (80 full-length surgeries).
+
+Preprocessing pipeline generates:
+
+Frame sequences
+
+Language queries (phases + tools)
+
+Positive/negative triplets for training
+
+⚙️ Training
+
+Frame Extraction
+
+python datasets/extract_cholec80_frames.py --input data/raw --output data/frames
 
 
-## ✨ Key Features
+Prepare Metadata & Splits
 
-* **Open-Set Localization**: Find anything you can describe with text, not just a fixed list of classes. This creates a flexible and future-proof tool for clinical review and research.
-* **Explainable AI (XAI)**: The model generates visual heatmaps that highlight the specific pixels it "looked at" to make a decision, providing crucial insight and building trust.
-* **State-of-the-Art Architecture**: A synergistic pipeline combining a powerful frozen vision backbone (M²CRL), a PEFT-tuned text encoder, a true cross-attention fusion head, and a temporal transformer for robust context modeling.
-* **Demonstrated Generalization**: The framework is designed to learn a generalizable skill, with evaluation protocols to test its zero-shot transfer capabilities from the medical domain to general-purpose benchmarks.
+python datasets/prepare_cholec80.py
+python datasets/create_splits.py
 
----
 
-## 🏗️ Architectural Pipeline
+Train Model
 
-Our framework processes video through four distinct, specialized stages:
+python training/train.py --config configs/m2crl_baseline.yaml
 
-1.  **Vision Backbone (`M²CRL`)**: A frozen M²CRL model extracts powerful, general-purpose feature maps from each video frame.
-    ```
-    [Frame] -> [Backbone] -> [Visual Feature Map]
-    ```
-2.  **Language-Guided Head (`Cross-Attention`)**: Fuses the visual feature map with the text query features. It performs **spatial attention** to identify relevant regions within the frame.
-    ```
-    ([Visual Features], [Text Features]) -> [Cross-Attention] -> [Frame Relevance Score + XAI Heatmap]
-    ```
-3.  **Temporal Head (`Temporal Transformer`)**: Receives the sequence of raw scores for all frames in a clip. It performs **temporal attention** to model the global event dynamics and outputs a smoothed, contextually-aware score sequence.
-    ```
-    [Score Sequence] -> [Temporal Transformer] -> [Refined Score Sequence]
-    ```
-4.  **Final Prediction (`Thresholding`)**: A simple final module that converts the refined score sequence into concrete `[start_time, end_time]` predictions.
+🔬 Key Features
 
----
+Bi-Level Consistency Loss: Aligns semantic + motion features using optical flow
+.
 
-## 🚀 Getting Started
+Evidential Deep Learning: Outputs both predictions & uncertainty estimates.
 
-### 1. Setup Environment
+Flexible Backbones: Swap between Transformer and Mamba-based models.
 
-It is recommended to use a Conda environment.
+Parameter-Efficient Tuning: LoRA adapters minimize fine-tuning cost.
 
-```bash
-# Create and activate the environment
-conda create -n loc_env python=3.9
-conda activate loc_env
+Cross-modal Explainability: Visualize attention maps for clinician review.
 
-# Install dependencies from the requirements file
-pip install -r requirements.txt
+📚 Citation
 
-2. Prepare Data
-This project uses a two-step data preparation process for training on the server:
+If you use this framework in your research, please cite:
 
-Pre-processing Script: First, run the prepare_data.py script on the server. This script will iterate through your datasets and generate a single master CSV file containing (frame_path, text_query, relevance_label) triplets.
+@mastersthesis{jafarifard2025,
+  title={An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos},
+  author={Soheil Jafarifard Bidgoli},
+  school={Aston University},
+  year={2025}
+}
 
-Dataloader: The dataset.py script reads this pre-processed CSV file during training, making the training process highly efficient.
+🤝 Acknowledgements
 
-3. Training on the Server
-The train.py script is designed to be run on a multi-GPU server like the Aston EPS ML Server.
+Supervisor: Dr. Zhuangzhuang Dai
 
-# 1. Start a persistent terminal session
-tmux
+Aston University – MSc Computer Science, CS4700 Dissertation
 
-# 2. Set the GPUs you have booked (e.g., GPUs 2 and 3)
-export CUDA_VISIBLE_DEVICES=2,3
+OpenAI CLIP, M²CRL, VideoMamba, Moment-DETR, and the Cholec80 community
 
-# 3. Launch the training script
-# The script will read all settings from config.py
-python train.py
-
-# 4. Detach from the session (Ctrl+B then D) and let it run
-
-4. Local Testing & Inference
-Use the inference.py script to test a trained model checkpoint on a single video file. This is perfect for local testing and visualization.
-
-python inference.py \
-    --video_path "/path/to/your/sample_video.mp4" \
-    --text_query "a polyp being removed" \
-    --checkpoint_path "./checkpoints/model_epoch_10.pth"
-
-📜 Citation
-If you find this work useful in your research, please consider citing our paper:
+✨ This repo aims to push forward trustworthy, explainable AI for surgery by combining vision, language, and temporal reasoning.
 
 @article{jafari2025query,
   title={Query, Localize, Explain: A Language-Guided Framework for Open-Set Event Localization in Medical Video},
