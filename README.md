@@ -7,192 +7,212 @@
 [![Paper Status](https://img.shields.io/badge/paper-in%20progress-brightgreen)](./)
 
 ---
+This repository contains the official implementation for the dissertation titled: “An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos” by Soheil Jafarifard Bidgoli (MSc Computer Science, Aston University).
 
-An explainable, language-guided framework for open-set temporal action localization (TAL) on endoscopic videos.
-This repository contains the official implementation accompanying the dissertation “An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos” by Soheil Jafarifard Bidgoli (MSc Computer Science, Aston University).
+The project introduces a novel framework for localizing arbitrary, language-described events in long-form surgical videos, moving beyond the limitations of traditional closed-set recognition models.
 
 🚀 Overview
+Surgical and endoscopic procedures generate vast amounts of video data. Clinicians often need to find specific moments, but traditional AI models can only recognize a fixed, predefined set of events (e.g., "Phase 1," "Phase 2"). This framework breaks that limitation by enabling open-vocabulary temporal localization. Users can query long, untrimmed videos with free-form natural language to find relevant events (e.g., “find when the grasper retracts the gallbladder”).
 
-Surgical and endoscopic procedures generate long, complex videos where clinicians may wish to localize arbitrary events described in natural language (e.g., “when the clipper is applied”).
-Traditional methods are closed-set: they only recognize fixed phases or tools. Our framework goes further:
+Our framework is built on three pillars:
 
-Open-vocabulary localization – Query with free-form clinical language, not just predefined labels.
 
-Efficient temporal modeling – Supports long untrimmed videos via Transformer and State-Space (Mamba) backbones.
+Open-Vocabulary Localization: Leverages powerful vision-language models to understand and locate events described by arbitrary text queries, not just fixed labels.
 
-Explainability & trustworthiness – Produces attention heatmaps and uncertainty estimates for clinical safety.
+
+
+Architectural Scalability: Employs a hybrid Transformer and Structured State Space Model (SSM) architecture to efficiently process long-form surgical videos, overcoming the quadratic complexity of traditional attention mechanisms.
+
+
+
+Trustworthiness & Explainability: Integrates Evidential Deep Learning to quantify model uncertainty and provides visual attention maps to explain its predictions, fostering clinical trust and safety.
+
+
+
+
+✨ Key Features
+End-to-End Open-Vocabulary TAL: A complete pipeline from data preprocessing to language-guided inference for surgical video analysis.
+
+
+Flexible Vision Backbones: Supports both a powerful M²CRL pretrained video transformer and a highly efficient EndoMamba (SSM) backbone for long-sequence modeling.
+
+
+
+
+Parameter-Efficient Fine-Tuning (PEFT): Uses Low-Rank Adaptation (LoRA) to efficiently adapt a pretrained CLIP text encoder to the surgical domain with minimal computational cost.
+
+
+
+Advanced Temporal Modeling: Features a state-of-the-art Mamba-based Temporal Head that scales linearly with sequence length, making it ideal for hour-long procedural videos.
+
+
+
+Bi-Level Consistency Loss: A novel training objective that enforces temporal consistency at both the semantic and spatial levels using optical flow (RAFT) to regularize the model.
+
+
+
+Uncertainty Quantification: Implements Evidential Deep Learning (EDL) to allow the model to express its own confidence, reliably identifying out-of-distribution or ambiguous events.
+
+
+
+Built-in Explainability (XAI): Generates cross-modal attention maps to visualize which parts of a frame the model focused on to make its decision, a critical feature for clinical validation.
+
+
+
+Comprehensive Baseline Suite: Includes code and instructions to benchmark against canonical baselines like CLIP, X-CLIP, Moment-DETR, and TeCNO.
 
 🏗️ Framework Architecture
+The system is a multi-stage pipeline designed to process spatial, semantic, and temporal information through specialized components:
 
-The system is a multi-stage pipeline combining computer vision, natural language processing, and temporal reasoning:
 
-Vision Backbone
+Vision Backbone: A pretrained M²CRL model extracts a grid of powerful visual feature vectors from each video frame.
 
-Default: M²CRL pretrained video transformer for robust spatio-temporal features.
 
-Alternative: EndoMamba backbone (structured state-space model) for efficient long-video scaling.
 
-Text Encoder
+Text Encoder: A LoRA-adapted CLIP text encoder processes the natural language query into a semantic feature vector.
 
-CLIP-based transformer encoder.
+Language-Guided Fusion Head: A cross-modal transformer uses attention to fuse the visual and textual features. It identifies relevant spatial regions in the frame corresponding to the query, outputting initial 
 
-Fine-tuned with LoRA (parameter-efficient tuning) for medical terminology.
+raw_scores, intermediate features for the consistency loss, and attention_weights for XAI.
 
-Language-Guided Fusion Head
 
-Cross-modal transformer aligns video features with text queries.
+Temporal Head (SSM/Mamba): This highly efficient head analyzes the sequence of fused features from the entire clip. It models long-range context to smooth predictions and fill gaps, producing final, contextually-aware 
 
-Outputs frame-level relevance scores + attention heatmaps.
+refined_scores.
 
-Temporal Head
 
-Baseline: Lightweight Transformer for sequence modeling.
 
-SOTA Upgrade: Mamba-based SSM for linear-complexity long-sequence analysis.
+Uncertainty & Prediction Head: In its SOTA configuration, this head uses Evidential Deep Learning to output not just a final score but also the parameters of a Beta distribution (evidential_output), allowing for robust uncertainty quantification.
 
-Uncertainty & Explainability
-
-Evidential Deep Learning (EDL) adds calibrated uncertainty scores.
-
-Cross-attention maps provide visual explanations.
-
+📂 Repository Structure
 Language-Guided-Endoscopy-Localization/
 │
-├── backbone/                         # Vision backbones
+├── backbone/
 │   ├── endomamba.py                  # EndoMamba (SSM-based backbone)
-│   └── vision_transformer.py         # ViT-based backbone (M²CRL, etc.)
+│   └── vision_transformer.py         # ViT-based backbone (M²CRL)
 │
-├── checkpoints/                      # Saved checkpoints and logs
+├── checkpoints/                      # Saved model checkpoints
 │
 ├── comparison_models/                # Baseline and benchmark models
-│   ├── clip_baseline/
-│   │   └── clip_baseline.py          # CLIP zero-shot / linear probe
-│   │
+│   ├── clip_baseline/                # CLIP zero-shot / linear probe
 │   ├── Moment-DETR/                  # Moment-DETR temporal grounding
-│   │   ├── run_evaluation.py
-│   │   ├── run_feature_extraction.py
-│   │   ├── run_preprocessing.py
-│   │   ├── run_training.py
-│   │   └── moment_detr_module/
-│   │       ├── __init__.py
-│   │       ├── configs.py
-│   │       ├── dataset.py
-│   │       ├── engine.py
-│   │       ├── loss.py
-│   │       ├── matcher.py
-│   │       ├── modeling.py
-│   │       ├── position_encoding.py
-│   │       ├── transformer.py
-│   │       ├── utils.py
-│   │       └── README.md
-│   │
 │   └── xclip_baseline/               # X-CLIP video-language baseline
-│       ├── train_xclip.py
-│       ├── eval_xclip.py
-│       ├── infer_xclip.py
-│       ├── requirements.txt
-│       ├── project_config.py
-│       ├── README_XCLIP.md
-│       └── xclip_package/
-│           └── xclip/
-│               ├── __init__.py
-│               ├── data.py
-│               ├── losses.py
-│               ├── metrics.py
-│               ├── model.py
-│               └── utils.py
 │
-├── dataset_preprocessing/            # Preprocessing for Cholec80 dataset
-│   ├── create_splits.py
-│   ├── extract_cholec80_frames.py
-│   └── prepare_cholec80.py
+├── dataset_preprocessing/            # Scripts for Cholec80 dataset
+│   ├── create_splits.py              # Creates train/val/test video splits
+│   ├── extract_cholec8o_frames.py    # Extracts frames from videos
+│   └── prepare_cholec80.py           # Generates (frame, query, label) triplets
 │
 ├── pretrained/                       # Pretrained model weights
 │   └── checkpoint.pth
 │
-├── dataset.py                        # Dataset wrapper
-├── inference.py                      # Inference script (language-guided)
-├── models.py                         # Main model components
-├── project_config.py                 # Config file for project settings
-├── train.py                          # Training entry point
+├── dataset.py                        # PyTorch Dataset and DataLoader
+├── inference.py                      # Inference script for localization
+├── models.py                         # Core architectural components
+├── project_config.py                 # Centralized configuration file
+├── train.py                          # Main training script
 │
-├── README.md                         # Project documentation
-└── .gitignore
+└── README.md
+🧑‍⚕️ Dataset: Cholec80
+This framework is developed and evaluated on the 
 
-📊 Baselines & Comparisons
+Cholec80 dataset, which contains 80 videos of laparoscopic cholecystectomy procedures. Our preprocessing pipeline transforms this dataset into a format suitable for open-vocabulary learning.
 
-We benchmark against three families of baselines
-:
+Preprocessing Pipeline
+Frame Extraction: Videos are decoded into individual frames at a specified sampling rate.
 
-Vision–Language Models (open-vocabulary)
+Bash
 
-CLIP (zero-shot & linear-probe)
+python dataset_preprocessing/extract_cholec80_frames.py --cholec80_videos_dir /path/to/videos --output_frames_dir /path/to/frames
+Create Data Splits: The 80 videos are randomly partitioned into training, validation, and test sets to ensure fair evaluation.
 
-VideoCLIP / X-CLIP
+Bash
 
-Temporal Grounding Models (language → time interval)
-
-Moment-DETR
-
-Surgical Specialists (closed-set baselines)
-
-TeCNO
-
-📈 Evaluation Protocol
-
-Frame-level Relevance (main task): AUROC, AUPRC, mAP@frame
-
-Temporal Grounding: mAP@tIoU=0.3/0.5/0.7, R@1/R@5
-
-Phase & Tool Recognition: Accuracy, Macro-F1, mAP
-
-Uncertainty calibration and explainability are also reported via EDL and attention maps.
-
-🧑‍⚕️ Dataset
-
-Cholec80 laparoscopic cholecystectomy dataset (80 full-length surgeries).
-
-Preprocessing pipeline generates:
-
-Frame sequences
-
-Language queries (phases + tools)
-
-Positive/negative triplets for training
-
-⚙️ Training
-
-Frame Extraction
-
-python datasets/extract_cholec80_frames.py --input data/raw --output data/frames
+python dataset_preprocessing/create_splits.py --video_dir /path/to/videos
+Generate Language Triplets: The core preprocessing step. This script reads the official phase and tool annotations and generates a CSV file of (frame_path, text_query, relevance_label) triplets. This creates positive and negative examples for training the vision-language alignment.
 
 
-Prepare Metadata & Splits
+Bash
 
-python datasets/prepare_cholec80.py
-python datasets/create_splits.py
+# Run for each split
+python dataset_preprocessing/prepare_cholec80.py --split train
+python dataset_preprocessing/prepare_cholec80.py --split val
+python dataset_preprocessing/prepare_cholec80.py --split test
+⚙️ Setup and Usage
+Installation
+Clone the repository:
 
+Bash
 
-Train Model
+git clone https://github.com/soheil-jafari/language-guided-endoscopy-localization.git
+cd language-guided-endoscopy-localization
+Create a Python environment and install dependencies. We recommend using Conda.
 
-python training/train.py --config configs/m2crl_baseline.yaml
+Bash
 
-🔬 Key Features
+conda create -n endo-tal python=3.9 -y
+conda activate endo-tal
+pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt # A requirements.txt would need to be created
+Configuration: Before running any scripts, review and update the paths in project_config.py to match your system's directory structure.
 
-Bi-Level Consistency Loss: Aligns semantic + motion features using optical flow
-.
+Training
+The main training script train.py handles model training with support for various configurations controlled by project_config.py and command-line arguments.
 
-Evidential Deep Learning: Outputs both predictions & uncertainty estimates.
+To train the model from scratch or fine-tune:
 
-Flexible Backbones: Swap between Transformer and Mamba-based models.
+Bash
 
-Parameter-Efficient Tuning: LoRA adapters minimize fine-tuning cost.
+python train.py
+To fine-tune from an existing checkpoint:
 
-Cross-modal Explainability: Visualize attention maps for clinician review.
+Bash
+
+python train.py --finetune_from /path/to/your/checkpoint.pth
+To run in debug mode on a small data subset:
+
+Bash
+
+python train.py --debug
+To adjust the training subset size (e.g., 50% of the data):
+
+Bash
+
+python train.py --subset 0.5
+Inference
+Use inference.py to run a trained model on a video to localize a specific language query.
+
+Bash
+
+python inference.py \
+    --video_path /path/to/your/video.mp4 \
+    --text_query "a grasper is present" \
+    --checkpoint_path /path/to/your/best_model.pth
+The script will output frame-by-frame relevance probabilities and identify the most relevant moment in the video.
+
+📊 Baselines and Comparisons
+This repository includes the necessary code and instructions to benchmark our framework against three key families of models:
+
+General Vision-Language Models: For open-set, text-driven evaluation.
+
+CLIP: Zero-shot and linear-probe per-frame relevance scoring.
+
+X-CLIP: A powerful video-language model for scoring short clips.
+
+Temporal Grounding Models: For the direct task of localizing events from text.
+
+Moment-DETR: Predicts start/end boundaries from a language query.
+
+Surgical Specialist Models: Closed-set baselines trained specifically for Cholec80.
+
+TeCNO: A temporal convolutional network for surgical phase recognition.
+
+The code for these baselines can be found in the comparison_models/ directory. Each subfolder contains a README with specific instructions for running that model.
 
 📚 Citation
+If you use this framework or ideas from our work in your research, please cite the following dissertation:
 
-If you use this framework in your research, please cite:
+Code snippet
 
 @mastersthesis{jafarifard2025,
   title={An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos},
@@ -200,16 +220,12 @@ If you use this framework in your research, please cite:
   school={Aston University},
   year={2025}
 }
-
 🤝 Acknowledgements
+This work was completed as part of the CS4700 Dissertation for the MSc in Computer Science at Aston University.
 
-Supervisor: Dr. Zhuangzhuang Dai
+Supervisor: Dr. Zhuangzhuang Dai.
 
-Aston University – MSc Computer Science, CS4700 Dissertation
-
-OpenAI CLIP, M²CRL, VideoMamba, Moment-DETR, and the Cholec80 community
-
-✨ This repo aims to push forward trustworthy, explainable AI for surgery by combining vision, language, and temporal reasoning.
+This project builds upon the foundational work of the Cholec80 dataset creators and the authors of M²CRL, VideoMamba, CLIP, Moment-DETR, and other referenced works.
 
 @article{jafari2025query,
   title={Query, Localize, Explain: A Language-Guided Framework for Open-Set Event Localization in Medical Video},
