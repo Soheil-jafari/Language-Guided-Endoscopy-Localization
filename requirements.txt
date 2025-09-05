@@ -1,0 +1,50 @@
+# ===== Core =====
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.3.1
+
+# Array & utils
+numpy==1.26.4
+tqdm==4.66.4
+einops==0.7.0
+scipy==1.11.4
+pandas==2.2.2
+scikit-learn==1.4.2
+
+# Images & video I/O
+Pillow==10.3.0
+opencv-python==4.9.0.80
+decord==0.6.0
+
+# Config & serialization
+PyYAML==6.0.1
+omegaconf==2.3.0
+
+# Vision backbones & modeling helpers
+timm==0.9.16
+
+# CLIP & text processing
+ftfy==6.2.0
+regex==2024.5.15
+# Use the maintained anytorch wheel for easy install across CUDA/CPU
+clip-anytorch==2.6.0
+
+# Visualization (attention maps, debugging)
+matplotlib==3.8.4
+
+# Moment-DETR / DETR-style dependencies
+pycocotools==2.0.7
+
+# Optional: metrics & logging
+torchmetrics==1.4.0.post0
+tensorboard==2.16.2
+
+# If RAFT optical flow is used for bi-level consistency, install these
+# (comment out if not needed)
+# kornia==0.7.2
+
+# NOTE:
+# - Install the correct CUDA-enabled PyTorch builds if using GPU:
+#   See https://pytorch.org/get-started/locally/ for the exact pip command.
+# - If you face issues with decord on Windows, try prebuilt wheels from:
+#   https://github.com/dmlc/decord
