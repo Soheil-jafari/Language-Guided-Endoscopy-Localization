@@ -43,32 +43,66 @@ The system is a multi-stage pipeline designed to process spatial, semantic, and 
 
     Language-Guided-Endoscopy-Localization/
     │
-    ├── backbone/
+    ├── backbone/                         # Vision backbones
     │   ├── endomamba.py                  # EndoMamba (SSM-based backbone)
-    │   └── vision_transformer.py         # ViT-based backbone (M²CRL)
+    │   └── vision_transformer.py         # ViT-based backbone (M²CRL, etc.)
     │
-    ├── checkpoints/                      # Saved model checkpoints
+    ├── checkpoints/                      # Saved checkpoints and logs
     │
     ├── comparison_models/                # Baseline and benchmark models
-    │   ├── clip_baseline/                # CLIP zero-shot / linear probe
+    │   ├── clip_baseline/
+    │   │   └── clip_baseline.py          # CLIP zero-shot / linear probe
+    │   │
     │   ├── Moment-DETR/                  # Moment-DETR temporal grounding
+    │   │   ├── run_evaluation.py
+    │   │   ├── run_feature_extraction.py
+    │   │   ├── run_preprocessing.py
+    │   │   ├── run_training.py
+    │   │   └── moment_detr_module/
+    │   │       ├── __init__.py
+    │   │       ├── configs.py
+    │   │       ├── dataset.py
+    │   │       ├── engine.py
+    │   │       ├── loss.py
+    │   │       ├── matcher.py
+    │   │       ├── modeling.py
+    │   │       ├── position_encoding.py
+    │   │       ├── transformer.py
+    │   │       ├── utils.py
+    │   │       └── README.md
+    │   │
     │   └── xclip_baseline/               # X-CLIP video-language baseline
+    │       ├── train_xclip.py
+    │       ├── eval_xclip.py
+    │       ├── infer_xclip.py
+    │       ├── requirements.txt
+    │       ├── project_config.py
+    │       ├── README_XCLIP.md
+    │       └── xclip_package/
+    │           └── xclip/
+    │               ├── __init__.py
+    │               ├── data.py
+    │               ├── losses.py
+    │               ├── metrics.py
+    │               ├── model.py
+    │               └── utils.py
     │
-    ├── dataset_preprocessing/            # Scripts for Cholec80 dataset
-    │   ├── create_splits.py              # Creates train/val/test video splits
-    │   ├── extract_cholec80_frames.py    # Extracts frames from videos
-    │   └── prepare_cholec80.py           # Generates (frame, query, label) triplets
+    ├── dataset_preprocessing/            # Preprocessing for Cholec80 dataset
+    │   ├── create_splits.py
+    │   ├── extract_cholec80_frames.py
+    │   └── prepare_cholec80.py
     │
     ├── pretrained/                       # Pretrained model weights
     │   └── checkpoint.pth
     │
-    ├── dataset.py                        # PyTorch Dataset and DataLoader
-    ├── inference.py                      # Inference script for localization
-    ├── models.py                         # Core architectural components
-    ├── project_config.py                 # Centralized configuration file
-    ├── train.py                          # Main training script
+    ├── dataset.py                        # Dataset wrapper
+    ├── inference.py                      # Inference script (language-guided)
+    ├── models.py                         # Main model components
+    ├── project_config.py                 # Config file for project settings
+    ├── train.py                          # Training entry point
     │
-    └── README.md
+    ├── README.md                         # Project documentation
+    └── .gitignore
 
 
 ## 🧑‍⚕️ Dataset: Cholec80
@@ -146,14 +180,14 @@ python inference.py \
 📊 Baselines and Comparisons
 This repository includes the necessary code and instructions to benchmark our framework against three key families of models:
 
-* **General Vision-Language Models: For open-set, text-driven evaluation.
-* **CLIP: Zero-shot and linear-probe per-frame relevance scoring.
-* **X-CLIP: A powerful video-language model for scoring short clips.
-* **Temporal Grounding Models: For the direct task of localizing events from text.
-* **Moment-DETR: Predicts start/end boundaries from a language query.
-* **Surgical Specialist Models: Closed-set baselines trained specifically for Cholec80.
-* **TeCNO: A temporal convolutional network for surgical phase recognition.
-* **The code for these baselines can be found in the comparison_models/ directory. Each subfolder contains a README with specific instructions for running that model.
+* General Vision-Language Models: For open-set, text-driven evaluation.
+* CLIP: Zero-shot and linear-probe per-frame relevance scoring.
+* X-CLIP: A powerful video-language model for scoring short clips.
+* Temporal Grounding Models: For the direct task of localizing events from text.
+* Moment-DETR: Predicts start/end boundaries from a language query.
+* Surgical Specialist Models: Closed-set baselines trained specifically for Cholec80.
+* TeCNO: A temporal convolutional network for surgical phase recognition.
+* The code for these baselines can be found in the comparison_models/ directory. Each subfolder contains a README with specific instructions for running that model.
 
 ### 📚 Citation
 If you use this framework or ideas from our work in your research, please cite the following dissertation:
