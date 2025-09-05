@@ -40,34 +40,68 @@ The system is a multi-stage pipeline designed to process spatial, semantic, and 
 5.  **Uncertainty & Prediction Head**: In its SOTA configuration, this head uses Evidential Deep Learning to output not just a final score but also the parameters of a Beta distribution (`evidential_output`), allowing for robust uncertainty quantification.
 
 ## 📂 Repository Structure
-Language-Guided-Endoscopy-Localization/
-│
-├── backbone/
-│   ├── endomamba.py                  # EndoMamba (SSM-based backbone)
-│   └── vision_transformer.py         # ViT-based backbone (M²CRL)
-│
-├── checkpoints/                      # Saved model checkpoints
-│
-├── comparison_models/                # Baseline and benchmark models
-│   ├── clip_baseline/                # CLIP zero-shot / linear probe
-│   ├── Moment-DETR/                  # Moment-DETR temporal grounding
-│   └── xclip_baseline/               # X-CLIP video-language baseline
-│
-├── dataset_preprocessing/            # Scripts for Cholec80 dataset
-│   ├── create_splits.py              # Creates train/val/test video splits
-│   ├── extract_cholec80_frames.py    # Extracts frames from videos
-│   └── prepare_cholec80.py           # Generates (frame, query, label) triplets
-│
-├── pretrained/                       # Pretrained model weights
-│   └── checkpoint.pth
-│
-├── dataset.py                        # PyTorch Dataset and DataLoader
-├── inference.py                      # Inference script for localization
-├── models.py                         # Core architectural components
-├── project_config.py                 # Centralized configuration file
-├── train.py                          # Main training script
-│
-└── README.md
+    Language-Guided-Endoscopy-Localization/
+    │
+    ├── backbone/                         # Vision backbones
+    │   ├── endomamba.py                  # EndoMamba (SSM-based backbone)
+    │   └── vision_transformer.py         # ViT-based backbone (M²CRL)
+    │
+    ├── checkpoints/                      # Saved checkpoints and logs
+    │
+    ├── comparison_models/                # Baseline and benchmark models
+    │   ├── clip_baseline/
+    │   │   └── clip_baseline.py          # CLIP zero-shot / linear probe
+    │   │
+    │   ├── Moment-DETR/                  # Moment-DETR temporal grounding
+    │   │   ├── run_evaluation.py
+    │   │   ├── run_feature_extraction.py
+    │   │   ├── run_preprocessing.py
+    │   │   ├── run_training.py
+    │   │   └── moment_detr_module/
+    │   │       ├── __init__.py
+    │   │       ├── configs.py
+    │   │       ├── dataset.py
+    │   │       ├── engine.py
+    │   │       ├── loss.py
+    │   │       ├── matcher.py
+    │   │       ├── modeling.py
+    │   │       ├── position_encoding.py
+    │   │       ├── transformer.py
+    │   │       ├── utils.py
+    │   │       └── README.md
+    │   │
+    │   └── xclip_baseline/               # X-CLIP video-language baseline
+    │       ├── train_xclip.py
+    │       ├── eval_xclip.py
+    │       ├── infer_xclip.py
+    │       ├── requirements.txt
+    │       ├── project_config.py
+    │       ├── README_XCLIP.md
+    │       └── xclip_package/
+    │           └── xclip/
+    │               ├── __init__.py
+    │               ├── data.py
+    │               ├── losses.py
+    │               ├── metrics.py
+    │               ├── model.py
+    │               └── utils.py
+    │
+    ├── dataset_preprocessing/            # Preprocessing for Cholec80 dataset
+    │   ├── create_splits.py
+    │   ├── extract_cholec80_frames.py
+    │   └── prepare_cholec80.py
+    │
+    ├── pretrained/                       # Pretrained model weights (M2CRL)
+    │   └── checkpoint.pth
+    │
+    ├── dataset.py                        # Dataset wrapper
+    ├── inference.py                      # Inference script (language-guided)
+    ├── models.py                         # Main model components
+    ├── project_config.py                 # Config file for project settings
+    ├── train.py                          # Training entry point
+    │
+    ├── README.md                         # Project documentation
+    └── .gitignore
 ## 🧑‍⚕️ Dataset: Cholec80
 
 This framework is developed and evaluated on the **Cholec80 dataset**, which contains 80 videos of laparoscopic cholecystectomy procedures. Our preprocessing pipeline transforms this dataset into a format suitable for open-vocabulary learning.
