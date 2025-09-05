@@ -1,0 +1,11 @@
+torch>=2.1
+torchvision>=0.16
+transformers>=4.42
+accelerate>=0.30
+datasets>=2.18
+pillow>=10.3
+tqdm>=4.66
+scikit-learn>=1.4
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
