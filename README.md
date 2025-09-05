@@ -134,15 +134,9 @@ Temporal Grounding Models (language → time interval)
 
 Moment-DETR
 
-UniVTG
-
 Surgical Specialists (closed-set baselines)
 
 TeCNO
-
-MS-TCN / MS-TCN++
-
-ResNet + LSTM
 
 📈 Evaluation Protocol
 
