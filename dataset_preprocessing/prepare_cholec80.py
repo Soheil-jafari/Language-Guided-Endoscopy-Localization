@@ -4,15 +4,11 @@ import os
 # Add the project root directory to sys.path so modules like 'config' can be found
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# dataset_preprocessing/prepare_cholec80.py
-# This script processes your pre-parsed Cholec80 CSV and a split file
-# to generate the final triplets CSV for training, validation, or testing.
 import pandas as pd
 import random
 from tqdm import tqdm
 import argparse
 
-# Import the config instance from the config module - THIS IS THE FIX
 from project_config import config
 
 
@@ -21,10 +17,13 @@ def generate_triplets_for_split(video_ids_for_split, all_annotations_df):
     Generates (frame_path, text_query, relevance_label) triplets for a given
     list of video IDs.
     """
+    # ensure a 'video_id' column like 'video01'
+    if 'video_id' not in all_annotations_df.columns and 'standardized_video_id' in all_annotations_df.columns:
+        all_annotations_df = all_annotations_df.copy()
+        all_annotations_df['video_id'] = all_annotations_df['standardized_video_id'].str.extract(r'(video\d+)$')
+
     all_triplets = []
 
-    # Ensure config.LABEL_TO_TEXT_QUERY is properly imported and structured
-    # (assuming it's defined in your project_config.py as a dictionary)
     master_class_list = list(config.LABEL_TO_TEXT_QUERY.keys())
 
     # Filter the main annotation dataframe to only include videos for the current split
@@ -38,30 +37,50 @@ def generate_triplets_for_split(video_ids_for_split, all_annotations_df):
         video_id = row['standardized_video_id']
         frame_index = row['frame_idx']
 
-        # Correct frame filename format based on your provided information: 'frame_padded_index.jpg'
-        frame_filename = f"frame_{frame_index:07d}.jpg"  # This creates 'frame_0000000.jpg', 'frame_0000001.jpg', etc.
+        STRIDE = 5
+        if int(frame_index) % STRIDE != 0:
+            continue
+
+        frame_filename = f"frame_{int(frame_index):07d}.jpg"
 
         # The full path: EXTRACTED_FRAMES_DIR/CHOLEC80__videoXX/frame_YYYYYYY.jpg
         frame_path = os.path.join(config.EXTRACTED_FRAMES_DIR, video_id, frame_filename)
 
         # Check if the frame file actually exists before creating triplets
         if not os.path.exists(frame_path):
-            # print(f"Warning: Frame file not found: {frame_path}. Skipping.") # For debugging missing frames
+            # print(f"Warning: Frame file not found: {frame_path}. Skipping.")
             continue
 
         # --- Determine all positive labels for the current frame ---
         positive_labels_for_frame = set()
 
-        # Add the phase label
-        # Add the phase label (using 'original_label' column)
-        if pd.notna(row['original_label']) and row['original_label'] in master_class_list:
-            positive_labels_for_frame.add(row['original_label'])
+        # ---- PHASE POSITIVES ----
+        phase_raw = str(row.get('original_label') or '')
+        phase_raw_l = phase_raw.lower()
 
-        # Add all present tool labels
+        # 1) exact match against keys
+        if phase_raw in master_class_list:
+            positive_labels_for_frame.add(phase_raw)
+        else:
+            # 2) clean patterns like "99483\tGallbladderDissection" -> "GallbladderDissection"
+            tail = phase_raw.split()[-1].split('\t')[-1]
+            if tail in master_class_list:
+                positive_labels_for_frame.add(tail)
+            else:
+                # 3) keyword mapping to canonical short keys
+                for kw in ("calot", "dissection", "cleaning", "clipping", "preparation", "packaging", "retraction"):
+                    if kw in phase_raw_l and kw in master_class_list:
+                        positive_labels_for_frame.add(kw)
+                        break
+
+        # ---- TOOL POSITIVES ----
         for tool in master_class_list:
-            if tool in row and row[tool] == 1:  # Assuming 'tool' column exists and '1' indicates presence
-                positive_labels_for_frame.add(tool)
-
+            if tool in row:
+                try:
+                    if pd.notna(row[tool]) and int(row[tool]) == 1:
+                        positive_labels_for_frame.add(tool)
+                except Exception:
+                    pass
         # --- Generate Positive Samples ---
         for label in positive_labels_for_frame:
             query_text = config.LABEL_TO_TEXT_QUERY.get(label, label)
@@ -77,7 +96,7 @@ def generate_triplets_for_split(video_ids_for_split, all_annotations_df):
         # Add a few negative samples to balance the data
         # Ensure num_neg_samples doesn't exceed available negative candidates or desired positive samples
         num_pos_samples = len(positive_labels_for_frame)
-        num_neg_samples = min(len(negative_candidate_labels), num_pos_samples)
+        num_neg_samples = min(len(negative_candidate_labels), 2)
 
         if num_neg_samples > 0:
             chosen_neg_labels = random.sample(negative_candidate_labels, num_neg_samples)

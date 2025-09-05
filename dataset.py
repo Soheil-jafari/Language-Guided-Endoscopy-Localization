@@ -11,149 +11,223 @@ import re
 import numpy as np
 from project_config import config
 
+# --- KEYWORD MAPPING ---
+PHASE_KEYWORDS = {
+    "preparation": 0, "calot": 1, "clipping": 2, "cutting": 2,
+    "dissection": 3, "packaging": 4, "cleaning": 5, "coagulation": 5,
+    "retraction": 6
+}
+TOOL_KEYWORDS = {
+    "grasper": 0, "bipolar": 1, "hook": 2, "scissors": 3,
+    "clip": 4, "clipper": 4, "irrigator": 5, "suction": 5,
+    "specimen": 6, "bag": 6
+}
+
+
+# --- CONCEPT PARSING FUNCTION ---
+def parse_query_kind(text_query: str):
+    q = text_query.lower()
+    for k, pid in PHASE_KEYWORDS.items():
+        if k in q:
+            return ("phase", pid)
+    for k, tid in TOOL_KEYWORDS.items():
+        if k in q:
+            return ("tool", tid)
+    return ("unknown", None)
+
 
 class EndoscopyLocalizationDataset(Dataset):
     """
-    Custom PyTorch dataset that loads short video CLIPS.
-    It uses the triplets CSV to find an "anchor" frame and then loads a sequence of
-    consecutive frames around it.
+    Loads 16-frame clips and generates per-frame labels by robustly mapping
+    the triplet's text query to a concept (phase/tool) and looking up ground
+    truth labels from the parsed annotations file.
     """
 
     def __init__(self, triplets_csv_path, tokenizer, clip_length=16, is_training=True):
+        # ---- Read triplets ----
         self.triplets_df = pd.read_csv(triplets_csv_path)
-        self.tokenizer = tokenizer
-        self.clip_length = clip_length  # Number of frames per clip
-        self.is_training = is_training
+        assert "frame_path" in self.triplets_df.columns, "Triplets CSV must have 'frame_path'"
+        assert "text_query" in self.triplets_df.columns, "Triplets CSV must have 'text_query'"
 
-        # === UNIFIED, TEMPORALLY CONSISTENT IMAGE TRANSFORMS ===
-        # Unified training augmentations, tensor conversion, and normalization
+        self.tokenizer = tokenizer
+        self.clip_length = clip_length
+        self.is_training = is_training
+        self._video_bounds = {}
+
+        # ==================== CONCEPT-BASED LABEL LOOKUP ====================
+        print("Building concept-based label lookup from parsed annotations...")
+        ann_path = config.CHOLEC80_PARSED_ANNOTATIONS
+        if not os.path.exists(ann_path):
+            raise FileNotFoundError(f"Parsed annotations CSV not found at: {ann_path}")
+
+        ann_df = pd.read_csv(ann_path)
+
+        # Standardize video IDs to match the format derived from frame_path (e.g., 'CHOLEC80__video01')
+        if 'standardized_video_id' not in ann_df.columns:
+            raise KeyError("Parsed annotations must have 'standardized_video_id' column")
+
+        # Create two separate, efficient lookups: one for phases, one for tools.
+        self.phase_label_lookup = {}  # Key: (video_id_str, frame_idx), Value: phase_id
+        self.tool_label_lookup = {}  # Key: (video_id_str, frame_idx), Value: list of 7 tool presence flags [0,1,0,0,1,0,0]
+
+        # Use tqdm for progress tracking
+        from tqdm import tqdm
+        for _, row in tqdm(ann_df.iterrows(), total=len(ann_df), desc="Processing annotations"):
+            video_id_str = row['standardized_video_id']
+            frame_idx = int(row['frame_idx'])
+            key = (video_id_str, frame_idx)
+
+            # For phases, we store the phase ID directly.
+            # We assume one phase per frame. 'original_label' seems to hold the phase name.
+            phase_name = str(row.get('original_label', '')).lower()
+            if phase_name:
+                for keyword, phase_id in PHASE_KEYWORDS.items():
+                    if keyword in phase_name:
+                        self.phase_label_lookup[key] = phase_id
+                        break  # Move to next row once phase is found
+
+            # For tools, we build a multi-hot vector for all 7 tool types.
+            if key not in self.tool_label_lookup:
+                self.tool_label_lookup[key] = [0] * len(TOOL_KEYWORDS)  # Initialize with all zeros
+
+            # Populate the tool vector based on tool columns (grasper, bipolar, etc.)
+            for tool_keyword, tool_id in TOOL_KEYWORDS.items():
+                # Check if a column matching the tool keyword exists and its value is 1
+                if tool_keyword in row and row[tool_keyword] == 1:
+                    self.tool_label_lookup[key][tool_id] = 1
+
+        print(
+            f"Lookup created. Found annotations for {len(self.phase_label_lookup)} phase instances and {len(self.tool_label_lookup)} tool instances.")
+
+        # ---- Transforms ----
         self.train_transforms = T.Compose([
-            # This is now a mandatory operation, ensuring all frames are 224x224
-            T.RandomResizedCrop(
-                (config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE),
-                scale=(0.8, 1.0),
-                ratio=(0.75, 1.33)
-            ),
-            T.RandomApply([
-                T.ColorJitter(
-                    brightness=0.2,
-                    contrast=0.2,
-                    saturation=0.2,
-                    hue=0.1
-                )], p=0.5),
+            T.RandomResizedCrop((config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE), scale=(0.5, 1.0),
+                                ratio=(0.7, 1.4)),
+            T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.3),
             T.RandomHorizontalFlip(p=config.DATA.AUGMENT_PROB),
-            T.RandomApply([T.RandomRotation(degrees=10)], p=0.3),
+            T.RandomApply([T.RandomRotation(degrees=20)], p=0.5),
             T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.3),
-            # --- ADD THIS STEP for explicit PIL-to-Tensor conversion ---
             T.ToImage(),
-            # --- The following steps now correctly receive a Tensor ---
             T.ToDtype(torch.float32, scale=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-        # Unified validation transforms, tensor conversion, and normalization
         self.val_transforms = T.Compose([
             T.Resize(size=config.DATA.TRAIN_CROP_SIZE + 32),
             T.CenterCrop(size=config.DATA.TRAIN_CROP_SIZE),
-            # --- ADD THIS STEP for explicit PIL-to-Tensor conversion ---
             T.ToImage(),
-            # --- The following steps now correctly receive a Tensor ---
             T.ToDtype(torch.float32, scale=True),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-
-        # The separate `final_transforms` is no longer needed.
-        self.final_transforms = None  # Or just delete the attribute
 
     def __len__(self):
         return len(self.triplets_df)
 
     def _load_frame(self, frame_path):
-        """Load a single frame with proper error handling"""
-        frame = cv2.imread(frame_path)
-        if frame is None:
+        if not os.path.exists(frame_path):
             return None
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = cv2.imread(frame_path)
+        if img is None:
+            return None
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def __getitem__(self, idx):
-        triplet = self.triplets_df.iloc[idx]
-        anchor_frame_path = triplet['frame_path']
-        text_query = str(triplet['text_query'])
-        relevance = float(triplet['relevance_label'])
+        row = self.triplets_df.iloc[idx]
+        frame_path = str(row["frame_path"])
+        text_query = str(row["text_query"])
 
-        # Extract video directory and frame number
-        video_dir = os.path.dirname(anchor_frame_path)
-        frame_name = os.path.basename(anchor_frame_path)
+        # Parse video_id_str and center_frame_idx from the frame_path
+        video_id_str = os.path.basename(os.path.dirname(frame_path))
+        m = re.search(r"frame_(\d+)\.jpg$", os.path.basename(frame_path), flags=re.IGNORECASE)
+        digits = len(m.group(1)) if m else 7
+        center_frame_idx = int(m.group(1)) if m else 0
 
-        # Parse frame number with robust regex
-        match = re.search(r'frame_(\d+)\.jpg$', frame_name)
-        if not match:
-            print(f"Warning: Could not parse frame number from {frame_name}. Using frame 1.")
-            anchor_frame_num = 1
-        else:
-            anchor_frame_num = int(match.group(1))
+        # Build 16-frame window and load frames
+        start_frame_idx = max(0, center_frame_idx - self.clip_length // 2)
+        video_dir = os.path.dirname(frame_path)
 
-        # Calculate frame range
-        start_frame_num = max(1, anchor_frame_num - self.clip_length // 2)
-        frames = []
-        last_valid_frame = None
+        # discover min/max once per video dir
+        if video_dir not in self._video_bounds:
+            min_idx, max_idx = 0, 0
+            try:
+                idxs = []
+                for f in os.listdir(video_dir):
+                    m2 = re.match(r"frame_(\d+)\.jpg$", f)
+                    if m2:
+                        idxs.append(int(m2.group(1)))
+                if idxs:
+                    min_idx, max_idx = min(idxs), max(idxs)
+            except FileNotFoundError:
+                pass
+            self._video_bounds[video_dir] = (min_idx, max_idx)
 
-        # Load frames with error handling
-        for i in range(self.clip_length):
-            current_frame_num = start_frame_num + i
-            frame_path = os.path.join(video_dir, f"frame_{current_frame_num:07d}.jpg")
+        min_idx, max_idx = self._video_bounds[video_dir]
 
-            frame = self._load_frame(frame_path)
-            if frame is None:
-                if last_valid_frame is not None:
-                    # Use last valid frame if available
-                    frames.append(last_valid_frame.copy())
+        # shift/clamp the window so it stays inside [min_idx, max_idx]
+        start_frame_idx = max(min_idx, start_frame_idx)
+        start_frame_idx = min(start_frame_idx, max(min_idx, max_idx - self.clip_length + 1))
+
+        frames, last_valid = [], None
+        for t in range(self.clip_length):
+            fidx = start_frame_idx + t
+            fpath = os.path.join(video_dir, f"frame_{fidx:0{digits}d}.jpg")
+            img = self._load_frame(fpath)
+            if img is None:
+                if last_valid is not None:
+                    frames.append(last_valid.copy())
                 else:
-                    # Create black frame as fallback
-                    frames.append(np.zeros((config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE, 3), dtype=np.uint8))
+                    frames.append(
+                        np.zeros((config.DATA.TRAIN_CROP_SIZE, config.DATA.TRAIN_CROP_SIZE, 3), dtype=np.uint8))
             else:
-                frames.append(frame)
-                last_valid_frame = frame
+                frames.append(img)
+                last_valid = img
 
-        # Convert to PIL Images for augmentation
-        pil_frames = [T.ToPILImage()(frame) for frame in frames]
-
-        # Apply the single, unified transform pipeline.
-        # This will return a single tensor of shape (T, C, H, W).
+        pil_frames = [T.ToPILImage()(f) for f in frames]
         transform = self.train_transforms if self.is_training else self.val_transforms
-        transformed_frames = [transform(img) for img in pil_frames]
+        video_clip_tensor = transform(pil_frames)
+        if isinstance(video_clip_tensor, list):
+            video_clip_tensor = torch.stack(video_clip_tensor, dim=0)
+        video_clip = video_clip_tensor.permute(1, 0, 2, 3).contiguous()
 
-        # 💡 Manually stack the list of tensors into a single tensor.
-        # The shape will become (T, C, H, W).
-        video_clip = torch.stack(transformed_frames, dim=0)
-
-        # Now that `video_clip` is a single tensor, we can permute it.
-        # The shape becomes (C, T, H, W).
-        video_clip = video_clip.permute(1, 0, 2, 3)
-
-        # --- Text and Label Preparation ---
-        text_inputs = self.tokenizer(
-            text_query, padding='max_length', truncation=True,
-            max_length=config.DATA.MAX_TEXT_LENGTH, return_tensors="pt"
-        )
+        # Tokenize text
+        text_inputs = self.tokenizer(text_query, padding='max_length', truncation=True,
+                                     max_length=config.DATA.MAX_TEXT_LENGTH, return_tensors="pt")
         input_ids = text_inputs['input_ids'].squeeze(0)
         attention_mask = text_inputs['attention_mask'].squeeze(0)
-        relevance_tensor = torch.full((self.clip_length,), relevance, dtype=torch.float32)
 
-        # Ensure contiguous memory layout
-        video_clip = video_clip.contiguous()
+        # ==================== PER-FRAME LABEL GENERATION ====================
+        # Parse the text query to find out what concept (phase/tool) we are looking for.
+        concept, concept_id = parse_query_kind(text_query)
 
-        # The DataLoader will handle pinning memory if pin_memory=True is set.
-        # We remove the manual call from the dataset worker.
+        labels = []
+        for t in range(self.clip_length):
+            fidx = start_frame_idx + t
+            key = (video_id_str, fidx)
+            label = 0.0  # Default label is 0 (not relevant)
+
+            if concept == "phase":
+                # Check if the phase at this frame matches the query's phase concept.
+                if self.phase_label_lookup.get(key, -1) == concept_id:
+                    label = 1.0
+            elif concept == "tool":
+                # Check if the specific tool is present in this frame.
+                tool_flags = self.tool_label_lookup.get(key)
+                if tool_flags and tool_flags[concept_id] == 1:
+                    label = 1.0
+
+            labels.append(label)
+
+        relevance_tensor = torch.tensor(labels, dtype=torch.float32)
 
         return {
-            'video_clip': video_clip,
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': relevance_tensor
+            "video_clip": video_clip,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": relevance_tensor,
         }
 
 
+# --- DataLoaders function ---
 def create_dataloaders(train_csv_path, val_csv_path, tokenizer, clip_length=16, subset_ratio=1.0):
     print(f"Loading training data from: {train_csv_path}")
     train_dataset = EndoscopyLocalizationDataset(
@@ -165,7 +239,6 @@ def create_dataloaders(train_csv_path, val_csv_path, tokenizer, clip_length=16, 
         val_csv_path, tokenizer, clip_length, is_training=False
     )
 
-    # Apply subsetting if needed
     if subset_ratio < 1.0:
         random.seed(42)
         torch.manual_seed(42)

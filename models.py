@@ -12,19 +12,18 @@ from backbone.vision_transformer import VisionTransformer, load_pretrained, _cfg
 
 
 # --- Conceptual LoRA Implementation ---
-class LoRALinear(nn.Linear):
+class LoRALinear(nn.Module):
     def __init__(self, linear_layer, r=8, alpha=16, dropout=0.0):
-        super().__init__(linear_layer.in_features, linear_layer.out_features, linear_layer.bias is not None)
+        super().__init__()
         self.r = r
         self.alpha = alpha
         self.dropout = nn.Dropout(dropout)
-        self.original_weight = linear_layer.weight
-        self.original_weight.requires_grad = False
+        self.register_buffer("original_weight", linear_layer.weight.data.clone())
         if linear_layer.bias is not None:
-            self.original_bias = linear_layer.bias
-            self.original_bias.requires_grad = False
+            self.register_buffer("original_bias", linear_layer.bias.data.clone())
         else:
             self.original_bias = None
+
         self.lora_A = nn.Parameter(torch.zeros(linear_layer.in_features, r))
         self.lora_B = nn.Parameter(torch.zeros(r, linear_layer.out_features))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -34,6 +33,21 @@ class LoRALinear(nn.Linear):
         original_output = F.linear(x, self.original_weight, self.original_bias)
         lora_output = (self.dropout(x @ self.lora_A) @ self.lora_B) * (self.alpha / self.r)
         return original_output + lora_output
+
+def apply_lora_to_linear_layers_selective(module, r=8, alpha=16, dropout=0.0, name_filter=None, _prefix=""):
+    """
+    Recursively wraps ONLY selected nn.Linear layers with LoRA.
+    - module: root nn.Module to traverse (e.g., vision backbone)
+    - name_filter: callable(full_name:str) -> bool
+    """
+    for child_name, child in module.named_children():
+        full_name = f"{_prefix}.{child_name}" if _prefix else child_name
+
+        if isinstance(child, nn.Linear) and (name_filter is None or name_filter(full_name)):
+            setattr(module, child_name, LoRALinear(child, r=r, alpha=alpha, dropout=dropout))
+        else:
+            apply_lora_to_linear_layers_selective(child, r=r, alpha=alpha, dropout=dropout,
+                                                  name_filter=name_filter, _prefix=full_name)
 
 
 def apply_lora_to_linear_layers(model, r=8, alpha=16, dropout=0.0):
@@ -72,7 +86,7 @@ class ConfidenceAwareFusion(nn.Module):
 
         return confidence_scores
 
-# --- Start Self-Contained Mamba Block Implementation ---
+# --- Self-Contained Mamba Block Implementation ---
 class MambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
@@ -87,7 +101,7 @@ class MambaBlock(nn.Module):
             in_channels=self.d_inner, out_channels=self.d_inner,
             bias=True, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, padding_mode='zeros'
         ).to(memory_format=torch.channels_last)
-        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)  # Simplified this line slightly
+        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
         self.act = nn.SiLU()
 
@@ -133,7 +147,7 @@ class MambaBlock(nn.Module):
         return x_out
 
 
-# --- End Self-Contained Mamba Block ---
+# --- Self-Contained Mamba Block ---
 
 class TextEncoder(nn.Module):
     def __init__(self, config):
@@ -147,8 +161,9 @@ class TextEncoder(nn.Module):
             print("Conceptual LoRA applied to Text Encoder.")
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.text_encoder(input_ids=input_ids.to(self.text_encoder.device),
-                                    attention_mask=attention_mask.to(self.text_encoder.device))
+        dev = next(self.text_encoder.parameters()).device
+        outputs = self.text_encoder(input_ids=input_ids.to(dev),
+                                    attention_mask=attention_mask.to(dev))
         return outputs.last_hidden_state, attention_mask
 
 
@@ -159,6 +174,14 @@ class LanguageGuidedHead(nn.Module):
                                                                     dim_feedforward=visual_embed_dim * 4,
                                                                     batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(self.transformer_decoder_layer, num_layers=num_layers)
+        _orig_mha_forward = self.transformer_decoder_layer.multihead_attn.forward
+
+        def _forward_with_weights(*args, **kwargs):
+            kwargs["need_weights"] = True
+            kwargs["average_attn_weights"] = False
+            return _orig_mha_forward(*args, **kwargs)
+
+        self.transformer_decoder_layer.multihead_attn.forward = _forward_with_weights
         self.fc_relevance = nn.Linear(visual_embed_dim, 1)
         self.text_proj = nn.Linear(text_embed_dim, visual_embed_dim)
 
@@ -171,7 +194,6 @@ class LanguageGuidedHead(nn.Module):
         xai_weights = None
         attn_holder = {}
         def _xai_hook(mod, inp, out):
-            # out can be Tensor or (attn_output, attn_weights) depending on PyTorch version
             try:
                 if isinstance(out, tuple) and len(out) == 2:
                     attn_holder['w'] = out[1]
@@ -205,23 +227,23 @@ class LanguageGuidedHead(nn.Module):
         # This is the averaged semantic feature vector (for the temporal head)
         semantic_features_for_temporal_head = fused_spatial_features.mean(dim=1)
 
-        # === THIS IS THE FIX: Return the correct features ===
+
         # Return both the semantic vector for the temporal head AND the full spatial map for the loss function
         xai_weights = attn_holder.get('w', None)
-        # Clean up hook
+
         try:
             handle.remove()
         except Exception:
             pass
         return semantic_features_for_temporal_head, fused_spatial_features, xai_weights
 
-# --- Kept Original Temporal Head ---
+# --- Temporal Head ---
 class TemporalHead(nn.Module):
     def __init__(self, input_dim, output_dim, num_attention_heads=8, num_layers=2):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_attention_heads, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        # The output layer's dimension is now controlled by the 'output_dim' parameter
+        # The output layer's dimension is controlled by the 'output_dim' parameter
         self.fc_output = nn.Linear(input_dim, output_dim)
 
     def forward(self, frame_features_seq):
@@ -229,8 +251,8 @@ class TemporalHead(nn.Module):
         # The output can now be a single score or 4 evidential parameters
         logits = self.fc_output(temporal_features)
 
-        # If output_dim is 4, we are in uncertainty mode. Apply activation.
-        if self.fc_output.out_features == 4:
+        # If output_dim is 2, we are in uncertainty mode.
+        if self.fc_output.out_features == 2:
             # Softplus ensures non-negative evidence. Adding 1 for numerical stability.
             return F.softplus(logits)
         else:
@@ -251,8 +273,8 @@ class TemporalHeadSSM(nn.Module):
         x = self.norm(x)
         logits = self.fc_output(x)
 
-        # If output_dim is 4, we are in uncertainty mode. Apply activation.
-        if self.fc_output.out_features == 4:
+        # If output_dim is 4, we are in uncertainty mode.
+        if self.fc_output.out_features == 2:
             return F.softplus(logits)
         else:
             return logits
@@ -290,6 +312,24 @@ class LocalizationFramework(nn.Module):
         else:
             raise ValueError(f"Unknown VISION_BACKBONE_NAME: {config.MODEL.VISION_BACKBONE_NAME}")
 
+        if getattr(config.TRAIN, "USE_LORA_BACKBONE", False):
+            # Wrap only attention (qkv/proj) + MLP (fc1/fc2) linear layers
+            target_names = {"qkv", "proj", "fc1", "fc2"}
+            apply_lora_to_linear_layers_selective(
+                self.vision_backbone,
+                r=config.TRAIN.LORA_R_BACKBONE,
+                alpha=config.TRAIN.LORA_ALPHA_BACKBONE,
+                dropout=config.TRAIN.LORA_DROPOUT_BACKBONE,
+                name_filter=lambda full_name: any(t in full_name.lower() for t in target_names)
+            )
+            print("LoRA applied to Vision Backbone (qkv/proj/fc1/fc2).")
+
+            if getattr(config.TRAIN, "FREEZE_BACKBONE_WHEN_LORA", True):
+                # Freeze all non-LoRA params in the backbone; train only LoRA A/B
+                for n, p in self.vision_backbone.named_parameters():
+                    p.requires_grad = ("lora_A" in n) or ("lora_B" in n)
+                print("Frozen non-LoRA backbone params (FREEZE_BACKBONE_WHEN_LORA=True).")
+
         self.vision_embed_dim = self.vision_backbone.embed_dim
         self.text_encoder = TextEncoder(config)
         self.language_guided_head = LanguageGuidedHead(visual_embed_dim=self.vision_embed_dim,
@@ -297,7 +337,7 @@ class LocalizationFramework(nn.Module):
                                                        num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
                                                        num_layers=config.MODEL.HEAD_NUM_LAYERS)
 
-        output_dim = 4 if config.MODEL.USE_UNCERTAINTY else 1
+        output_dim = 2 if config.MODEL.USE_UNCERTAINTY else 1
         if config.MODEL.TEMPORAL_HEAD_TYPE == 'SSM':
             self.temporal_head = TemporalHeadSSM(input_dim=self.vision_embed_dim, output_dim=output_dim,
                                                  num_layers=config.MODEL.HEAD_NUM_LAYERS)
@@ -345,12 +385,13 @@ class LocalizationFramework(nn.Module):
 
             # Return the tuple in the order the MasterLoss expects.
             # (refined_score_placeholder, raw_score, unused, semantic, spatial, EVIDENTIAL_PARAMS)
-            return (refined_scores_for_val_and_unpacker, raw_relevance_scores, None,
+            return (refined_scores_for_val_and_unpacker, raw_relevance_scores, xai_weights,
                     semantic_features_reshaped, spatial_features_reshaped, evidential_params)
         else:
             # When uncertainty is off, the final output IS the refined score.
             refined_scores = final_output
 
             # The evidential_output is None.
-            return (refined_scores, raw_relevance_scores, None,
+            return (refined_scores, raw_relevance_scores, xai_weights,
                     semantic_features_reshaped, spatial_features_reshaped, None)
+

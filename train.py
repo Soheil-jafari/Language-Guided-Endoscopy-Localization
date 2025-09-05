@@ -10,7 +10,28 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import GradScaler, autocast
+from sklearn.metrics import roc_auc_score, average_precision_score
 
+def best_f1_threshold_from_logits(logits_1d, labels_1d):
+    """
+    logits_1d: numpy array of raw logits (not sigmoid), shape (N,)
+    labels_1d: numpy array of {0,1}, shape (N,)
+    Returns: (thr*, bestF1)
+    """
+    p = 1.0 / (1.0 + np.exp(-np.asarray(logits_1d)))
+    y = np.asarray(labels_1d).astype(int)
+    best_t, best_f1 = 0.5, 0.0
+    for t in np.linspace(0.05, 0.95, 19):
+        pred = (p >= t)
+        tp = (pred & (y == 1)).sum()
+        fp = (pred & (y == 0)).sum()
+        fn = ((~pred) & (y == 1)).sum()
+        prec = tp / (tp + fp + 1e-9)
+        rec  = tp / (tp + fn + 1e-9)
+        f1   = 2 * prec * rec / (prec + rec + 1e-9)
+        if f1 > best_f1:
+            best_t, best_f1 = t, f1
+    return best_t, best_f1
 
 # ===== Robust checkpoint utilities =====
 def _strip_module_prefix(state_dict):
@@ -34,6 +55,7 @@ def atomic_torch_save(obj, path):
                 os.remove(tmp_path)
             except Exception:
                 pass
+
 def load_weights_for_finetune(model, checkpoint_path, device):
     import os, torch, builtins
     import torch.serialization as ts
@@ -42,7 +64,7 @@ def load_weights_for_finetune(model, checkpoint_path, device):
         raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
     print(f"Loading weights for fine-tuning from: {checkpoint_path}")
 
-    # 1) Try safe (tensors-only) load on PyTorch 2.6+
+    # 1) Here we Try safe (tensors-only) load on PyTorch 2.6+
     ckpt = None
     try:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -64,6 +86,7 @@ def load_weights_for_finetune(model, checkpoint_path, device):
     # Strip/normalize DP prefix
     def strip_module(d):
         return { (k[7:] if k.startswith("module.") else k): v for k, v in d.items() }
+
     state_dict = strip_module(state_dict)
 
     # Filter to matching keys & shapes
@@ -178,7 +201,7 @@ class EvidentialLoss(nn.Module):
 
     def forward(self, evidential_output, target):
         target = target.unsqueeze(-1)
-        evidence = F.softplus(evidential_output)
+        evidence = evidential_output
         alpha = evidence[..., 0:1] + 1
         beta = evidence[..., 1:2] + 1
         S = alpha + beta
@@ -202,7 +225,9 @@ class MasterLoss(nn.Module):
         self.use_uncertainty = config.MODEL.USE_UNCERTAINTY
         self.use_bilevel = config.TRAIN.USE_BILEVEL_CONSISTENCY
 
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        pos_weight_value = 1.0
+        pos_weight_tensor = torch.tensor([pos_weight_value], device=config.TRAIN.DEVICE)
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
         self.l1_loss = nn.L1Loss()
         if self.use_uncertainty:
             self.evidential_loss = EvidentialLoss()
@@ -236,7 +261,7 @@ class MasterLoss(nn.Module):
 
                 # The RAFT model's internal pyramid downsamples by 8. To get a feature map of at least 16x16,
                 # the input image must be at least 128x128 (128 / 8 = 16).
-                # Our previous 224 * 0.5 = 112px was too small. We now use a safe target size.
+
                 target_raft_size = (128, 128)
 
                 # Downsample frames to the required minimum size for RAFT
@@ -250,10 +275,9 @@ class MasterLoss(nn.Module):
                 flow_small = self.optical_flow_model(video_t_norm, video_t_plus_1_norm)[-1]
 
                 # Upscale flow to original feature resolution
-                feature_res = (H // 16, W // 16)  # For patch size 16
-                flow = F.interpolate(flow_small, size=feature_res, mode='bilinear') * (feature_res[0] / target_raft_size[0])
+                flow = flow_small
 
-            warped_spatial = self.warp_features(spatial_features, flow)
+            warped_spatial = self.warp_features(spatial_features, flow, src_flow_size=target_raft_size)
             actual_next = spatial_features[:, 1:]
             loss_flow = self.l1_loss(warped_spatial, actual_next)
 
@@ -289,17 +313,44 @@ class MasterLoss(nn.Module):
 
         return total_loss, primary_loss, temporal_regularizer_loss
 
-    def warp_features(self, features, flow):
+    def warp_features(self, features, flow, src_flow_size=(128, 128)):
+        """
+        features: (B, T, H_feat, W_feat, C_feat)
+        flow: (B*(T-1), 2, H_src, W_src) from RAFT (e.g., 128x128)
+        src_flow_size: (H_src, W_src) used when flow was computed
+        """
         B, T, H_feat, W_feat, C_feat = features.shape
+        assert T > 1, "Need at least two frames for warping."
+
+        # prepare feature tensor: (B*(T-1), C, H_feat, W_feat)
         features_to_warp = features[:, :-1].reshape(B * (T - 1), H_feat, W_feat, C_feat).permute(0, 3, 1, 2)
-        downsampled_flow = F.interpolate(flow.to(features.dtype), size=(H_feat, W_feat), mode='bilinear',
-                                         align_corners=False).permute(0, 2, 3, 1)
-        grid_y, grid_x = torch.meshgrid(torch.arange(H_feat, device=flow.device),
-                                        torch.arange(W_feat, device=flow.device), indexing="ij")
-        grid = torch.stack((grid_x, grid_y), 2).float().unsqueeze(0).expand(B * (T - 1), -1, -1, -1)
-        new_grid = grid + downsampled_flow
-        new_grid[..., 0] = 2.0 * new_grid[..., 0] / max(W_feat - 1, 1) - 1.0
-        new_grid[..., 1] = 2.0 * new_grid[..., 1] / max(H_feat - 1, 1) - 1.0
+
+        # resize flow to feature resolution
+        flow_resized = F.interpolate(flow.to(features.dtype), size=(H_feat, W_feat), mode='bilinear',
+                                     align_corners=False)
+
+        # scale u (x) and v (y) components from src_flow_size -> (H_feat, W_feat)
+        H_src, W_src = src_flow_size
+        scale_x = W_feat / float(W_src)
+        scale_y = H_feat / float(H_src)
+        flow_resized[:, 0, ...] = flow_resized[:, 0, ...] * scale_x  # u
+        flow_resized[:, 1, ...] = flow_resized[:, 1, ...] * scale_y  # v
+
+        # grid sample expects flow in (B*(T-1), H_feat, W_feat, 2)
+        flow_feat = flow_resized.permute(0, 2, 3, 1)
+
+        # build base grid and add flow (in pixel units), then normalize to [-1, 1]
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H_feat, device=flow.device),
+            torch.arange(W_feat, device=flow.device),
+            indexing="ij"
+        )
+        base_grid = torch.stack((grid_x, grid_y), 2).float().unsqueeze(0).expand(B * (T - 1), -1, -1, -1)
+
+        new_grid = base_grid + flow_feat
+        new_grid[..., 0] = 2.0 * new_grid[..., 0] / max(W_feat - 1, 1) - 1.0  # x to [-1,1]
+        new_grid[..., 1] = 2.0 * new_grid[..., 1] / max(H_feat - 1, 1) - 1.0  # y to [-1,1]
+
         warped_features_flat = F.grid_sample(features_to_warp, new_grid, padding_mode='border', align_corners=False)
         warped_features = warped_features_flat.permute(0, 2, 3, 1).view(B, T - 1, H_feat, W_feat, C_feat)
         return warped_features
@@ -384,38 +435,71 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device):
     return running_loss / len(dataloader)
 
 
+@torch.no_grad()
 def validate_one_epoch(model, dataloader, criterion, device):
     model.eval()
-    running_loss, all_preds, all_labels = 0.0, [], []
-    progress_bar = tqdm(dataloader, desc="Validating", unit="batch", leave=False)
+    running_loss = 0.0
+    all_logits_flat = []
+    all_labels_flat = []
 
-    with torch.no_grad():
-        for i, batch in enumerate(progress_bar):
-            video_clip = batch['video_clip'].to(device, non_blocking=True)
-            input_ids = batch['input_ids'].to(device, non_blocking=True)
-            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
-            relevance = batch['labels'].to(device, non_blocking=True)
+    for batch in dataloader:
+        video_clip = batch['video_clip'].to(device, non_blocking=True)   # (B,C,T,H,W)
+        input_ids  = batch['input_ids'].to(device, non_blocking=True)
+        attn_mask  = batch['attention_mask'].to(device, non_blocking=True)
+        labels     = batch['labels'].to(device, non_blocking=True)       # (B,T) or (B,T,1)
 
-            with autocast():
-                outputs = model(video_clip, input_ids, attention_mask)
-                loss, _, _ = criterion(outputs, video_clip, relevance)
+        outputs = model(video_clip, input_ids, attn_mask)
 
-            if isinstance(loss, torch.Tensor) and loss.numel() > 1:
-                loss = loss.mean()
+        # ---- match training objective ----
+        total_val_loss, _, _ = criterion(outputs, video_clip, labels)
+        running_loss += float(total_val_loss.item())
 
-            refined_scores, _, _, _, _, _ = outputs
-            preds = torch.sigmoid(refined_scores.squeeze(-1)) > 0.5
+        # ---- metrics on the refined predictions (primary output) ----
+        refined_scores = outputs[0]   # shape (B,T) or (B,T,1)
+        if refined_scores.dim() == 3 and refined_scores.size(-1) == 1:
+            refined_scores = refined_scores.squeeze(-1)
 
-            running_loss += loss.item()
-            all_preds.extend(preds.flatten().cpu().numpy())
-            all_labels.extend(relevance.flatten().cpu().numpy())
+        # ensure labels shape matches
+        if labels.dim() == 3 and labels.size(-1) == 1:
+            labels_eval = labels.squeeze(-1)
+        else:
+            labels_eval = labels
 
-    avg_loss = running_loss / len(dataloader)
-    if not all_labels:
-        accuracy = 0.0
-    else:
-        accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
-    return avg_loss, accuracy
+        # collect center-frame logits & labels
+        all_logits_flat.extend(refined_scores.detach().cpu().view(-1).numpy().tolist())
+        all_labels_flat.extend(labels.detach().cpu().view(-1).numpy().tolist())
+
+    from sklearn.metrics import roc_auc_score, average_precision_score
+
+    y_true = np.array(all_labels_flat, dtype=int)
+    z = np.array(all_logits_flat, dtype=float)
+    probs  = 1.0 / (1.0 + np.exp(-z))                    # sigmoid
+
+    # AUROC / AUPRC
+    try:
+        auroc = roc_auc_score(y_true, probs)
+    except ValueError:
+        auroc = float('nan')
+    try:
+        auprc = average_precision_score(y_true, probs)
+    except ValueError:
+        auprc = float('nan')
+
+    # plain accuracy at fixed threshold 0.5
+    preds_05   = (probs >= 0.5).astype(int)
+    val_acc_05 = (preds_05 == y_true).mean()
+
+    # best-F1 threshold sweep (reuse the helper)
+    thr, best_f1 = best_f1_threshold_from_logits(z, y_true)
+    acc_at_thr   = ((probs >= thr) == y_true).mean()
+
+    avg_loss = running_loss / max(len(dataloader), 1)
+    print(f"[VAL] loss={avg_loss:.4f}  AUROC={auroc:.3f}  AUPRC={auprc:.3f}  "
+          f"acc@0.50={val_acc_05:.3f}  bestF1={best_f1:.3f}  thr*={thr:.2f}  acc@thr*={acc_at_thr:.3f}")
+
+    # keep the same return signature you had
+    return avg_loss, auroc, auprc, val_acc_05, best_f1, thr, acc_at_thr
+
 
 
 def save_model_DEPRECATED(*args, **kwargs):
@@ -448,7 +532,7 @@ def main(args):
     print("--- Starting Training Pipeline ---")
     device = torch.device(config.TRAIN.DEVICE)
     torch.backends.cudnn.benchmark = True
-    # Enhanced checkpoint directory handling
+    # checkpoint directory handling
     checkpoint_dir = os.path.abspath(config.CHECKPOINT_DIR)
     print(f"Checkpoint directory: {checkpoint_dir}")
 
@@ -502,7 +586,11 @@ def main(args):
     )
 
     if args.finetune_from:
-        model = load_weights_for_finetune(model, args.finetune_from, device)
+        _ = load_weights_for_finetune(
+            model.module if isinstance(model, nn.DataParallel) else model,
+            args.finetune_from,
+            device
+        )
         print(f"Fine-tuning FROM: {args.finetune_from}")
     else:
         print("Fine-tuning FROM: (none) — training from scratch weights")
@@ -516,7 +604,6 @@ def main(args):
                                                 num_training_steps=total_training_steps)
 
     criterion = MasterLoss(config)
-    print(f"\n=== Training with MasterLoss ===")
     print(f"Uncertainty Mode: {criterion.use_uncertainty}")
     print(f"Bilevel Consistency Mode: {criterion.use_bilevel}")
     best_val_loss = float('inf')
@@ -538,14 +625,28 @@ def main(args):
     for epoch in range(epochs):
         print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device)
-        val_loss, val_accuracy = validate_one_epoch(model, val_loader, criterion, device)
-        current_lr = optimizer.param_groups[0]['lr']
+        val_loss, auroc, auprc, val_acc_05, best_f1, thr, acc_at_thr = validate_one_epoch(
+            model, val_loader, criterion, device
+        )
+
+        print(f"\tValidation Loss: {val_loss:.4f}")
+        print(f"\tValidation AUROC: {auroc:.3f}")
+        print(f"\tValidation AUPRC: {auprc:.3f}")
+        print(f"\tValidation Accuracy@0.50: {val_acc_05:.4f} ({val_acc_05:.2%})")
+        print(f"\tBest F1: {best_f1:.3f} (thr={thr:.2f})")
+        print(f"\tValidation Accuracy@thr*: {acc_at_thr:.4f} ({acc_at_thr:.2%})")
+
+        try:
+            current_lr = scheduler.get_last_lr()[0]
+        except Exception:
+            current_lr = optimizer.param_groups[0]['lr']
 
         print(f"\nEpoch {epoch + 1} Summary:")
         print(f"\tTraining Loss: {train_loss:.4f}")
         print(f"\tValidation Loss: {val_loss:.4f}")
-        print(f"\tValidation Accuracy: {val_accuracy:.4f} ({val_accuracy:.2%})")
+        print(f"\tValidation Accuracy@0.50: {val_acc_05:.4f} ({val_acc_05:.2%})")
         print(f"\tCurrent Learning Rate: {current_lr:.6f}")
+
         # --- Save checkpoints (latest and best) ---
         latest_model_path = os.path.join(checkpoint_dir, f"latest_model_epoch_{epoch + 1}.pth")
         save_checkpoint(model, optimizer, scheduler, None, epoch + 1, best_val_loss, latest_model_path)

@@ -1,6 +1,4 @@
-# dataset_preprocessing/create_splits.py
-# This is a one-time script to create a reproducible train/validation/test split
-# for the Cholec80 dataset based on video filenames.
+
 
 import os
 import random
@@ -8,8 +6,9 @@ import argparse
 import sys
 import re  # For extracting numbers from filenames
 
-# We need to import config to know where to save the split files
-import project_config
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from project_config import config
 
 
 def create_video_splits(video_dir, train_split=0.7, val_split=0.15):
@@ -67,7 +66,7 @@ def create_video_splits(video_dir, train_split=0.7, val_split=0.15):
     print(f"  Test videos: {len(test_ids)}")
 
     # --- Save the lists to .txt files in the directory specified in project_config.py ---
-    output_dir = project_config.SPLIT_FILES_DIR
+    output_dir = config.SPLIT_FILES_DIR
     os.makedirs(output_dir, exist_ok=True)  # Ensure the directory exists
 
     with open(os.path.join(output_dir, 'train_videos.txt'), 'w') as f:

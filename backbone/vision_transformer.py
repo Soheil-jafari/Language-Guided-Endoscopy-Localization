@@ -9,12 +9,11 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.hub  # Changed from torch.utils.model_zoo for load_state_dict_from_url
+import torch.hub
 import torch.utils.checkpoint as checkpoint
-from einops import rearrange  # Assuming einops is installed and available in your environment
+from einops import rearrange
 
 # --- Constants and Utilities ---
-# Using a basic logger instead of timm's _logger for simplicity
 _logger = logging.getLogger(__name__)
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
@@ -106,89 +105,84 @@ default_cfgs = {
 }
 
 
-def _conv_filter(state_dict, patch_size=16):
-    """ convert patch embedding weight from manual patchify + linear proj to conv"""
-    out_dict = {}
+def _conv_filter(state_dict, model):
+    """Adapt 2D ViT patch-embed weights to a 3D Conv (1, p, p)."""
+    out = {}
     for k, v in state_dict.items():
-        if 'patch_embed.proj.weight' in k:
-            if v.shape[-1] != patch_size:
-                patch_size = v.shape[-1]
-            v = v.reshape((v.shape[0], 3, patch_size, patch_size))
-        out_dict[k] = v
-    return out_dict
-
+        if k.endswith('patch_embed.proj.weight'):
+            # v: (out, 3, p, p)  --> need (out, 3, 1, p, p)
+            if v.ndim == 4:
+                v = v.unsqueeze(2)
+        out[k] = v
+    return out
 
 # --- Helper function for loading pre-trained weights into VisionTransformer ---
-# This version explicitly handles local file paths first, then URLs, then random init.
-def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=None, img_size=224, num_frames=16,
-                    num_patches=196, attention_type='divided_space_time', pretrained_model='', strict=True):
+# This function explicitly handles local file paths first, then URLs, then random init.
+def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=None,
+                    img_size=224, num_frames=16, num_patches=196,
+                    attention_type='divided_space_time', pretrained_model='',
+                    strict=False):
+    """
+    Load ViT weights (local file wins; else URL). Defaults to strict=False so
+    temporal params missing in 2D ViTs won't break loading.
+    """
     if cfg is None:
-        # Resolve config from model's default_cfg or a default if arch not found
         cfg = getattr(model, 'default_cfg', None) or default_cfgs.get('vit_base_patch16_224')
         if cfg is None:
-            _logger.warning("Could not resolve default config for model and no explicit cfg was provided.")
+            _logger.warning("No cfg and no default_cfg; using random init.")
             warnings.warn("No valid pretrained model found. Using random initialization.")
-            return  # Fallback to random initialization early
+            return
 
     if filter_fn is None:
         filter_fn = _conv_filter
 
-    # --- Priority 1: Local pretrained_model path ---
+    def _clean_sd(sd):
+        # unwrap common wrappers
+        if any(k.startswith('module.') for k in sd.keys()):
+            sd = {k.replace('module.', '', 1): v for k, v in sd.items()}
+        if any(k.startswith('backbone.') for k in sd.keys()):
+            sd = {k.replace('backbone.', '', 1): v for k, v in sd.items()}
+        return sd
+
+    def _maybe_drop_head(sd):
+        if num_classes == 0:
+            for k in list(sd.keys()):
+                if k.startswith('head.'):
+                    del sd[k]
+        return sd
+
+    # 1) Local file
     if pretrained_model and os.path.exists(pretrained_model):
-        _logger.info(f'Attempting to load pretrained weights from local file: {pretrained_model}')
+        _logger.info(f'Loading pretrained from local: {pretrained_model}')
         try:
-            checkpoint = torch.load(pretrained_model, map_location='cpu')
-            if 'model' in checkpoint:
-                state_dict = checkpoint['model']  # Assuming the common case of 'model' key
-            else:
-                state_dict = checkpoint  # Otherwise, assume it's the state_dict directly
-
-            # Filter out classifier head if present and not needed (num_classes=0 means no head for fine-tuning)
-            if num_classes == 0:
-                for k in list(state_dict.keys()):
-                    if 'head' in k:
-                        del state_dict[k]
-
-            # Apply filter function for patch embedding conversion if needed
-            state_dict = filter_fn(state_dict, model.patch_size[0])
-
-            model.load_state_dict(state_dict, strict=strict)
-            _logger.info(f'Successfully loaded pretrained weights from {pretrained_model}')
-            return  # Successfully loaded, exit function
-
-
-
+            ckpt = torch.load(pretrained_model, map_location='cpu')
+            sd = ckpt.get('model', ckpt)
+            sd = _clean_sd(sd)
+            sd = _maybe_drop_head(sd)
+            sd = filter_fn(sd, model)  # <— pass model for Conv3d inflation
+            missing, unexpected = model.load_state_dict(sd, strict=strict)
+            _logger.info(f'loaded. missing:{len(missing)} unexpected:{len(unexpected)}')
+            return
         except Exception as e:
-            _logger.error(f"Error loading local checkpoint '{pretrained_model}': {e}")  # ADD THIS LINE
-            warnings.warn(
-                f"Failed to load pretrained model from {pretrained_model}: {e}. Falling back to URL/random initialization.")
+            _logger.error(f"Local load failed: {e}")
+            warnings.warn(f"Failed local load: {e}. Falling back to URL/random.")
 
-    # --- Priority 2: URL loading (if local path not provided or failed) ---
-    if 'url' in cfg and cfg['url']:
-        _logger.info(f'Attempting to load pretrained from URL: {cfg["url"]}')
+    # 2) URL
+    if cfg.get('url'):
+        _logger.info(f'Loading pretrained from URL: {cfg["url"]}')
         try:
-            state_dict = torch.hub.load_state_dict_from_url(cfg['url'], map_location='cpu', progress=True)
-            if 'model' in state_dict:  # Some checkpoints might be wrapped in a 'model' key
-                state_dict = state_dict['model']
-
-            if num_classes == 0:
-                for k in list(state_dict.keys()):
-                    if 'head' in k:
-                        del state_dict[k]
-
-            state_dict = filter_fn(state_dict, model.patch_size[0])
-
-            model.load_state_dict(state_dict, strict=strict)
-            _logger.info(f'Successfully loaded pretrained weights from URL: {cfg["url"]}')
-            return  # Successfully loaded, exit function
+            sd = torch.hub.load_state_dict_from_url(cfg['url'], map_location='cpu', progress=True)
+            sd = sd.get('model', sd)
+            sd = _clean_sd(sd)
+            sd = _maybe_drop_head(sd)
+            sd = filter_fn(sd, model)
+            missing, unexpected = model.load_state_dict(sd, strict=strict)
+            _logger.info(f'loaded. missing:{len(missing)} unexpected:{len(unexpected)}')
+            return
         except Exception as e:
-            warnings.warn(f"Failed to load pretrained model from URL {cfg['url']}: {e}. Using random initialization.")
-            # If URL loading fails, then final fallback is random init.
+            warnings.warn(f"Failed URL load: {e}. Using random init.")
 
-    # --- Final Fallback: Random Initialization (if no local path or URL worked) ---
-    warnings.warn(
-        "No valid pretrained model found (local path not provided/failed, or URL invalid/failed). Using random initialization.")
-
+    warnings.warn("No valid pretrained model; using random initialization.")
 
 # --- Core Backbone Classes ---
 
@@ -272,87 +266,92 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, B, T, W, return_attn=False):
+        # x: (B, 1 + T*H*W, D) if class_tokens==1 else (B, T*H*W, D)
         num_spatial_tokens = (x.size(1) - self.class_tokens) // T
-        H = num_spatial_tokens // W  # H of the patch grid
+        H = num_spatial_tokens // W  # patch-grid height
 
         if self.attention_type in ['space_only', 'joint_space_time']:
+            # standard ViT-style residuals: DropPath at the add, not inside attn/mlp
             x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
             return x
+
         elif self.attention_type == 'divided_space_time':
-            # Divided Space Time Attention (as per M²CRL and TimeSformer)
-
-            # Extract CLS token and patch tokens (save original for residual connection)
+            # ====== Split CLS vs patch tokens ======
             if self.class_tokens == 1:
-                cls_tokens_for_block_start = x[:, :1, :]  # (B, 1, D)
-                patch_tokens_for_block_start = x[:, 1:, :]  # (B, T*num_patches, D)
+                cls_tok = x[:, :1, :]  # (B, 1, D)
+                patch_tok = x[:, 1:, :]  # (B, T*H*W, D)
             else:
-                cls_tokens_for_block_start = None
-                patch_tokens_for_block_start = x
+                cls_tok = None
+                patch_tok = x  # (B, T*H*W, D)
 
-            # --- Temporal Attention ---
-            # Reshape patch_tokens_for_block_start for temporal attention: (B*num_patches, T, dim)
-            xt_temp_reshaped = rearrange(patch_tokens_for_block_start, 'b (h w t) m -> (b h w) t m', b=B, h=H, w=W, t=T)
+            # 1) TEMPORAL ATTENTION on patches (per location)
+            # reshape: (B, T*H*W, D) -> ((B*H*W), T, D)
+            xt = rearrange(patch_tok, 'b (h w t) d -> (b h w) t d', b=B, h=H, w=W, t=T)
 
-            # Apply temporal attention
-            res_temporal_output = self.drop_path(self.temporal_attn(self.temporal_norm1(xt_temp_reshaped)))
+            # ViT-style: norm -> attn ; apply DropPath at the add
+            temp_out = self.temporal_attn(self.temporal_norm1(xt))  # ((B*H*W), T, D)
+            temp_out = rearrange(temp_out, '(b h w) t d -> b (h w t) d', b=B, h=H, w=W, t=T)  # (B, T*H*W, D)
 
-            # Reshape temporal attention output back to (B, T*num_patches, dim)
-            res_temporal_output = rearrange(res_temporal_output, '(b h w) t m -> b (h w t) m', b=B, h=H, w=W, t=T)
-
-
-            # Add temporal residual to the ORIGINAL patch tokens (patch_tokens_for_block_start)
-            patch_tokens_after_temporal = patch_tokens_for_block_start + res_temporal_output
-            # This 'patch_tokens_after_temporal' is (B, T*num_patches, D)
-
-            # --- Spatial Attention ---
-            # Prepare CLS token for spatial attention across frames
-            if cls_tokens_for_block_start is not None:
-                # Repeat CLS token for each frame
-                cls_token_spatial = cls_tokens_for_block_start.repeat(1, T, 1)  # (B, T, D)
-                cls_token_spatial = rearrange(cls_token_spatial, 'b t m -> (b t) m').unsqueeze(1)  # (B*T, 1, D)
+            # build a residual tensor aligned with x: zeros for CLS, temporal residual for patches
+            temp_residual_full = torch.zeros_like(x)
+            if cls_tok is not None:
+                temp_residual_full[:, 1:, :] = temp_out
             else:
-                cls_token_spatial = None
+                temp_residual_full = temp_out
 
-            # Reshape spatial patches for spatial attention: (B*T, num_patches, dim)
-            # Use patch_tokens_after_temporal here
-            xs = rearrange(patch_tokens_after_temporal, 'b (h w t) m -> (b t) (h w) m', b=B, h=H, w=W, t=T)
+            # add temporal residual (DropPath applied here, once)
+            x = x + self.drop_path(temp_residual_full)
 
-            # Concatenate CLS token if present
-            if cls_token_spatial is not None:
-                xs = torch.cat((cls_token_spatial, xs), 1)  # (B*T, 1 + num_patches, D)
+            # after temporal add, refresh tokens for spatial step
+            if self.class_tokens == 1:
+                cls_tok = x[:, :1, :]
+                patch_tok = x[:, 1:, :]
+            else:
+                patch_tok = x
+
+            # 2) SPATIAL ATTENTION on each frame (per time step)
+            # reshape patches to per-frame sequences: (B, T*H*W, D) -> (B*T, H*W, D)
+            xs = rearrange(patch_tok, 'b (h w t) d -> (b t) (h w) d', b=B, h=H, w=W, t=T)
+
+            # replicate CLS for each frame if present and prepend
+            if cls_tok is not None:
+                cls_for_frames = cls_tok.repeat(1, T, 1)  # (B, T, D)
+                cls_for_frames = rearrange(cls_for_frames, 'b t d -> (b t) 1 d')  # (B*T, 1, D)
+                xs = torch.cat([cls_for_frames, xs], dim=1)  # (B*T, 1 + H*W, D)
 
             if return_attn:
-                _, attn = self.attn(self.norm1(xs), return_attn=return_attn)
+                _, attn = self.attn(self.norm1(xs), return_attn=True)
                 return attn
+
+            # spatial attention (again, DropPath only at the add)
+            spatial_out = self.attn(self.norm1(xs))  # (B*T, 1+H*W, D) or (B*T, H*W, D)
+
+            # split CLS vs patches in spatial output
+            if cls_tok is not None:
+                cls_per_t = spatial_out[:, 0, :]  # (B*T, D)
+                cls_per_t = rearrange(cls_per_t, '(b t) d -> b t d', b=B, t=T)  # (B, T, D)
+                cls_residual = cls_per_t.mean(dim=1, keepdim=True)  # (B, 1, D) — average across time
+                spatial_patches = spatial_out[:, 1:, :]  # (B*T, H*W, D)
             else:
-                res_spatial_output = self.drop_path(self.attn(self.norm1(xs)))  # Spatial attention output
+                cls_residual = None
+                spatial_patches = spatial_out  # (B*T, H*W, D)
 
-            # Extract and process CLS token after spatial attention
-            if cls_tokens_for_block_start is not None:
-                cls_token_out = res_spatial_output[:, 0, :]  # (B*T, D)
-                cls_token_out = rearrange(cls_token_out, '(b t) m -> b t m', b=B, t=T)  # (B, T, D)
-                cls_token_out = torch.mean(cls_token_out, 1, True)  # Average across time for final CLS token (B, 1, D)
-                res_spatial_patches = res_spatial_output[:, 1:, :]  # Get only patches (B*T, num_patches, D)
+            # put patch spatial residuals back to (B, T*H*W, D)
+            spatial_patches = rearrange(spatial_patches, '(b t) (h w) d -> b (h w t) d', b=B, h=H, w=W, t=T)
+
+            # build residual tensor aligned with x: CLS in slot 0, patches in 1:
+            spatial_residual_full = torch.zeros_like(x)
+            if cls_tok is not None:
+                spatial_residual_full[:, :1, :] = cls_residual
+                spatial_residual_full[:, 1:, :] = spatial_patches
             else:
-                cls_token_out = None
-                res_spatial_patches = res_spatial_output  # All were patches (B*T, num_patches, D)
+                spatial_residual_full = spatial_patches
 
-            # Reshape spatial attention output back to original (B, T*num_patches, dim)
-            res_spatial_patches = rearrange(res_spatial_patches, '(b t) (h w) m -> b (h w t) m', b=B, h=H, w=W, t=T)
+            # add spatial residual (DropPath applied here, once)
+            x = x + self.drop_path(spatial_residual_full)
 
-            # Combine cls_tokens_out with res_spatial_patches for the block's MLP and final residual
-            # This is the output of the two attention heads (temporal + spatial)
-            if cls_tokens_for_block_start is not None:
-                # The output of attention is the original input (x) + attention residual
-                # For blocks, the overall residual connection (x + self.mlp(self.norm2(x))) is key.
-                # Here, we combine the original CLS and patch tokens with their respective attention-processed residuals.
-                attended_output = torch.cat((cls_token_out, res_spatial_patches), 1)  # (B, 1 + T*num_patches, D)
-                x = x + self.drop_path(attended_output)  # Block's first residual
-            else:
-                x = x + self.drop_path(res_spatial_patches)  # Block's first residual (no CLS)
-
-            # Apply MLP and its residual
+            # 3) MLP sublayer (standard ViT)
             x = x + self.drop_path(self.mlp(self.norm2(x)))
             return x
 
@@ -411,9 +410,10 @@ class VisionTransformer(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        norm_layer = partial(nn.LayerNorm, eps=1e-6)  # Use functools.partial for default
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.num_frames = num_frames
-        self.patch_size = patch_size
+        self.patch_size = to_2tuple(patch_size)  # ensure tuple (pH, pW)
+        self.default_cfg = default_cfgs.get('vit_base_patch16_224')
         self.attention_type = attention_type
         self.use_checkpoint = use_checkpoint
 
@@ -439,7 +439,7 @@ class VisionTransformer(nn.Module):
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
-        # Classifier head (not used in our framework, but kept for compatibility with pretrained models)
+        # Classifier head (not used in this framework, but kept for compatibility with pretrained models)
         self.head = nn.Identity()
 
         trunc_normal_(self.pos_embed, std=.02)
@@ -468,23 +468,44 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def _resize_pos_embed(self, posemb, grid_size_height, grid_size_width, num_frames,
-                          start_index=1):
-        posemb_tok = posemb[:, :start_index]
-        posemb_grid = posemb[0, start_index:]
-        old_grid_size = int(posemb_grid.size(0) ** 0.5)  # Use int() here as discussed
+    def _resize_pos_embed(self, posemb, grid_size_height, grid_size_width, num_frames, start_index=1):
+        """
+        Resize a 2D ViT positional embedding (1 + H*W, D) to our current spatial grid (H', W'),
+        then tile across time (T = num_frames). Works even if the source grid wasn't square.
+        """
+        # posemb: (1, 1 + old_tokens, D)
+        posemb_tok = posemb[:, :start_index]  # (1, 1, D) CLS
+        posemb_grid = posemb[:, start_index:]  # (1, old_H*old_W, D)
+        old_num = posemb_grid.shape[1]
 
-        posemb_grid = posemb_grid.reshape(1, old_grid_size, old_grid_size, -1).permute(0, 3, 1, 2)
-        posemb_grid = nn.functional.interpolate(
-            posemb_grid,
-            size=(grid_size_height, grid_size_width),
-            mode="bicubic",  # Or "bilinear" if that's what you prefer
-            align_corners=False
-        )
+        # Try to infer old (H, W)
+        old_h = int(round((old_num) ** 0.5))
+        old_w = old_h
+        if old_h * old_w != old_num:
+            # fallback: keep aspect similar to target if not square
+            # choose (old_h, old_w) such that old_h*old_w == old_num and |old_h/old_w - H'/W'| is small
+            target_ratio = grid_size_height / float(grid_size_width)
+            best = None
+            for h in range(1, old_num + 1):
+                if old_num % h == 0:
+                    w = old_num // h
+                    ratio = h / float(w)
+                    score = abs(ratio - target_ratio)
+                    if best is None or score < best[0]:
+                        best = (score, h, w)
+            _, old_h, old_w = best
+
+        # (1, old_H*old_W, D) -> (1, D, old_H, old_W)
+        posemb_grid = posemb_grid.reshape(1, old_h, old_w, -1).permute(0, 3, 1, 2)
+        # resize to (H', W')
+        posemb_grid = F.interpolate(posemb_grid, size=(grid_size_height, grid_size_width),
+                                    mode="bicubic", align_corners=False)
+        # (1, D, H', W') -> (1, H'*W', D)
         posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, grid_size_height * grid_size_width, -1)
-        posemb_grid_expanded_for_time = posemb_grid.repeat(1, num_frames, 1)  # This is the temporal part
-        posemb = torch.cat([posemb_tok, posemb_grid_expanded_for_time], dim=1)
-        return posemb
+        # tile across time
+        posemb_grid = posemb_grid.repeat(1, num_frames, 1)  # (1, T*H'*W', D)
+        # concat CLS back
+        return torch.cat([posemb_tok, posemb_grid], dim=1)
 
     def forward_features(self, x, get_all=False, get_attn=False):
         # x: (B, C, T, H, W)
@@ -528,50 +549,153 @@ class VisionTransformer(nn.Module):
             # If lengths match (e.g., if T=1 and spatial dimensions match original), directly add
             x = x + self.pos_embed
 
-        # Add Time Embeddings
-        # Extract CLS token again to apply time embedding only to patch tokens
-        cls_tokens_after_pos = x[:, :1, :]
-        patch_tokens_after_pos = x[:, 1:, :]  # (B, T*num_patches, embed_dim)
+        x = self.pos_drop(x)
 
-        # Reshape patch_tokens to (B, T, num_patches, embed_dim) to apply time embed
+        # --- Add Time Embeddings (with T-adaptive handling) ---
+        cls_tokens_after_pos = x[:, :1, :]
+        patch_tokens_after_pos = x[:, 1:, :]  # (B, T*num_patches, D)
+
         patch_tokens_reshaped = patch_tokens_after_pos.reshape(B, T, num_patches, self.embed_dim)
 
-        # Expand time_embed to apply to all spatial patches within each frame
-        # time_embed: (1, num_frames, embed_dim) -> (B, num_frames, 1, embed_dim)
-        temporal_embed_expanded = self.temporal_embed.unsqueeze(2).expand(-1, -1, num_patches, -1)
+        # Adapt temporal embedding to runtime T if needed
+        te = self.temporal_embed  # (1, F, D)
+        if te.shape[1] != T:
+            te = F.interpolate(te.transpose(1, 2), size=T, mode='linear', align_corners=False).transpose(1, 2)
 
-        # Add time embedding and reshape back to (B, T*num_patches, embed_dim)
+        temporal_embed_expanded = te.unsqueeze(2).expand(-1, -1, num_patches, -1)
         patch_tokens_with_time = (patch_tokens_reshaped + temporal_embed_expanded).reshape(B, T * num_patches,
-                                                                                       self.embed_dim)
+                                                                                           self.embed_dim)
         patch_tokens_with_time = self.time_drop(patch_tokens_with_time)
 
-        # Recombine CLS token with time-embedded spatial patches
         x = torch.cat((cls_tokens_after_pos, patch_tokens_with_time), dim=1)  # (B, 1 + T*num_patches, embed_dim)
 
         # Pass through Transformer Blocks
         for blk in self.blocks:
             if self.use_checkpoint:
-                # Assuming blk.forward takes (x, B, T, W) as per Block class, need to pass W from patch_embed
-                x = checkpoint.checkpoint(blk, x, B, T, self.patch_embed.num_patches_w)
+                x = checkpoint.checkpoint(lambda inp: blk(inp, B, T, self.patch_embed.num_patches_w), x)
             else:
-                x = blk(x, B, T, self.patch_embed.num_patches_w)  # Pass B, T, W to block
+                x = blk(x, B, T, self.patch_embed.num_patches_w)
 
         x = self.norm(x)
         if get_all:  # Return all tokens (CLS + patch tokens)
             return x
-        else:  # Return only CLS token (for classification, though we don't use it directly)
+        else:  # Return only CLS token (for classification, though I don't use it directly)
             return x[:, 0]
 
     def forward(self, x, use_head=False):
         x = self.forward_features(x)
-        if use_head:  # This is for default classification head, not our custom one
+        if use_head:  # This is for default classification head, not the custom one
             x = self.head(x)
         return x
 
-    def get_intermediate_layers(self, x, n=1):
-        raise NotImplementedError(
-            "Intermediate layer extraction not fully implemented for this customized VisionTransformer.")
+    def get_intermediate_layers(self, x, n=1, return_patch_tokens=False):
+        """
+        Return the last n hidden states (after norm) as a list.
+        If return_patch_tokens=False => return CLS tokens only (B, D) per layer.
+        If True => return full tokens (B, 1 + T*H*W, D) per layer.
+        """
+        self.eval()  # typical behavior; you can remove if you prefer training-mode extraction
+        B, C, T, H, W = x.shape
+
+        # --- same pre-processing as forward_features ---
+        x = self.patch_embed(x)  # (B, T, N, D)
+        num_patches = x.shape[2]
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+        x = x.reshape(B, T * num_patches, self.embed_dim)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1 + T*N, D)
+
+        original_pos_embed_length = self.pos_embed.size(1)
+        current_full_sequence_length = x.size(1)
+        if current_full_sequence_length != original_pos_embed_length:
+            new_pos_embed = self._resize_pos_embed(
+                self.pos_embed,
+                self.patch_embed.num_patches_h,
+                self.patch_embed.num_patches_w,
+                T
+            )
+            x = x + new_pos_embed
+        else:
+            x = x + self.pos_embed
+
+        x = self.pos_drop(x)
+
+        # time embedding (T-adaptive)
+        cls_tokens_after_pos = x[:, :1, :]
+        patch_tokens_after_pos = x[:, 1:, :]  # (B, T*N, D)
+        patch_tokens_reshaped = patch_tokens_after_pos.reshape(B, T, num_patches, self.embed_dim)
+        te = self.temporal_embed
+        if te.shape[1] != T:
+            te = F.interpolate(te.transpose(1, 2), size=T, mode='linear', align_corners=False).transpose(1, 2)
+        temporal_embed_expanded = te.unsqueeze(2).expand(-1, -1, num_patches, -1)
+        patch_tokens_with_time = (patch_tokens_reshaped + temporal_embed_expanded).reshape(B, T * num_patches,
+                                                                                           self.embed_dim)
+        patch_tokens_with_time = self.time_drop(patch_tokens_with_time)
+        x = torch.cat((cls_tokens_after_pos, patch_tokens_with_time), dim=1)
+
+        # --- transformer blocks, collect last n ---
+        collected = []
+        last_k = max(1, int(n))
+        for i, blk in enumerate(self.blocks):
+            x = blk(x, B, T, self.patch_embed.num_patches_w)
+            # collect if in last n
+            if i >= len(self.blocks) - last_k:
+                xs = self.norm(x)
+                if not return_patch_tokens:
+                    xs = xs[:, 0]  # CLS only (B, D)
+                collected.append(xs)
+        return collected
 
     def get_last_selfattention(self, x):
-        raise NotImplementedError(
-            "Attention map extraction not fully implemented for this customized VisionTransformer.")
+        """
+        Returns the spatial self-attention maps from the LAST block.
+        Shape: (B, T, num_heads, L, L), where L = 1 + H*W if CLS is present, else H*W.
+        """
+        self.eval()
+        B, C, T, H, W = x.shape
+
+        # --- same pre-processing as forward_features up to the blocks ---
+        x = self.patch_embed(x)  # (B, T, N, D)
+        num_patches = x.shape[2]
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+        x = x.reshape(B, T * num_patches, self.embed_dim)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1 + T*N, D)
+
+        original_pos_embed_length = self.pos_embed.size(1)
+        current_full_sequence_length = x.size(1)
+        if current_full_sequence_length != original_pos_embed_length:
+            new_pos_embed = self._resize_pos_embed(
+                self.pos_embed,
+                self.patch_embed.num_patches_h,
+                self.patch_embed.num_patches_w,
+                T
+            )
+            x = x + new_pos_embed
+        else:
+            x = x + self.pos_embed
+
+        x = self.pos_drop(x)
+
+        # time embedding (T-adaptive)
+        cls_tokens_after_pos = x[:, :1, :]
+        patch_tokens_after_pos = x[:, 1:, :]
+        patch_tokens_reshaped = patch_tokens_after_pos.reshape(B, T, num_patches, self.embed_dim)
+        te = self.temporal_embed
+        if te.shape[1] != T:
+            te = F.interpolate(te.transpose(1, 2), size=T, mode='linear', align_corners=False).transpose(1, 2)
+        temporal_embed_expanded = te.unsqueeze(2).expand(-1, -1, num_patches, -1)
+        patch_tokens_with_time = (patch_tokens_reshaped + temporal_embed_expanded).reshape(B, T * num_patches,
+                                                                                           self.embed_dim)
+        patch_tokens_with_time = self.time_drop(patch_tokens_with_time)
+        x = torch.cat((cls_tokens_after_pos, patch_tokens_with_time), dim=1)
+
+        # --- run all blocks except the last normally ---
+        for blk in self.blocks[:-1]:
+            x = blk(x, B, T, self.patch_embed.num_patches_w)
+
+        # --- last block: return attention instead of tokens ---
+        attn = self.blocks[-1](x, B, T, self.patch_embed.num_patches_w, return_attn=True)
+        # attn shape from Attention: ((B*T), heads, L, L) where L = 1 + H*W
+        num_heads = attn.shape[1]
+        L = attn.shape[-1]
+        attn = attn.reshape(B, T, num_heads, L, L)
+        return attn
