@@ -147,5 +147,38 @@ python inference.py \
 This repository includes the necessary code and instructions to benchmark our framework against three key families of models:
 
 General Vision-Language Models: For open-set, text-driven evaluation.
+
+CLIP: Zero-shot and linear-probe per-frame relevance scoring.
+
+X-CLIP: A powerful video-language model for scoring short clips.
+
+Temporal Grounding Models: For the direct task of localizing events from text.
+
+Moment-DETR: Predicts start/end boundaries from a language query.
+
+Surgical Specialist Models: Closed-set baselines trained specifically for Cholec80.
+
+TeCNO: A temporal convolutional network for surgical phase recognition.
+
+The code for these baselines can be found in the comparison_models/ directory. Each subfolder contains a README with specific instructions for running that model.
+
+### 📚 Citation
+If you use this framework or ideas from our work in your research, please cite the following dissertation:
+
+Code snippet
+```bash
+@mastersthesis{jafarifard2025,
+  title={An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos},
+  author={Soheil Jafarifard Bidgoli},
+  school={Aston University},
+  year={2025}
+}
+```
+### 🤝 Acknowledgements
+This work was completed as part of the CS4700 Dissertation for the MSc in Computer Science at Aston University.
+
+Supervisor: Dr. Zhuangzhuang Dai.
+
+This project builds upon the foundational work of the Cholec80 dataset creators and the authors of M²CRL, VideoMamba, CLIP, Moment-DETR, and other referenced works.
     
        
