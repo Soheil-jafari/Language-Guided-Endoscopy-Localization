@@ -1,7 +1,8 @@
 """
-Moment-DETR Baseline: Step 3 - Training (with debug-overfit mode)
+Moment-DETR Baseline: Step 3 - Training (with proper metric saving)
 """
 import os
+import json
 import argparse
 import datetime
 import torch
@@ -32,7 +33,6 @@ def build_argparser():
                         help="Epochs to run during overfit debug.")
     parser.add_argument("--debug_lr", type=float, default=1e-3,
                         help="LR during overfit debug.")
-
     return parser
 
 
@@ -54,51 +54,50 @@ def main(args):
     checkpoint_dir = os.path.join(args.ckpt_dir, run_name)
     if args.local_rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
-    logger = get_logger(os.path.join(checkpoint_dir, "train.log")) if args.local_rank == 0 else None
 
+    # Logger
+    logger = get_logger(os.path.join(checkpoint_dir, "train.log")) if args.local_rank == 0 else None
     if args.local_rank == 0 and logger is not None:
         logger.info(f"Saving checkpoints to: {checkpoint_dir}")
         logger.info(f"Config: {vars(cfg)}")
+        # Also dump config to JSON for record
+        with open(os.path.join(checkpoint_dir, "config_dump.json"), "w") as f:
+            json.dump(vars(cfg), f, indent=2)
 
     # ----- model -----
     model = MomentDETR(cfg).to(device)
     if args.dist:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
 
-    # Param groups (respect backbone LR if your model supports it)
+    # Optimizer + LR
     params = [p for p in model.parameters() if p.requires_grad]
     assert len(params) > 0, "No trainable parameters found!"
     base_lr = getattr(cfg, "lr", 1e-4)
     lr_use = (args.debug_lr if args.debug_overfit else base_lr)
-    optimizer = torch.optim.AdamW(params, lr=lr_use)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, cfg.lr_drop)
+    optimizer = torch.optim.AdamW(params, lr=lr_use, weight_decay=getattr(cfg, "weight_decay", 1e-4))
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, getattr(cfg, "lr_drop", 40))
 
     # ----- datasets -----
     train_dataset = MomentDETRDataset(cfg, 'train')
     val_dataset = MomentDETRDataset(cfg, 'val')
 
-    # Optional: overfit on K samples, repeat them to create many steps
+    # Optional: overfit on K items
     if args.debug_overfit:
         from torch.utils.data import Subset, Dataset
-
         idxs = list(range(min(args.debug_k, len(train_dataset))))
         train_dataset = Subset(train_dataset, idxs)
 
         class _RepeatDS(Dataset):
-            def __init__(self, base, times=128):
-                self.base, self.times = base, times
-            def __len__(self):
-                return len(self.base) * self.times
-            def __getitem__(self, i):
-                return self.base[i % len(self.base)]
-
+            def __init__(self, base, times=128): self.base, self.times = base, times
+            def __len__(self): return len(self.base) * self.times
+            def __getitem__(self, i): return self.base[i % len(self.base)]
         train_dataset = _RepeatDS(train_dataset, times=128)
 
     # Samplers
     train_sampler = DistributedSampler(train_dataset) if (args.dist and not args.debug_overfit) else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if args.dist else None
 
-    # ----- loaders (IMPORTANT: use collate_fn for both) -----
+    # ----- loaders (use collate_fn for both) -----
     if args.debug_overfit:
         train_loader = DataLoader(
             train_dataset, batch_size=1, shuffle=True,
@@ -106,8 +105,9 @@ def main(args):
         )
     else:
         train_loader = DataLoader(
-            train_dataset, batch_size=getattr(cfg, "batch_size", 32), shuffle=(train_sampler is None),
-            num_workers=args.num_workers, pin_memory=True, drop_last=False, sampler=train_sampler,
+            train_dataset, batch_size=getattr(cfg, "batch_size", 32),
+            shuffle=(train_sampler is None), num_workers=args.num_workers,
+            pin_memory=True, drop_last=False, sampler=train_sampler,
             collate_fn=collate_fn
         )
 
@@ -117,12 +117,13 @@ def main(args):
         collate_fn=collate_fn
     )
 
-    # ----- Optional: single-batch sanity overfit (fast) -----
+    # Optional single-batch sanity (only when debug_overfit true)
     one_batch_sanity = args.debug_overfit and (not args.dist)
     if one_batch_sanity:
-        print("\n" + "=" * 40)
-        print("!!! RUNNING OVERFITTING SANITY CHECK (single GPU, one batch) !!!")
-        print("=" * 40 + "\n")
+        if args.local_rank == 0:
+            print("\n" + "=" * 40)
+            print("!!! RUNNING OVERFITTING SANITY CHECK (single GPU, one batch) !!!")
+            print("=" * 40 + "\n")
         single_batch = next(iter(train_loader))
         train_loader = [single_batch]
         val_loader = [single_batch]
@@ -130,12 +131,16 @@ def main(args):
     if args.local_rank == 0 and logger is not None:
         logger.info("Start training")
 
+    # Track best by R1@0.5 (fall back if missing)
+    def _score(d): return d.get('R1@0.5', d.get('mAP@0.5', -1))
+
     best_metric = -1.0
+    best_epoch = -1
+
     for epoch in tqdm(range(cfg.epochs), desc="Training Epochs"):
         if args.dist and (train_sampler is not None):
             train_sampler.set_epoch(epoch)
 
-        # NOTE: train_one_epoch / evaluate come from the repo and include the criterion internally.
         train_one_epoch(model, train_loader, optimizer, device, epoch, cfg.clip_max_norm, logger, args.local_rank)
         lr_scheduler.step()
 
@@ -159,23 +164,24 @@ def main(args):
                 eval_stats = evaluate(model, val_loader, device)
                 if logger is not None:
                     logger.info(f"Validation - Epoch {epoch}: {eval_stats}")
-                current_metric = eval_stats.get('R1@0.5', -1)
 
-                import json
+                # Save per-epoch metrics JSON
                 with open(os.path.join(checkpoint_dir, f"metrics_epoch_{epoch}.json"), "w") as f:
                     json.dump({"epoch": epoch, **eval_stats}, f, indent=2)
 
-                # Save best metrics when we get a new best
+                # Update "best"
+                current_metric = _score(eval_stats)
                 if current_metric > best_metric:
                     best_metric = current_metric
+                    best_epoch = epoch
+                    # Save best weights (model only)
                     torch.save({'model': state_dict}, os.path.join(checkpoint_dir, "best_checkpoint.ckpt"))
+                    # Save best metrics JSON
                     with open(os.path.join(checkpoint_dir, "best_metrics.json"), "w") as f:
                         json.dump({"epoch": epoch, **eval_stats}, f, indent=2)
-                        current_metric = eval_stats.get('R1@0.5', -1)
-
 
     if args.local_rank == 0 and logger is not None:
-        logger.info("Training finished.")
+        logger.info(f"Training finished. Best epoch: {best_epoch}, best metric: {best_metric:.4f}")
 
 
 if __name__ == '__main__':
