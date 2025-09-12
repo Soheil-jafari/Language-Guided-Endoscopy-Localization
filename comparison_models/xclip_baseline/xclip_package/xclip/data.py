@@ -1,5 +1,3 @@
-# Save this file as: xclip/data.py
-
 import pandas as pd
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
@@ -8,8 +6,11 @@ from PIL import Image
 import re
 import torch
 from torch.utils.data import Dataset
+import random
+from typing import List
 
-# --- Existing Helper Functions (No changes needed here) ---
+
+# --- Existing Helper Functions  ---
 
 @dataclass
 class Triplet:
@@ -107,13 +108,13 @@ def load_annotations_from_frame_list(csv_path: str, default_fps: int):
 
     return items, {}
 
-# --- NEW DATASET CLASS FOR PARALLEL LOADING ---
 
 class VideoWindowDataset(Dataset):
     """
     A PyTorch Dataset that represents all possible sliding windows from all videos.
     This allows a DataLoader to fetch windows in parallel, which is much faster.
     """
+
     def __init__(self, items, config, args, processor):
         self.items = items
         self.config = config
@@ -122,8 +123,6 @@ class VideoWindowDataset(Dataset):
         self.windows = []
 
         print("[INFO] Pre-calculating all windows for the dataset...")
-        # Flatten all possible windows from all videos into a single list
-        # This makes indexing (`__getitem__`) straightforward.
         for (video, query), bundle in self.items.items():
             frame_paths = get_frame_paths(config.EXTRACTED_FRAMES_DIR, video, args.frame_glob)
             if not frame_paths:
@@ -131,12 +130,12 @@ class VideoWindowDataset(Dataset):
 
             n_frames = len(frame_paths)
             num_frames_in_window = self.args.num_frames
-            
+
             if n_frames >= num_frames_in_window:
                 window_starts = list(range(0, n_frames - num_frames_in_window + 1, self.args.stride))
             else:
-                window_starts = [0] # Handle very short videos
-            
+                window_starts = [0]
+
             if self.args.max_windows_per_video is not None:
                 window_starts = window_starts[:self.args.max_windows_per_video]
 
@@ -149,48 +148,113 @@ class VideoWindowDataset(Dataset):
                 })
 
     def __len__(self):
-        """Returns the total number of windows across all videos."""
         return len(self.windows)
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], str, str, int]:
-        """
-
-        Fetches a single window, loads its frames, and prepares it for the model.
-        This is where the actual data loading happens, and it will be called in parallel
-        by the DataLoader's workers.
-        """
         window_info = self.windows[idx]
         num_frames_in_window = self.args.num_frames
-        
+
         start = window_info["start_frame"]
         end = start + num_frames_in_window
-        
-        # Load ONLY the frames needed for this specific window
+
         clip_paths = window_info["frame_paths"][start:end]
+
         try:
-            clip_images = [Image.open(p).convert("RGB") for p in clip_paths]
+            # Hardcode the standard target size for CLIP-based models
+            target_size = (224, 224)
+
+            clip_images = []
+            for path in clip_paths:
+                img = Image.open(path).convert("RGB")
+                img = img.resize(target_size)  # Enforce the resize
+                clip_images.append(img)
+
         except Exception as e:
+            # This will now only catch actual file loading errors
             print(f"[ERROR] Failed to load image for window {idx}: {e}")
-            # Return a dummy clip if an image is corrupted
-            dummy_image = Image.new('RGB', (224, 224), color = 'red')
+            dummy_image = Image.new('RGB', (224, 224), color='red')
             clip_images = [dummy_image] * num_frames_in_window
 
-        # Handle cases where the clip is too short (last window) by padding
         if len(clip_images) < num_frames_in_window:
             last_frame = clip_images[-1] if clip_images else Image.new('RGB', (224, 224))
             padding = [last_frame] * (num_frames_in_window - len(clip_images))
             clip_images.extend(padding)
 
-        # The HuggingFace processor handles tensor conversion and normalization
-        inputs = self.processor(
-            videos=[clip_images], 
-            text=[window_info["query"]], 
+        proc_out = self.processor(
+            videos=[clip_images],
+            text=[window_info["query"]],
             return_tensors="pt",
             padding=True,
         )
-        
-        # Squeeze to remove the batch dimension of 1 that the processor adds
-        inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-        
-        # Return identifiers so we can reconstruct the results later
+
+        # ensure batch dim removed AND storage is fresh & contiguous
+        inputs = {}
+        for k, v in proc_out.items():
+            if isinstance(v, torch.Tensor):
+                # batch=1 -> remove leading dim safely
+                if v.dim() > 0 and v.size(0) == 1:
+                    v = v.squeeze(0)
+                v = v.contiguous().clone()
+            inputs[k] = v
+
         return inputs, window_info['video'], window_info['query'], window_info['start_frame']
+
+def sample_positive_window(triplet, num_frames: int, stride: int) -> Tuple[int, List[int]]:
+    """
+    Randomly samples a window of frames from within a ground truth segment.
+
+    Args:
+        triplet (Triplet): The ground truth annotation with start and end frames.
+        num_frames (int): The number of frames in the window.
+        stride (int): The gap between sampled frames.
+
+    Returns:
+        A tuple containing the start frame index and a list of all frame indices in the window.
+    """
+    window_span = (num_frames - 1) * stride + 1
+
+    # Calculate the valid range for the start of the window
+    max_start_frame = triplet.end_frame - window_span
+
+    # Ensure the start frame is not before the triplet's start
+    min_start_frame = triplet.start_frame
+
+    if max_start_frame >= min_start_frame:
+        start_idx = random.randint(min_start_frame, max_start_frame)
+    else:
+        # If the segment is too short for a full window, just start at the beginning
+        start_idx = min_start_frame
+
+    indices = [start_idx + i * stride for i in range(num_frames)]
+    return start_idx, indices
+
+
+def load_frames_by_indices(frame_paths: List[str], indices: List[int]) -> List[Image.Image]:
+    """
+    Loads a list of video frames from disk given their paths and specific indices.
+
+    Args:
+        frame_paths (List[str]): A sorted list of all frame paths for a video.
+        indices (List[int]): The specific frame indices to load.
+
+    Returns:
+        A list of loaded PIL Image objects.
+    """
+    frames = []
+    max_idx = len(frame_paths) - 1
+    for i in indices:
+        # Clamp index to be within the valid range of available frames
+        safe_idx = min(max(0, i), max_idx)
+        try:
+            # Open the image and ensure it's in RGB format
+            img = Image.open(frame_paths[safe_idx]).convert("RGB")
+            frames.append(img)
+        except Exception as e:
+            print(f"Warning: Could not load frame at {frame_paths[safe_idx]}. Error: {e}")
+            # If a frame is corrupted, you might append a blank image or the previous frame
+            if frames:
+                frames.append(frames[-1])
+            else:  # If it's the first frame that fails, add a dummy black frame
+                frames.append(Image.new("RGB", (224, 224)))
+
+    return frames

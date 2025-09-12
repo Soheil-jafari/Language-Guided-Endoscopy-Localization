@@ -1,6 +1,3 @@
-"""
-Moment-DETR Baseline: Step 3 - Training (with proper metric saving)
-"""
 import os
 import json
 import argparse

@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
+from torchvision.transforms.functional import normalize
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score, average_precision_score
 
@@ -240,45 +241,68 @@ class MasterLoss(nn.Module):
                 self.optical_flow_model = nn.DataParallel(self.optical_flow_model)
 
             self.optical_flow_model.eval()
+            for p in self.optical_flow_model.parameters():
+                p.requires_grad_(False)
 
     def _get_bilevel_consistency_loss(self, semantic_features, spatial_features, video_clip):
-        """Calculates the add-on bi-level consistency regularizer."""
-        loss_semantic = torch.tensor(0.0, device=video_clip.device)
-        if self.config.TRAIN.SEMANTIC_LOSS_WEIGHT > 0 and semantic_features is not None and semantic_features.shape[
-            1] > 1:
+        """
+        Bi-level consistency = temporal smoothness on semantic features
+                               + optical-flow-based consistency on spatial features.
+        video_clip: (B, C, T, H, W)  -- ImageNet-normalized already
+        semantic_features: (B, T, D_sem) or (B, T, C, H, W) depending on your head
+        spatial_features:  (B, T, C', H', W')  -- features you warp to t+1
+        """
+        device = video_clip.device
+
+        # -------------------- 1) Semantic temporal smoothness --------------------
+        loss_semantic = torch.tensor(0.0, device=device)
+        if (self.config.TRAIN.SEMANTIC_LOSS_WEIGHT > 0 and
+                semantic_features is not None and
+                semantic_features.shape[1] > 1):
+            # L1 between consecutive timesteps (t vs t+1)
+            # Works for (B,T,...) with any trailing dims
             loss_semantic = self.l1_loss(semantic_features[:, 1:], semantic_features[:, :-1])
 
-        loss_flow = torch.tensor(0.0, device=video_clip.device)
-        if self.config.TRAIN.OPTICAL_FLOW_LOSS_WEIGHT > 0 and spatial_features is not None and video_clip.shape[2] > 1:
-            with torch.no_grad(), autocast(enabled=False):
-                video_clip_fp32 = video_clip.float()
-                B, C, T, H, W = video_clip_fp32.shape
+        # -------------------- 2) Optical-flow consistency (RAFT) --------------------
+        loss_flow = torch.tensor(0.0, device=device)
+        if (self.config.TRAIN.OPTICAL_FLOW_LOSS_WEIGHT > 0 and
+                spatial_features is not None and
+                video_clip.shape[2] > 1):
+            B, C, T, H, W = video_clip.shape
 
-                # Downsample to 50% resolution before flow computation
-                video_permuted = video_clip_fp32.permute(0, 2, 1, 3, 4)  # (B, T, C, H, W)
-                video_t = video_permuted[:, :-1].reshape(-1, C, H, W)  # (B*(T-1), C, H, W)
-                video_t_plus_1 = video_permuted[:, 1:].reshape(-1, C, H, W)
+            # (a) Denormalize from ImageNet back to [0,1]
+            imgnet_mean = torch.tensor([0.485, 0.456, 0.406], device=device)[None, :, None, None, None]
+            imgnet_std = torch.tensor([0.229, 0.224, 0.225], device=device)[None, :, None, None, None]
+            video_01 = (video_clip * imgnet_std + imgnet_mean).clamp(0.0, 1.0).float()  # (B,C,T,H,W)
 
-                # The RAFT model's internal pyramid downsamples by 8. To get a feature map of at least 16x16,
-                # the input image must be at least 128x128 (128 / 8 = 16).
+            # (b) Build adjacent pairs as (B*(T-1), C, H, W)
+            video_btchw = video_01.permute(0, 2, 1, 3, 4)  # (B,T,C,H,W)
+            vid_t = video_btchw[:, :-1].reshape(-1, C, H, W).contiguous()
+            vid_t1 = video_btchw[:, 1:].reshape(-1, C, H, W).contiguous()
 
-                target_raft_size = (128, 128)
+            # (c) Downscale once to a RAFT-safe size (divisible by 8)
+            target_raft_size = (128, 128)
+            vid_t_small = F.interpolate(vid_t, size=target_raft_size, mode='bilinear', align_corners=False)
+            vid_t1_small = F.interpolate(vid_t1, size=target_raft_size, mode='bilinear', align_corners=False)
 
-                # Downsample frames to the required minimum size for RAFT
-                video_t_small = F.interpolate(video_t, size=target_raft_size, mode='bilinear', align_corners=False)
-                video_t_plus_1_small = F.interpolate(video_t_plus_1, size=target_raft_size, mode='bilinear',
-                                                     align_corners=False)
-                video_t_norm = normalize(video_t_small, mean=[0.5] * 3, std=[0.5] * 3)
-                video_t_plus_1_norm = normalize(video_t_plus_1_small, mean=[0.5] * 3, std=[0.5] * 3)
+            # (d) RAFT normalization to [-1,1]
+            vid_t_small = normalize(vid_t_small, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            vid_t1_small = normalize(vid_t1_small, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
-                # Compute flow on downsampled frames
-                flow_small = self.optical_flow_model(video_t_norm, video_t_plus_1_norm)[-1]
+            # (e) Call RAFT with no grads + AMP
+            with torch.no_grad():
+                with autocast(True):
+                    # torchvision RAFT returns a list of flows; last is the finest
+                    flow_small = self.optical_flow_model(vid_t_small, vid_t1_small)[-1]
 
-                # Upscale flow to original feature resolution
-                flow = flow_small
+            flow_small = flow_small.float()  # (B*(T-1), 2, h, w)
+            src_flow_size = flow_small.shape[-2:]  # (h, w) used for warping
 
-            warped_spatial = self.warp_features(spatial_features, flow, src_flow_size=target_raft_size)
-            actual_next = spatial_features[:, 1:]
+            # (f) Warp features from t -> t+1 using the computed flow
+            warped_spatial = self.warp_features(spatial_features, flow_small, src_flow_size=src_flow_size)
+            actual_next = spatial_features[:, 1:]  # ground-truth features at t+1
+
+            # (g) L1 consistency
             loss_flow = self.l1_loss(warped_spatial, actual_next)
 
         return (self.config.TRAIN.SEMANTIC_LOSS_WEIGHT * loss_semantic +
@@ -436,69 +460,118 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device):
 
 
 @torch.no_grad()
-def validate_one_epoch(model, dataloader, criterion, device):
+def validate_one_epoch(model, dataloader, criterion, device,
+                       ignore_index=-100, use_uncertainty=None, center_only=False):
+    """
+    - Handles USE_UNCERTAINTY correctly (no double sigmoid).
+    - Ignores padded/invalid frames via ignore_index.
+    - Sweeps probability thresholds (not logits) to get best F1.
+    - Optionally evaluates center frame only (center_only=True).
+    """
     model.eval()
     running_loss = 0.0
-    all_logits_flat = []
-    all_labels_flat = []
+
+    # Infer USE_UNCERTAINTY from model.config if not given
+    if use_uncertainty is None:
+        try:
+            use_uncertainty = bool(getattr(getattr(model, "module", model).config.MODEL, "USE_UNCERTAINTY", False))
+        except Exception:
+            use_uncertainty = False
+
+    all_probs = []
+    all_labels = []
 
     for batch in dataloader:
-        video_clip = batch['video_clip'].to(device, non_blocking=True)   # (B,C,T,H,W)
-        input_ids  = batch['input_ids'].to(device, non_blocking=True)
-        attn_mask  = batch['attention_mask'].to(device, non_blocking=True)
-        labels     = batch['labels'].to(device, non_blocking=True)       # (B,T) or (B,T,1)
+        video_clip = batch["video_clip"].to(device, non_blocking=True)      # (B,C,T,H,W)
+        input_ids  = batch["input_ids"].to(device, non_blocking=True)
+        attn_mask  = batch["attention_mask"].to(device, non_blocking=True)
+        labels     = batch["labels"].to(device, non_blocking=True)          # (B,T) or (B,T,1)
 
         outputs = model(video_clip, input_ids, attn_mask)
-
-        # ---- match training objective ----
         total_val_loss, _, _ = criterion(outputs, video_clip, labels)
         running_loss += float(total_val_loss.item())
 
-        # ---- metrics on the refined predictions (primary output) ----
-        refined_scores = outputs[0]   # shape (B,T) or (B,T,1)
-        if refined_scores.dim() == 3 and refined_scores.size(-1) == 1:
-            refined_scores = refined_scores.squeeze(-1)
+        refined = outputs[0]                                                # (B,T) or (B,T,1)
+        if refined.dim() == 3 and refined.size(-1) == 1:
+            refined = refined.squeeze(-1)                                   # (B,T)
 
-        # ensure labels shape matches
+        # labels (B,T)
         if labels.dim() == 3 and labels.size(-1) == 1:
             labels_eval = labels.squeeze(-1)
         else:
             labels_eval = labels
 
-        # collect center-frame logits & labels
-        all_logits_flat.extend(refined_scores.detach().cpu().view(-1).numpy().tolist())
-        all_labels_flat.extend(labels.detach().cpu().view(-1).numpy().tolist())
+        # Convert model output to probabilities correctly
+        if use_uncertainty:
+            # already in [0,1]
+            probs_bt = refined.clamp(0, 1)
+        else:
+            probs_bt = torch.sigmoid(refined)
 
-    from sklearn.metrics import roc_auc_score, average_precision_score
+        # (optional) center frame only evaluation (common if loss trains on center frame)
+        if center_only:
+            T = probs_bt.size(1)
+            c = T // 2
+            probs_bt = probs_bt[:, c:c+1]          # (B,1)
+            labels_eval = labels_eval[:, c:c+1]
 
-    y_true = np.array(all_labels_flat, dtype=int)
-    z = np.array(all_logits_flat, dtype=float)
-    probs  = 1.0 / (1.0 + np.exp(-z))                    # sigmoid
+        # mask out invalid frames (padding etc.)
+        valid_mask = (labels_eval != ignore_index)
+        if valid_mask.sum().item() == 0:
+            continue
 
-    # AUROC / AUPRC
+        all_probs.append(probs_bt[valid_mask].detach().cpu().float())
+        all_labels.append(labels_eval[valid_mask].detach().cpu().int())
+
+    if len(all_probs) == 0:
+        print("[VAL] No valid frames found (check ignore_index / labels).")
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+
+    y_prob = torch.cat(all_probs, dim=0).numpy()     # (N,)
+    y_true = torch.cat(all_labels, dim=0).numpy()    # (N,)
+    # Safety: clamp labels to {0,1}
+    y_true = (y_true > 0).astype(np.int32)
+
+    # --- AUROC / AUPRC ---
     try:
-        auroc = roc_auc_score(y_true, probs)
-    except ValueError:
-        auroc = float('nan')
-    try:
-        auprc = average_precision_score(y_true, probs)
-    except ValueError:
-        auprc = float('nan')
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        # roc_auc needs both classes present
+        auroc = roc_auc_score(y_true, y_prob) if (y_true.min() != y_true.max()) else float("nan")
+        auprc = average_precision_score(y_true, y_prob)
+    except Exception:
+        auroc, auprc = float("nan"), float("nan")
 
-    # plain accuracy at fixed threshold 0.5
-    preds_05   = (probs >= 0.5).astype(int)
-    val_acc_05 = (preds_05 == y_true).mean()
+    # --- Accuracy at 0.5 ---
+    preds_05   = (y_prob >= 0.5).astype(np.int32)
+    val_acc_05 = float((preds_05 == y_true).mean())
 
-    # best-F1 threshold sweep (reuse the helper)
-    thr, best_f1 = best_f1_threshold_from_logits(z, y_true)
-    acc_at_thr   = ((probs >= thr) == y_true).mean()
+    # --- Best F1 over probability thresholds (not logits) ---
+    thr_grid = np.linspace(0.05, 0.95, 19, dtype=np.float32)
+    best_f1, best_thr = -1.0, None
+    best_prec, best_rec, acc_at_thr = 0.0, 0.0, 0.0
+
+    for thr in thr_grid:
+        pred = (y_prob >= thr).astype(np.int32)
+        tp = int(((y_true == 1) & (pred == 1)).sum())
+        fp = int(((y_true == 0) & (pred == 1)).sum())
+        fn = int(((y_true == 1) & (pred == 0)).sum())
+        tn = int(((y_true == 0) & (pred == 0)).sum())
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1   = 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0.0
+        acc  = (tp + tn) / max(len(y_true), 1)
+        if (f1 > best_f1) or (f1 == best_f1 and rec > best_rec):
+            best_f1, best_thr = f1, float(thr)
+            best_prec, best_rec, acc_at_thr = prec, rec, acc
 
     avg_loss = running_loss / max(len(dataloader), 1)
+    pos = int((y_true == 1).sum()); neg = int((y_true == 0).sum())
     print(f"[VAL] loss={avg_loss:.4f}  AUROC={auroc:.3f}  AUPRC={auprc:.3f}  "
-          f"acc@0.50={val_acc_05:.3f}  bestF1={best_f1:.3f}  thr*={thr:.2f}  acc@thr*={acc_at_thr:.3f}")
+          f"acc@0.50={val_acc_05:.3f}  bestF1={best_f1:.3f}  thr*={best_thr:.2f}  "
+          f"acc@thr*={acc_at_thr:.3f}  (pos={pos}, neg={neg}, N={len(y_true)})")
 
-    # keep the same return signature you had
-    return avg_loss, auroc, auprc, val_acc_05, best_f1, thr, acc_at_thr
+    # Keep your original return signature:
+    return avg_loss, auroc, auprc, val_acc_05, best_f1, best_thr, acc_at_thr
 
 
 

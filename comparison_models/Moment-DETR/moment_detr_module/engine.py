@@ -98,7 +98,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, max_norm, logger, r
         loss_meter.update(loss.item())
         progress_bar.set_description(f"Epoch {epoch} | Loss: {loss_meter.avg:.4f}")
 
-        # ---- one-time debug on the first step of each epoch (rank 0 only)
+        # ---- one-time debug on the first step of each epoch
         if i == 0 and rank == 0:
             ld = {k: float(v.detach().cpu()) for k, v in out['loss_dict'].items()}
             print(f"\n[DEBUG] epoch {epoch} loss_dict:", ld)
@@ -114,9 +114,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, max_norm, logger, r
                   "num_tokens=", int(data['video_feats'].shape[1]))
 
 
-# --------------------------
 # EVAL
-# --------------------------
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()

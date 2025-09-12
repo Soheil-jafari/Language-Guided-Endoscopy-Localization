@@ -84,7 +84,7 @@ class Config:
                 # Inference Settings
                 self.SEGMENT_THRESHOLD = 0.5  # higher = fewer/cleaner segments, lower = more/longer segments
                 self.MIN_SEGMENT_DURATION = 0.4  # drop very short bursts
-                self.MERGE_GAP = 0.2  # merge close segments
+                self.MERGE_GAP = None  # merge close segments
                 self.INFER_IMG_SIZE = 224
 
                 self.LABEL_TO_TEXT_QUERY = {
@@ -126,7 +126,7 @@ class Config:
                     self.NUM_FRAMES = 16
                     self.FRAME_RATE = 30
                     self.CLIP_LENGTH = 16
-                    self.NUM_INFERENCE_FRAMES = 50
+                    self.NUM_INFERENCE_FRAMES = 200
 
                     self.MAX_TEXT_LENGTH = 77
                     self.NUM_WORKERS = 4

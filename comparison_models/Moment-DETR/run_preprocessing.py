@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
 
-# --- Configuration (Paths from your project_config.py) ---
+# --- Configuration ---
 class ServerConfig:
     UNIFIED_MEDICAL_VIDEOS_DIR = "/home/240331715/data/unified_medical_videos"
     TRAIN_CSV = f"{UNIFIED_MEDICAL_VIDEOS_DIR}/final_triplets/cholec80_train_triplets.csv"
@@ -30,7 +30,7 @@ cfg = ServerConfig()
 OUTPUT_DIR = Path("./preprocessed_data")
 SPLIT_MAPPING = {"train": cfg.TRAIN_CSV, "val": cfg.VAL_CSV, "test": cfg.TEST_CSV}
 
-# --- Segmentation knobs (tune as needed) ---
+# --- Segmentation knobs ---
 MERGE_GAP_FRAMES   = 15   # merge gaps <= 15 frames (~0.5s at 30 fps)
 MIN_SEG_LEN_FRAMES = 30   # drop segments shorter than 30 frames (~1.0s at 30 fps)
 

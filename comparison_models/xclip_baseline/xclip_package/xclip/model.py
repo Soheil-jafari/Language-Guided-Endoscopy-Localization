@@ -18,4 +18,8 @@ class XCLIPWrapper(nn.Module):
         Instead of returning the whole output object, we explicitly return
         only the logits tensor that we need for the calculation.
         """
-        return self.model(**inputs).logits_per_video # <-- THE ONLY CHANGE IS HERE
+
+        outputs = self.model(**inputs)
+        # Select the first token's output, which represents the whole sentence
+        text_embeds_pooled = outputs.text_embeds[:, 0]
+        return outputs.video_embeds, text_embeds_pooled
