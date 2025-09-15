@@ -13,16 +13,20 @@ from project_config import config
 
 # --- KEYWORD MAPPING ---
 PHASE_KEYWORDS = {
+    "calot triangle dissection": 3,
+    "dissection": 3,
     "preparation": 0, "calot": 1, "clipping": 2, "cutting": 2,
-    "dissection": 3, "packaging": 4, "cleaning": 5, "coagulation": 5,
+    "packaging": 4, "cleaning": 5, "coagulation": 5,
     "retraction": 6
 }
+
 TOOL_KEYWORDS = {
     "grasper": 0, "bipolar": 1, "hook": 2, "scissors": 3,
     "clip": 4, "clipper": 4, "irrigator": 5, "suction": 5,
     "specimen": 6, "bag": 6
 }
 
+NUM_TOOL_CLASSES = max(TOOL_KEYWORDS.values()) + 1
 
 # --- CONCEPT PARSING FUNCTION ---
 def parse_query_kind(text_query: str):
@@ -88,12 +92,12 @@ class EndoscopyLocalizationDataset(Dataset):
 
             # For tools, we build a multi-hot vector for all 7 tool types.
             if key not in self.tool_label_lookup:
-                self.tool_label_lookup[key] = [0] * len(TOOL_KEYWORDS)  # Initialize with all zeros
+                self.tool_label_lookup[key] = [0] * NUM_TOOL_CLASSES  # Initialize with all zeros
 
             # Populate the tool vector based on tool columns (grasper, bipolar, etc.)
             for tool_keyword, tool_id in TOOL_KEYWORDS.items():
                 # Check if a column matching the tool keyword exists and its value is 1
-                if tool_keyword in row and row[tool_keyword] == 1:
+                if tool_keyword in ann_df.columns and int(row.get(tool_keyword, 0)) == 1:
                     self.tool_label_lookup[key][tool_id] = 1
 
         print(
@@ -218,12 +222,15 @@ class EndoscopyLocalizationDataset(Dataset):
             labels.append(label)
 
         relevance_tensor = torch.tensor(labels, dtype=torch.float32)
+        frame_indices = list(range(start_frame_idx, start_frame_idx + self.clip_length))
 
         return {
             "video_clip": video_clip,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": relevance_tensor,
+            "video_id": video_id_str,
+            "frame_indices": torch.tensor(frame_indices, dtype=torch.int32),
         }
 
 

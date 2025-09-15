@@ -10,8 +10,47 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torchvision.transforms.functional import normalize
+from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score, average_precision_score
+
+def _decode_segments(binary_vec):
+    segs = []
+    s = None
+    for i, v in enumerate(binary_vec):
+        if v and s is None:
+            s = i
+        if (not v or i == len(binary_vec)-1) and s is not None:
+            e = i if v else i-1
+            segs.append((s, e))  # inclusive frame indices
+            s = None
+    return segs
+
+def _iou_1d(a, b):
+    inter = max(0, min(a[1], b[1]) - max(a[0], b[0]) + 1)
+    union = (a[1]-a[0]+1) + (b[1]-b[0]+1) - inter
+    return inter / union if union > 0 else 0.0
+
+def _tiou_prf1(pred_segs, gt_segs, thr=0.5):
+    used_gt = set()
+    tp = 0
+    for ps in pred_segs:
+        best, best_i = -1, -1
+        for i, gs in enumerate(gt_segs):
+            if i in used_gt:
+                continue
+            v = _iou_1d(ps, gs)
+            if v > best:
+                best, best_i = v, i
+        if best >= thr:
+            tp += 1
+            used_gt.add(best_i)
+    fp = max(0, len(pred_segs) - tp)
+    fn = max(0, len(gt_segs) - tp)
+    prec = tp / (tp + fp) if (tp+fp) else 0.0
+    rec  = tp / (tp + fn) if (tp+fn) else 0.0
+    f1   = 2*prec*rec/(prec+rec) if (prec+rec) else 0.0
+    return prec, rec, f1
 
 def best_f1_threshold_from_logits(logits_1d, labels_1d):
     """
@@ -176,9 +215,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ma
     if scaler and ckpt.get('scaler_state_dict'):
         scaler.load_state_dict(ckpt['scaler_state_dict'])
     return ckpt
-# ======================================
-from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
-from torchvision.transforms.functional import normalize
 
 from project_config import config
 from models import LocalizationFramework
@@ -233,13 +269,17 @@ class MasterLoss(nn.Module):
         if self.use_uncertainty:
             self.evidential_loss = EvidentialLoss()
         if self.use_bilevel:
-            self.optical_flow_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(
-                config.TRAIN.DEVICE)
+            try:
+                weights = Raft_Small_Weights.C_T_SKHT_KITTI_V2
+            except Exception:
+                try:
+                    weights = Raft_Small_Weights.DEFAULT
+                except Exception:
+                    weights = None  # last resort, uninitialized
 
-            if torch.cuda.device_count() > 1:
-                print("Parallelizing RAFT model for Bi-Level Consistency Loss.")
-                self.optical_flow_model = nn.DataParallel(self.optical_flow_model)
+            self.optical_flow_model = raft_small(weights=weights, progress=False).to(config.TRAIN.DEVICE)
 
+            # IMPORTANT: do NOT wrap RAFT in DataParallel; it adds overhead and isn’t needed
             self.optical_flow_model.eval()
             for p in self.optical_flow_model.parameters():
                 p.requires_grad_(False)
@@ -456,6 +496,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device):
         running_loss += loss.item() * config.TRAIN.GRADIENT_ACCUMULATION_STEPS
         progress_bar.set_postfix(loss=f"{running_loss / (i + 1):.4f}")
 
+    leftover = (i + 1) % config.TRAIN.GRADIENT_ACCUMULATION_STEPS
+    if leftover != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        optimizer.zero_grad()
+
     return running_loss / len(dataloader)
 
 
@@ -573,7 +620,173 @@ def validate_one_epoch(model, dataloader, criterion, device,
     # Keep your original return signature:
     return avg_loss, auroc, auprc, val_acc_05, best_f1, best_thr, acc_at_thr
 
+@torch.no_grad()
+def evaluate_single_query(model, tokenizer, config, video_id_int, query_text, gt_segments_csv):
+    """
+    Validates ONLY the specified video + text query:
+      - per-frame metrics (AUROC, AUPRC, F1/Acc at thr*)
+      - segment metrics (tIoU@{0.3,0.5,0.7}) using gt_segments.csv
+    """
 
+    # 1) Build the full val dataset
+    from dataset import EndoscopyLocalizationDataset
+    val_csv = config.DATA.VAL_TRIPLETS
+    val_ds  = EndoscopyLocalizationDataset(val_csv, tokenizer, clip_length=config.DATA.CLIP_LENGTH, is_training=False)
+
+    # 2) Filter rows to (video 5, given query)
+    import os, pandas as pd
+    import numpy as np
+    val_df = pd.read_csv(val_csv)
+    target_vid = f"CHOLEC80__video{video_id_int:02d}"
+    mask = (val_df["text_query"].str.strip().str.lower() == query_text.strip().lower()) & \
+           (val_df["frame_path"].str.contains(f"/{target_vid}/"))
+    idxs = np.nonzero(mask.values)[0].tolist()
+    if len(idxs) == 0:
+        print(f"[EVAL] No rows matched video={target_vid}, query='{query_text}'. Check spelling/case & triplets.")
+        return
+
+    from torch.utils.data import Subset, DataLoader
+    sub_ds = Subset(val_ds, idxs)
+    val_loader = DataLoader(
+        sub_ds,
+        batch_size=config.TRAIN.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.DATA.NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=True if config.DATA.NUM_WORKERS > 0 else False
+    )
+
+    # 3) Run forward passes, collect per-frame probs/labels and indices
+    model.eval()
+    all_probs, all_labels = [], []
+    timeline = {}  # frame_idx -> (prob,label) aggregated (mean if duplicates)
+    for batch in val_loader:
+        video_clip = batch["video_clip"].to(config.TRAIN.DEVICE, non_blocking=True)
+        input_ids = batch["input_ids"].to(config.TRAIN.DEVICE, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(config.TRAIN.DEVICE, non_blocking=True)
+        labels = batch["labels"].to(config.TRAIN.DEVICE, non_blocking=True)  # (B,T)
+        out = model(video_clip, input_ids, attention_mask)  # adapt if your forward signature differs
+
+        # 1) pick the refined output
+        refined = out[0] if not (isinstance(out, dict) and "logits" in out) else out["logits"]
+        if refined.dim() == 3 and refined.size(-1) == 1:
+            refined = refined.squeeze(-1)  # (B,T)
+
+        # 2) infer USE_UNCERTAINTY from model.config
+        try:
+            use_uncertainty_eval = bool(getattr(getattr(model, "module", model).config.MODEL, "USE_UNCERTAINTY", False))
+        except Exception:
+            use_uncertainty_eval = False
+
+        # 3) convert to probabilities (avoid double-sigmoid when uncertainty is on)
+        probs = refined.clamp(0, 1) if use_uncertainty_eval else torch.sigmoid(refined)
+        probs = probs.detach()
+
+        # Per-frame pool for AUROC/AUPRC/F1 (flatten valid)
+        valid = (labels >= 0)  # ignore_index-safe if you use -1
+        if valid.sum().item() > 0:
+            all_probs.append(probs[valid].float().cpu())
+            all_labels.append(labels[valid].int().cpu())
+
+        # Build timeline (this subset is all from the same video & query)
+        vids = batch["video_id"]
+        fidx = batch["frame_indices"].cpu().numpy()  # (B,T)
+        p_np = probs.cpu().numpy()
+        y_np = (labels > 0).int().cpu().numpy()
+        for b in range(p_np.shape[0]):
+            for t in range(p_np.shape[1]):
+                k = int(fidx[b, t])
+                if k not in timeline:
+                    timeline[k] = {"p": [], "y": []}
+                timeline[k]["p"].append(float(p_np[b, t]))
+                timeline[k]["y"].append(int(y_np[b, t]))
+
+    if len(all_probs) == 0:
+        print("[EVAL] No valid frames found in subset.")
+        return
+
+    # 4) Per-frame metrics
+    import numpy as np
+    y_prob = torch.cat(all_probs).numpy()
+    y_true = (torch.cat(all_labels).numpy() > 0).astype(np.int32)
+
+    from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, f1_score
+    auroc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
+    auprc = average_precision_score(y_true, y_prob)
+
+    # best F1 sweep
+    thrs = np.linspace(0.0, 1.0, 101)
+    f1s  = []
+    for th in thrs:
+        y_hat = (y_prob >= th).astype(np.int32)
+        if y_hat.max() == 0 and y_true.max() == 0:
+            f1s.append(0.0)
+        else:
+            f1s.append(f1_score(y_true, y_hat))
+    best_idx = int(np.argmax(f1s))
+    best_thr = float(thrs[best_idx])
+    best_f1  = float(f1s[best_idx])
+
+    # accuracy at best_thr
+    y_hat_best = (y_prob >= best_thr).astype(np.int32)
+    acc_at_thr = float(accuracy_score(y_true, y_hat_best))
+
+    print(f"[EVAL][Per-frame] AUROC={auroc:.3f} AUPRC={auprc:.3f}  Best F1={best_f1:.3f}  Acc@thr*={acc_at_thr:.3f}  thr*={best_thr:.2f}")
+
+    # 5) Segment-level tIoU using gt_segments.csv
+    # Build predicted segments on the timeline (frame units)
+    if len(timeline) == 0:
+        print("[EVAL] No timeline collected. Skipping tIoU.")
+        return
+
+    ks = sorted(timeline.keys())
+    prob_line = [float(np.mean(timeline[k]["p"])) for k in ks]
+    pred_bin  = [1 if p >= best_thr else 0 for p in prob_line]
+    pred_segs_rel = _decode_segments(pred_bin)  # relative to ks positions
+    # Map back to absolute frame indices
+    pred_segs = [(ks[s], ks[e]) for (s, e) in pred_segs_rel]
+
+    # Load GT segments (expect columns: video_id, text_query, start_frame, end_frame)
+    gt_df = pd.read_csv(gt_segments_csv)
+    mask_gt = (gt_df["video_id"].astype(str).str.strip().str.lower() == target_vid.lower()) & \
+              (gt_df["text_query"].str.strip().str.lower() == query_text.strip().lower())
+    gt_rows = gt_df.loc[mask_gt]
+    gt_segs = []
+    for _, r in gt_rows.iterrows():
+        s = int(r["start_frame"]); e = int(r["end_frame"])
+        if s > e: s, e = e, s
+        gt_segs.append((s, e))
+
+    if len(gt_segs) == 0:
+        print(f"[EVAL][tIoU] No GT segments found in {gt_segments_csv} for {target_vid} / '{query_text}'.")
+        return
+
+    print(f"[EVAL] Pred segs: {len(pred_segs)}   GT segs: {len(gt_segs)}   (units: frames)")
+    for thr in (0.3, 0.5, 0.7):
+        prec, rec, f1 = _tiou_prf1(pred_segs, gt_segs, thr=thr)
+        print(f"[EVAL][tIoU@{thr:.1f}]  P={prec:.3f}  R={rec:.3f}  F1={f1:.3f}")
+
+    # Optional: boundary error diagnostics for best match (if you want)
+    # (Match each pred to its best-IoU GT and print start/end errors)
+    matches = []
+    used = set()
+    for ps in pred_segs:
+        best, best_i = -1, -1
+        for i, gs in enumerate(gt_segs):
+            if i in used: continue
+            v = _iou_1d(ps, gs)
+            if v > best:
+                best, best_i = v, i
+        if best_i >= 0:
+            used.add(best_i)
+            gs = gt_segs[best_i]
+            se = abs(ps[0]-gs[0]); ee = abs(ps[1]-gs[1])
+            matches.append((best, se, ee))
+    if matches:
+        iou_mean = float(np.mean([m[0] for m in matches]))
+        se_mean  = float(np.mean([m[1] for m in matches]))
+        ee_mean  = float(np.mean([m[2] for m in matches]))
+        print(f"[EVAL][Boundary] mean IoU={iou_mean:.3f}  mean|start_err|={se_mean:.1f}  mean|end_err|={ee_mean:.1f}")
 
 def save_model_DEPRECATED(*args, **kwargs):
     raise RuntimeError('save_model is deprecated; use save_checkpoint instead.')
@@ -631,6 +844,17 @@ def main(args):
 
     tokenizer_for_dataloaders = model.module.text_encoder.tokenizer if isinstance(model,
                                                                                   nn.DataParallel) else model.text_encoder.tokenizer
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location="cpu")
+        missing, unexpected = model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
+        print(f"[LOAD] Loaded checkpoint. missing={len(missing)} unexpected={len(unexpected)}")
+
+    if args.eval_single_query:
+        evaluate_single_query(model, tokenizer_for_dataloaders, config,
+                              video_id_int=args.video_id,
+                              query_text=args.query,
+                              gt_segments_csv=args.gt_segments or "/users/2/240331715/data/project_folder/Language-Guided-Endoscopy-Localization/gt_segments.csv")
+        return
 
     if args.debug:
         print("--- RUNNING IN DEBUG MODE ---")
@@ -729,6 +953,20 @@ def main(args):
             best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
             print(f"	*** New best model found! Validation loss: {val_loss:.4f} ***")
             save_checkpoint(model, optimizer, scheduler, None, epoch + 1, best_val_loss, best_model_path)
+
+        if args.eval_single_each_epoch:
+            evaluate_single_query(
+                model,
+                tokenizer_for_dataloaders,  # already defined earlier in main
+                config,
+                video_id_int=args.video_id,
+                query_text=args.query,
+                gt_segments_csv=(
+                        args.gt_segments
+                        or "/users/2/240331715/data/project_folder/Language-Guided-Endoscopy-Localization/gt_segments.csv"
+                ),
+            )
+
     print("\n--- Training Complete ---")
     print(f"Final models saved in: {checkpoint_dir}")
     print("Use: `ls -lh \"{}\"` to verify files".format(checkpoint_dir.replace('"', '\\"')))
@@ -741,5 +979,18 @@ if __name__ == '__main__':
                         help="Fraction of TRAIN set to use (0..1). Overrides config if provided.")
     parser.add_argument('--finetune_from', type=str, default=None,
                         help="Path to a checkpoint to load ONLY the weights from (no optimizer/scheduler).")
+    parser.add_argument("--eval_single_query", action="store_true",
+                        help="Run evaluation on a single (video, query) pair and exit.")
+    parser.add_argument("--video_id", type=int, default=5,
+                        help="Video number (e.g., 5 for CHOLEC80__video05).")
+    parser.add_argument("--query", type=str, default="Calot triangle dissection phase",
+                        help="Exact text query to evaluate.")
+    parser.add_argument("--gt_segments", type=str, required=False,
+                        help="Path to gt_segments.csv (columns: video_id,text_query,start_frame,end_frame).")
+    parser.add_argument("--checkpoint", type=str, required=False,
+                        help="Path to model weights to load before evaluation (e.g., best_model.pth).")
+    parser.add_argument("--eval_single_each_epoch", action="store_true",
+                        help="After each epoch, run single (video,query) evaluation (prints tIoU).")
+
     args = parser.parse_args()
     main(args)
