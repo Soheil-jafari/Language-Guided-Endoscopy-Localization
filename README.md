@@ -18,6 +18,11 @@ Our framework is built on three pillars:
 2.  **Architectural Scalability**: Employs a hybrid Transformer and Structured State Space Model (SSM) architecture to efficiently process long-form surgical videos, overcoming the quadratic complexity of traditional attention mechanisms.
 3.  **Trustworthiness & Explainability**: Integrates Evidential Deep Learning to quantify model uncertainty and provides visual attention maps to explain its predictions, fostering clinical trust and safety.
 
+### Visualizing Temporal Localization
+The following demonstration shows the framework successfully localizing the **"Calot triangle dissection phase"** in a 40-minute untrimmed procedure based solely on a natural language query.
+
+![Surgical Localization Demo](surgical_localization_demo.gif)
+*Query: "Calot triangle dissection phase" | Peak Confidence: 99.9%*
 ## ✨ Key Features
 
 * **End-to-End Open-Vocabulary TAL**: A complete pipeline from data preprocessing to language-guided inference for surgical video analysis.
