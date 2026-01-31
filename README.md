@@ -184,10 +184,10 @@ python inference.py \
 ```
 ## 📈 Performance & Key Results
 
-[cite_start]The framework was evaluated on the held-out Cholec80 test split (8 full-length videos)[cite: 757]. [cite_start]Despite the computational constraints limiting training to only **4 epochs**, the model demonstrated state-of-the-art potential in frame-level discrimination[cite: 805, 806].
+The framework was evaluated on the held-out Cholec80 test split (8 full-length videos). Despite the computational constraints limiting training to only **4 epochs**, the model demonstrated state-of-the-art potential in frame-level discrimination.
 
 ### Quantitative Benchmarking
-[cite_start]Our framework significantly outperforms general-domain baselines when applied to the specialized surgical environment[cite: 867, 931].
+Our framework significantly outperforms general-domain baselines when applied to the specialized surgical environment.
 
 | Model | AUROC (Discrimination) | AUPRC (Precision-Recall) | Best F1-Score |
 | :--- | :--- | :--- | :--- |
@@ -196,7 +196,7 @@ python inference.py \
 | X-CLIP Baseline | 0.50 | 0.07 | 0.12 |
 | Moment-DETR | 0.51 | 0.06 | 0.11 |
 
-[cite_start]*Note: Baselines were trained and evaluated under identical conditions using the same Cholec80 splits[cite: 758, 759].*
+*Note: Baselines were trained and evaluated under identical conditions using the same Cholec80 splits.*
 
 ### Qualitative Success
 In a focused case study on the **"Calot triangle dissection phase"** (Video 05), the model successfully identified the correct temporal neighborhood, achieving a peak confidence score of **0.9994**.
@@ -215,17 +215,17 @@ This repository includes the necessary code and instructions to benchmark our fr
 
 ## 🔍 Explainability & Trustworthiness
 
-[cite_start]In high-stakes clinical environments, "black-box" predictions are insufficient[cite: 44]. This framework integrates designed-in trustworthiness through two key mechanisms:
+In high-stakes clinical environments, "black-box" predictions are insufficient. This framework integrates designed-in trustworthiness through two key mechanisms:
 
 ### 1. Uncertainty Quantification (EDL)
-[cite_start]The system employs **Evidential Deep Learning (EDL)** to predict the parameters of a Beta distribution ($\alpha, \beta$) for every frame[cite: 567]. 
-* [cite_start]**Inverse Uncertainty**: The total evidence ($S_t = \alpha_t + \beta_t$) provides an explicit measure of model confidence[cite: 568].
-* [cite_start]**Safety**: This allows the system to flag ambiguous or out-of-distribution events that require human surgeon review[cite: 580].
+The system employs **Evidential Deep Learning (EDL)** to predict the parameters of a Beta distribution ($\alpha, \beta$) for every frame. 
+* **Inverse Uncertainty**: The total evidence ($S_t = \alpha_t + \beta_t$) provides an explicit measure of model confidence.
+* **Safety**: This allows the system to flag ambiguous or out-of-distribution events that require human surgeon review.
 
 ### 2. Visual Rationales
-[cite_start]The framework generates **Cross-Modal Attention Maps** to visualize the model's reasoning[cite: 750]. 
-* [cite_start]**Focus**: These heatmaps highlight the specific surgical tools (e.g., clip applier, grasper) or anatomical structures the model prioritized during a query[cite: 350, 751].
-* [cite_start]**Validation**: This provides clinicians with interpretable evidence that aligns AI predictions with familiar visual cues[cite: 242, 752].
+The framework generates **Cross-Modal Attention Maps** to visualize the model's reasoning. 
+* **Focus**: These heatmaps highlight the specific surgical tools (e.g., clip applier, grasper) or anatomical structures the model prioritized during a query.
+* **Validation**: This provides clinicians with interpretable evidence that aligns AI predictions with familiar visual cues.
 
 ### 📚 Citation
 If you use this framework or ideas from our work in your research, please cite the following dissertation:
