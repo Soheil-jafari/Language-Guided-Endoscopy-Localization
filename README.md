@@ -198,8 +198,18 @@ Our framework significantly outperforms general-domain baselines when applied to
 
 *Note: Baselines were trained and evaluated under identical conditions using the same Cholec80 splits.*
 
+### Visualizing Model Accuracy
+The following Precision-Recall curve demonstrates the framework's ability to maintain high precision across various recall levels, achieving an AUPRC of 0.887.
+
+![Precision-Recall Curve](pr_curve.png)
+
 ### Qualitative Success
 In a focused case study on the **"Calot triangle dissection phase"** (Video 05), the model successfully identified the correct temporal neighborhood, achieving a peak confidence score of **0.9994**.
+
+### Temporal Localization Analysis
+The timeline below illustrates the model's activation scores across Video 05. Note the distinct probability peak aligned with the "Calot triangle dissection phase" ground truth.
+
+![Temporal Localization Timeline](timeline.png)
 
 📊 Baselines and Comparisons
 This repository includes the necessary code and instructions to benchmark our framework against three key families of models:
