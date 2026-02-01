@@ -146,7 +146,7 @@ This framework is developed and evaluated on the **Cholec80 dataset**, which con
     conda create -n endo-tal python=3.9 -y
     conda activate endo-tal
     pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu118
-    pip install -r requirements.txt # A requirements.txt would need to be created
+    pip install -r requirements.txt 
     ```
 
 3.  **Configuration**: Before running any scripts, review and update the paths in `project_config.py` to match your system's directory structure.
