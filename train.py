@@ -262,7 +262,7 @@ class MasterLoss(nn.Module):
         self.use_uncertainty = config.MODEL.USE_UNCERTAINTY
         self.use_bilevel = config.TRAIN.USE_BILEVEL_CONSISTENCY
 
-        pos_weight_value = 1.0
+        pos_weight_value = float(getattr(config.TRAIN, "BCE_POS_WEIGHT", 1.0))
         pos_weight_tensor = torch.tensor([pos_weight_value], device=config.TRAIN.DEVICE)
         self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
         self.l1_loss = nn.L1Loss()
@@ -430,14 +430,16 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device):
+def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device, scaler):
     """
     Trains the model for one epoch with optional gradient accumulation.
+
+    `scaler` is created once in main() and reused across epochs so its dynamic
+    loss scale is not reset at every epoch boundary.
     """
     model.train()
     running_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
-    scaler = GradScaler()
 
     # Zero the gradients once before the loop begins.
     optimizer.zero_grad()
@@ -630,7 +632,7 @@ def evaluate_single_query(model, tokenizer, config, video_id_int, query_text, gt
 
     # 1) Build the full val dataset
     from dataset import EndoscopyLocalizationDataset
-    val_csv = config.DATA.VAL_TRIPLETS
+    val_csv = config.VAL_TRIPLETS_CSV_PATH
     val_ds  = EndoscopyLocalizationDataset(val_csv, tokenizer, clip_length=config.DATA.CLIP_LENGTH, is_training=False)
 
     # 2) Filter rows to (video 5, given query)
@@ -895,8 +897,12 @@ def main(args):
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config.TRAIN.LEARNING_RATE,
                             weight_decay=config.TRAIN.WEIGHT_DECAY)
 
-    total_training_steps = len(train_loader) // config.TRAIN.GRADIENT_ACCUMULATION_STEPS * epochs
-    num_warmup_steps = len(train_loader) // config.TRAIN.GRADIENT_ACCUMULATION_STEPS * config.TRAIN.WARMUP_EPOCHS
+    # One optimizer step per accumulation cycle, plus one for the leftover partial
+    # cycle at the end of each epoch -> ceil. This matches how train_one_epoch actually
+    # steps the scheduler, so the cosine schedule ends exactly at step 0-progress.
+    steps_per_epoch = math.ceil(len(train_loader) / config.TRAIN.GRADIENT_ACCUMULATION_STEPS)
+    total_training_steps = steps_per_epoch * epochs
+    num_warmup_steps = steps_per_epoch * config.TRAIN.WARMUP_EPOCHS
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps,
                                                 num_training_steps=total_training_steps)
 
@@ -919,9 +925,11 @@ def main(args):
     print(f"Evidential lambda:     {config.TRAIN.EVIDENTIAL_LAMBDA}")
     print("=========================================\n")
 
+    # Create the AMP gradient scaler once and reuse it across all epochs.
+    scaler = GradScaler()
     for epoch in range(epochs):
         print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device, scaler)
         val_loss, auroc, auprc, val_acc_05, best_f1, thr, acc_at_thr = validate_one_epoch(
             model, val_loader, criterion, device
         )

@@ -286,12 +286,16 @@ class Block(nn.Module):
                 patch_tok = x  # (B, T*H*W, D)
 
             # 1) TEMPORAL ATTENTION on patches (per location)
+            # The token sequence produced by forward_features is frame-major, i.e. laid
+            # out as "(t h w)" (position = t*H*W + h*W + w). The rearrange patterns below
+            # MUST match that ordering so each temporal group is one spatial location seen
+            # across all T frames.
             # reshape: (B, T*H*W, D) -> ((B*H*W), T, D)
-            xt = rearrange(patch_tok, 'b (h w t) d -> (b h w) t d', b=B, h=H, w=W, t=T)
+            xt = rearrange(patch_tok, 'b (t h w) d -> (b h w) t d', b=B, h=H, w=W, t=T)
 
             # ViT-style: norm -> attn ; apply DropPath at the add
             temp_out = self.temporal_attn(self.temporal_norm1(xt))  # ((B*H*W), T, D)
-            temp_out = rearrange(temp_out, '(b h w) t d -> b (h w t) d', b=B, h=H, w=W, t=T)  # (B, T*H*W, D)
+            temp_out = rearrange(temp_out, '(b h w) t d -> b (t h w) d', b=B, h=H, w=W, t=T)  # (B, T*H*W, D)
 
             # build a residual tensor aligned with x: zeros for CLS, temporal residual for patches
             temp_residual_full = torch.zeros_like(x)
@@ -312,7 +316,7 @@ class Block(nn.Module):
 
             # 2) SPATIAL ATTENTION on each frame (per time step)
             # reshape patches to per-frame sequences: (B, T*H*W, D) -> (B*T, H*W, D)
-            xs = rearrange(patch_tok, 'b (h w t) d -> (b t) (h w) d', b=B, h=H, w=W, t=T)
+            xs = rearrange(patch_tok, 'b (t h w) d -> (b t) (h w) d', b=B, h=H, w=W, t=T)
 
             # replicate CLS for each frame if present and prepend
             if cls_tok is not None:
@@ -337,8 +341,8 @@ class Block(nn.Module):
                 cls_residual = None
                 spatial_patches = spatial_out  # (B*T, H*W, D)
 
-            # put patch spatial residuals back to (B, T*H*W, D)
-            spatial_patches = rearrange(spatial_patches, '(b t) (h w) d -> b (h w t) d', b=B, h=H, w=W, t=T)
+            # put patch spatial residuals back to (B, T*H*W, D)  -- frame-major "(t h w)"
+            spatial_patches = rearrange(spatial_patches, '(b t) (h w) d -> b (t h w) d', b=B, h=H, w=W, t=T)
 
             # build residual tensor aligned with x: CLS in slot 0, patches in 1:
             spatial_residual_full = torch.zeros_like(x)

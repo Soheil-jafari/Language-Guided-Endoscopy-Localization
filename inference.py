@@ -157,6 +157,11 @@ def run_inference(args):
 
     model.eval()
 
+    # Enable cross-attention capture only if we intend to save XAI heatmaps.
+    if int(args.save_xai) == 1:
+        _core = model.module if isinstance(model, torch.nn.DataParallel) else model
+        _core.language_guided_head.return_attention = True
+
     # --- Video sampling (dense, constant-rate) ---
     video_path = args.video_path
     if not os.path.exists(video_path):
@@ -282,11 +287,13 @@ def run_inference(args):
                 # Common: refined_scores, raw_scores are first two
                 refined_scores = outputs[0]
                 raw_scores = outputs[1]
-                # Heuristics: evidential params and attention maps (if present)
+                # Model output contract (see models.LocalizationFramework.forward):
+                #   [0]=refined_scores, [1]=raw_scores, [2]=xai_weights,
+                #   [3]=semantic_features, [4]=spatial_features, [5]=evidential_params
+                if len(outputs) >= 6 and outputs[5] is not None:
+                    alpha_beta = outputs[5]  # shape [B, T, 2] -> (alpha, beta) pre-softplus/ReLU
                 if len(outputs) >= 3 and outputs[2] is not None:
-                    alpha_beta = outputs[2]  # shape [B, T, 2] -> (alpha, beta) pre-softplus/ReLU
-                if len(outputs) >= 4 and outputs[3] is not None:
-                    xai_maps = outputs[3]  # list/tenor of attention maps per frame or [B, T, H', W']
+                    xai_maps = outputs[2]  # cross-attention weights for XAI
             else:
                 # Fallback: older tuple
                 refined_scores, raw_scores = outputs, None
@@ -468,10 +475,10 @@ def run_inference(args):
                 rep_mask = text_inputs.attention_mask.repeat(B, 1)
 
                 outs = model(batch_clips, rep_ids, rep_mask)
-                # Try to pull attention again
+                # Pull the spatial attention map (output index 2; see model forward contract)
                 attn = None
-                if isinstance(outs, (list, tuple)) and len(outs) >= 4 and outs[3] is not None:
-                    attn = outs[3]  # [B, T, H', W'] or list
+                if isinstance(outs, (list, tuple)) and len(outs) >= 3 and outs[2] is not None:
+                    attn = outs[2]  # [B, T, H', W'] spatial attention map
 
                 if attn is None:
                     continue

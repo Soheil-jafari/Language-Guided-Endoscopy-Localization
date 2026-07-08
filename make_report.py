@@ -22,9 +22,13 @@ def parse_spans(span_strs):
     return spans
 
 def load_scores(run_dir):
-    path = os.path.join(run_dir, "scores.csv")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"scores.csv not found in {run_dir}")
+    # inference.py writes per_frame*.csv (optionally with a suffix); fall back to scores.csv
+    candidates = ["per_frame.csv", "per_frame_baseline.csv", "per_frame_improved.csv", "scores.csv"]
+    search = [os.path.join(run_dir, c) for c in candidates]
+    search += sorted(glob.glob(os.path.join(run_dir, "per_frame*.csv")))
+    path = next((p for p in search if os.path.exists(p)), None)
+    if path is None:
+        raise FileNotFoundError(f"No per_frame*.csv or scores.csv found in {run_dir}")
     t, p = [], []
     with open(path) as f:
         r = csv.DictReader(f)
@@ -37,9 +41,14 @@ def load_scores(run_dir):
     return t, p
 
 def load_pred_segments(run_dir):
-    # Prefer frozen segments if present
+    # Prefer frozen segments if present, then pred_segments.csv, then any pred_segments*.csv
     frozen = os.path.join(run_dir, "pred_segments.frozen.csv")
-    path = frozen if os.path.exists(frozen) else os.path.join(run_dir, "pred_segments.csv")
+    if os.path.exists(frozen):
+        path = frozen
+    else:
+        default = os.path.join(run_dir, "pred_segments.csv")
+        globbed = sorted(glob.glob(os.path.join(run_dir, "pred_segments*.csv")))
+        path = default if os.path.exists(default) else (globbed[0] if globbed else default)
     segs = []
     if os.path.exists(path):
         with open(path) as f:
@@ -83,7 +92,7 @@ def tiou(seg, gt):
     s,e = seg
     a,b = gt
     inter = max(0.0, min(e,b) - max(s,a))
-    union = max(e,s) - min(a,b)
+    union = max(e,b) - min(s,a)
     if union <= 0: return 0.0
     return inter / union
 

@@ -156,9 +156,15 @@ class TextEncoder(nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(config.MODEL.TEXT_ENCODER_MODEL)
         self.embed_dim = self.text_encoder.config.hidden_size
         if config.TRAIN.USE_PEFT:
-            apply_lora_to_linear_layers(self.text_encoder, r=config.TRAIN.LORA_R, alpha=config.TRAIN.LORA_ALPHA,
-                                        dropout=config.TRAIN.LORA_DROPOUT)
-            print("Conceptual LoRA applied to Text Encoder.")
+            # Restrict LoRA to the modules named in config (default: q_proj/v_proj),
+            # instead of wrapping every Linear in the text encoder.
+            target_modules = config.TRAIN.LORA_TARGET_MODULES
+            apply_lora_to_linear_layers_selective(
+                self.text_encoder, r=config.TRAIN.LORA_R, alpha=config.TRAIN.LORA_ALPHA,
+                dropout=config.TRAIN.LORA_DROPOUT,
+                name_filter=lambda full_name: any(t in full_name for t in target_modules)
+            )
+            print(f"LoRA applied to Text Encoder modules matching {target_modules}.")
 
     def forward(self, input_ids, attention_mask):
         dev = next(self.text_encoder.parameters()).device
@@ -170,18 +176,16 @@ class TextEncoder(nn.Module):
 class LanguageGuidedHead(nn.Module):
     def __init__(self, visual_embed_dim, text_embed_dim, num_attention_heads=8, num_layers=2):
         super().__init__()
-        self.transformer_decoder_layer = nn.TransformerDecoderLayer(d_model=visual_embed_dim, nhead=num_attention_heads,
-                                                                    dim_feedforward=visual_embed_dim * 4,
-                                                                    batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(self.transformer_decoder_layer, num_layers=num_layers)
-        _orig_mha_forward = self.transformer_decoder_layer.multihead_attn.forward
-
-        def _forward_with_weights(*args, **kwargs):
-            kwargs["need_weights"] = True
-            kwargs["average_attn_weights"] = False
-            return _orig_mha_forward(*args, **kwargs)
-
-        self.transformer_decoder_layer.multihead_attn.forward = _forward_with_weights
+        decoder_layer = nn.TransformerDecoderLayer(d_model=visual_embed_dim, nhead=num_attention_heads,
+                                                   dim_feedforward=visual_embed_dim * 4,
+                                                   batch_first=True)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        # Cross-attention (XAI) weights are captured on demand only. nn.TransformerDecoder
+        # deep-copies `decoder_layer`, so a hook/patch must target the CLONED layers in
+        # self.transformer_decoder.layers, not the template. This is kept OFF during
+        # training (so the fast attention path is preserved) and can be flipped on for
+        # inference/visualization via `model.language_guided_head.return_attention = True`.
+        self.return_attention = False
         self.fc_relevance = nn.Linear(visual_embed_dim, 1)
         self.text_proj = nn.Linear(text_embed_dim, visual_embed_dim)
 
@@ -191,19 +195,6 @@ class LanguageGuidedHead(nn.Module):
             self.confidence_module = None
 
     def forward(self, visual_features, text_features, text_attention_mask):
-        xai_weights = None
-        attn_holder = {}
-        def _xai_hook(mod, inp, out):
-            try:
-                if isinstance(out, tuple) and len(out) == 2:
-                    attn_holder['w'] = out[1]
-            except Exception:
-                pass
-        # Try to hook the cross-attention module inside the first decoder layer
-        try:
-            handle = self.transformer_decoder_layer.multihead_attn.register_forward_hook(_xai_hook)
-        except Exception:
-            handle = None
         B_T, _, C_visual = visual_features.shape
         B_original, L_text, _ = text_features.shape
         T_frames = B_T // B_original
@@ -217,6 +208,29 @@ class LanguageGuidedHead(nn.Module):
             confidence_scores = self.confidence_module(visual_features, text_features_expanded)
             visual_features = visual_features * confidence_scores.unsqueeze(1)
 
+        # Optionally capture cross-attention weights (query=visual patches, key=text tokens)
+        # from the LAST decoder layer, for explainability. Patch + hook the real cloned layer.
+        handle = None
+        restore = None
+        attn_holder = {}
+        if self.return_attention and len(self.transformer_decoder.layers) > 0:
+            last_attn = self.transformer_decoder.layers[-1].multihead_attn
+            _orig_forward = last_attn.forward
+
+            def _forward_with_weights(*args, **kwargs):
+                kwargs["need_weights"] = True
+                kwargs["average_attn_weights"] = False
+                return _orig_forward(*args, **kwargs)
+
+            last_attn.forward = _forward_with_weights
+            restore = (last_attn, _orig_forward)
+
+            def _xai_hook(mod, inp, out):
+                if isinstance(out, tuple) and len(out) == 2:
+                    attn_holder['w'] = out[1]
+
+            handle = last_attn.register_forward_hook(_xai_hook)
+
         # This is the full spatial feature map (needed for optical flow)
         fused_spatial_features = self.transformer_decoder(
             tgt=visual_features,
@@ -227,14 +241,20 @@ class LanguageGuidedHead(nn.Module):
         # This is the averaged semantic feature vector (for the temporal head)
         semantic_features_for_temporal_head = fused_spatial_features.mean(dim=1)
 
-
-        # Return both the semantic vector for the temporal head AND the full spatial map for the loss function
-        xai_weights = attn_holder.get('w', None)
-
-        try:
+        # Reduce raw cross-attention (B_T, heads, N_patches, L_text) to a per-patch
+        # relevance map (B_T, N_patches): mean over heads, mask-weighted mean over text.
+        xai_weights = None
+        if handle is not None:
             handle.remove()
-        except Exception:
-            pass
+            if restore is not None:
+                restore[0].forward = restore[1]
+            raw_attn = attn_holder.get('w', None)
+            if raw_attn is not None:
+                a = raw_attn.mean(dim=1)                          # (B_T, N_patches, L_text)
+                m = text_mask_expanded.unsqueeze(1).to(a.dtype)   # (B_T, 1, L_text)
+                xai_weights = (a * m).sum(-1) / m.sum(-1).clamp(min=1e-6)  # (B_T, N_patches)
+
+        # Return the semantic vector, the full spatial map (for the loss), and XAI weights
         return semantic_features_for_temporal_head, fused_spatial_features, xai_weights
 
 # --- Temporal Head ---
@@ -361,6 +381,10 @@ class LocalizationFramework(nn.Module):
             text_features,
             attention_mask
         )
+
+        if xai_weights is not None:
+            # (B*T, N_patches) -> (B, T, num_patches_h, num_patches_w) spatial attention map
+            xai_weights = xai_weights.reshape(B, T, num_patches_h, num_patches_w)
 
         semantic_features_reshaped = semantic_features_for_temporal.reshape(B, T, self.vision_embed_dim)
 
