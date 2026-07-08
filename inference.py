@@ -253,6 +253,12 @@ def run_inference(args):
     sum_alpha = np.zeros(N, dtype=np.float32)
     sum_beta = np.zeros(N, dtype=np.float32)
 
+    # The query is fixed for the whole run, so encode it through CLIP ONCE and reuse it
+    # for every window instead of re-encoding the same text on every forward pass.
+    core_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    with torch.no_grad(), autocast_ctx():
+        cached_text_features, _ = core_model.text_encoder(text_inputs.input_ids, text_inputs.attention_mask)
+
     with torch.no_grad(), autocast_ctx():
         for bi, b in enumerate(progress_iter):
             batch_starts = window_starts[b:b + B_win]
@@ -271,13 +277,14 @@ def run_inference(args):
                 batch_clips.append(clip_np)
             batch_clips = torch.cat(batch_clips, dim=0).to(device)  # (B, C, T, H, W)
 
-            # Repeat text inputs to match batch
+            # Repeat text inputs to match batch (mask still needed by the fusion head)
             B = batch_clips.size(0)
             rep_ids = text_inputs.input_ids.repeat(B, 1)
             rep_mask = text_inputs.attention_mask.repeat(B, 1)
+            text_feats = cached_text_features.expand(B, -1, -1).contiguous()
 
-            # Forward
-            outputs = model(batch_clips, rep_ids, rep_mask)
+            # Forward (reusing cached text features)
+            outputs = model(batch_clips, rep_ids, rep_mask, text_features=text_feats)
 
             # Backward-compatible unpacking:
             alpha_beta = None
@@ -473,8 +480,9 @@ def run_inference(args):
                 B = batch_clips.size(0)
                 rep_ids = text_inputs.input_ids.repeat(B, 1)
                 rep_mask = text_inputs.attention_mask.repeat(B, 1)
+                text_feats = cached_text_features.expand(B, -1, -1).contiguous()
 
-                outs = model(batch_clips, rep_ids, rep_mask)
+                outs = model(batch_clips, rep_ids, rep_mask, text_features=text_feats)
                 # Pull the spatial attention map (output index 2; see model forward contract)
                 attn = None
                 if isinstance(outs, (list, tuple)) and len(outs) >= 3 and outs[2] is not None:

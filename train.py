@@ -430,12 +430,14 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device, scaler):
+def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device, scaler,
+                    amp_dtype=torch.float16):
     """
     Trains the model for one epoch with optional gradient accumulation.
 
     `scaler` is created once in main() and reused across epochs so its dynamic
-    loss scale is not reset at every epoch boundary.
+    loss scale is not reset at every epoch boundary. `amp_dtype` selects the
+    autocast precision (torch.float16 or torch.bfloat16).
     """
     model.train()
     running_loss = 0.0
@@ -452,7 +454,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device, 
         relevance = batch['labels'].to(device, non_blocking=True)
 
         # Use autocast for mixed-precision training to save memory and speed up training.
-        with autocast():
+        with autocast(dtype=amp_dtype):
             try:
                 with torch.backends.cuda.sdp_kernel(enable_flash=True):
                     outputs = model(video_clip, input_ids, attention_mask)
@@ -925,11 +927,16 @@ def main(args):
     print(f"Evidential lambda:     {config.TRAIN.EVIDENTIAL_LAMBDA}")
     print("=========================================\n")
 
+    # Resolve autocast precision. bf16 needs no loss scaling, so disable the scaler then.
+    amp_dtype = torch.bfloat16 if str(getattr(config.TRAIN, "AMP_DTYPE", "fp16")).lower() == "bf16" \
+        else torch.float16
+    print(f"AMP dtype: {amp_dtype}")
     # Create the AMP gradient scaler once and reuse it across all epochs.
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=(amp_dtype == torch.float16))
     for epoch in range(epochs):
         print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device, scaler)
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device, scaler,
+                                     amp_dtype=amp_dtype)
         val_loss, auroc, auprc, val_acc_05, best_f1, thr, acc_at_thr = validate_one_epoch(
             model, val_loader, criterion, device
         )

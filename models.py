@@ -348,7 +348,8 @@ class LocalizationFramework(nn.Module):
                 num_classes=0, embed_dim=768, depth=12, num_heads=12,
                 mlp_ratio=4., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
                 num_frames=config.DATA.NUM_FRAMES,
-                attention_type=config.TIMESFORMER.ATTENTION_TYPE
+                attention_type=config.TIMESFORMER.ATTENTION_TYPE,
+                use_checkpoint=getattr(config.TRAIN, "USE_GRADIENT_CHECKPOINTING", False)
             )
             if config.MODEL.M2CRL_WEIGHTS_PATH and os.path.exists(config.MODEL.M2CRL_WEIGHTS_PATH):
                 load_pretrained(
@@ -409,7 +410,7 @@ class LocalizationFramework(nn.Module):
                                               num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
                                               num_layers=config.MODEL.HEAD_NUM_LAYERS)
 
-    def forward(self, video_clip, input_ids, attention_mask):
+    def forward(self, video_clip, input_ids, attention_mask, text_features=None):
         B, _, T, H, W = video_clip.shape
         num_patches_h = H // self.vision_backbone.patch_embed.patch_size[0]
         num_patches_w = W // self.vision_backbone.patch_embed.patch_size[1]
@@ -417,7 +418,10 @@ class LocalizationFramework(nn.Module):
         all_visual_tokens = self.vision_backbone.forward_features(video_clip, get_all=True)
         visual_features_for_head = all_visual_tokens[:, 1:, :].reshape(B * T, -1, self.vision_embed_dim)
 
-        text_features, _ = self.text_encoder(input_ids, attention_mask)
+        # Allow precomputed text features (e.g. cached at inference, since the query is
+        # fixed). Must be shaped (B, L_text, D_text). Falls back to encoding on the fly.
+        if text_features is None:
+            text_features, _ = self.text_encoder(input_ids, attention_mask)
 
         semantic_features_for_temporal, spatial_features_for_loss, xai_weights = self.language_guided_head(
             visual_features_for_head,

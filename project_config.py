@@ -138,6 +138,13 @@ class Config:
             self.WEIGHT_DECAY = 0.2
             self.EVIDENTIAL_LAMBDA = 0.2
             self.GRADIENT_ACCUMULATION_STEPS = 6
+            # Mixed-precision dtype for autocast: 'fp16' (default) or 'bf16'. Use 'bf16'
+            # on Ampere+ GPUs (A100/H100/RTX 30xx+) for more stable training with no loss
+            # scaling. The GradScaler is disabled automatically when using bf16.
+            self.AMP_DTYPE = 'fp16'
+            # Trade compute for memory in the vision backbone (activation checkpointing).
+            # Lets you fit a larger batch or longer clips; ~20-30% slower per step.
+            self.USE_GRADIENT_CHECKPOINTING = False
             self.LOG_INTERVAL = 10
             self.SAVE_INTERVAL = 1
             self.USE_BILEVEL_CONSISTENCY = False

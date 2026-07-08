@@ -227,16 +227,26 @@ class Attention(nn.Module):
             qkv = x.reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             q, k, v = qkv, qkv, qkv
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        if return_attn:
+            # Explicit path: needed only when the caller wants the attention matrix
+            # (e.g. get_last_selfattention for visualization). SDPA cannot return weights.
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            if self.with_qkv:
+                x = self.proj(x)
+                x = self.proj_drop(x)
+            return x, attn
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Fast path: fused scaled dot-product attention (flash / memory-efficient
+        # kernels when available). Mathematically identical to the explicit path above.
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, scale=self.scale)
+        x = x.transpose(1, 2).reshape(B, N, C)
         if self.with_qkv:
             x = self.proj(x)
             x = self.proj_drop(x)
-        if return_attn:
-            return x, attn
         return x
 
 
@@ -575,8 +585,10 @@ class VisionTransformer(nn.Module):
 
         # Pass through Transformer Blocks
         for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(lambda inp: blk(inp, B, T, self.patch_embed.num_patches_w), x)
+            if self.use_checkpoint and self.training:
+                x = checkpoint.checkpoint(
+                    lambda inp: blk(inp, B, T, self.patch_embed.num_patches_w),
+                    x, use_reentrant=False)
             else:
                 x = blk(x, B, T, self.patch_embed.num_patches_w)
 
