@@ -280,11 +280,47 @@ class TemporalHead(nn.Module):
 
 # --- SSM Temporal Head ---
 class TemporalHeadSSM(nn.Module):
-    def __init__(self, input_dim, output_dim, num_layers=4):
+    """
+    Mamba / state-space temporal head. It stacks `num_layers` Mamba mixers, each
+    mapping a (B, T, D) sequence to (B, T, D), followed by a norm and an output
+    projection.
+
+    The mixer is selected at build time:
+      * If `use_official_mamba` is True AND the `mamba_ssm` CUDA library imports
+        successfully, the fast official `mamba_ssm.Mamba` is used.
+      * Otherwise it falls back to the self-contained `MambaBlock` in this file,
+        so the head works even when `mamba_ssm` is not installed.
+    Both implementations expose the same (B, L, D) -> (B, L, D) interface.
+    """
+
+    def __init__(self, input_dim, output_dim, num_layers=4, use_official_mamba=True,
+                 d_state=16, d_conv=4, expand=2):
         super().__init__()
-        self.layers = nn.ModuleList([MambaBlock(d_model=input_dim) for _ in range(num_layers)])
+
+        mixer_factory = None
+        if use_official_mamba:
+            try:
+                from mamba_ssm import Mamba
+
+                def mixer_factory():
+                    return Mamba(d_model=input_dim, d_state=d_state, d_conv=d_conv, expand=expand)
+
+                print("[SSM] TemporalHeadSSM using official mamba_ssm.Mamba mixer.")
+            except Exception as e:
+                mixer_factory = None
+                print(f"[SSM] mamba_ssm unavailable ({type(e).__name__}: {e}); "
+                      f"falling back to built-in MambaBlock.")
+
+        if mixer_factory is None:
+            def mixer_factory():
+                return MambaBlock(d_model=input_dim, d_state=d_state, d_conv=d_conv, expand=expand)
+
+            if use_official_mamba is False:
+                print("[SSM] TemporalHeadSSM using built-in MambaBlock (official Mamba disabled by config).")
+
+        self.layers = nn.ModuleList([mixer_factory() for _ in range(num_layers)])
         self.norm = nn.LayerNorm(input_dim)
-        # The output layer's dimension is now controlled by the 'output_dim' parameter
+        # The output layer's dimension is controlled by the 'output_dim' parameter
         self.fc_output = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
@@ -293,7 +329,7 @@ class TemporalHeadSSM(nn.Module):
         x = self.norm(x)
         logits = self.fc_output(x)
 
-        # If output_dim is 4, we are in uncertainty mode.
+        # If output_dim is 2, we are in uncertainty mode (Beta evidential params).
         if self.fc_output.out_features == 2:
             return F.softplus(logits)
         else:
@@ -359,8 +395,15 @@ class LocalizationFramework(nn.Module):
 
         output_dim = 2 if config.MODEL.USE_UNCERTAINTY else 1
         if config.MODEL.TEMPORAL_HEAD_TYPE == 'SSM':
-            self.temporal_head = TemporalHeadSSM(input_dim=self.vision_embed_dim, output_dim=output_dim,
-                                                 num_layers=config.MODEL.HEAD_NUM_LAYERS)
+            print("Initializing Temporal Head: SSM (Mamba)")
+            self.temporal_head = TemporalHeadSSM(
+                input_dim=self.vision_embed_dim, output_dim=output_dim,
+                num_layers=getattr(config.MODEL, 'SSM_NUM_LAYERS', config.MODEL.HEAD_NUM_LAYERS),
+                use_official_mamba=getattr(config.MODEL, 'SSM_USE_OFFICIAL_MAMBA', True),
+                d_state=getattr(config.MODEL, 'SSM_D_STATE', 16),
+                d_conv=getattr(config.MODEL, 'SSM_D_CONV', 4),
+                expand=getattr(config.MODEL, 'SSM_EXPAND', 2),
+            )
         else:  # 'TRANSFORMER'
             self.temporal_head = TemporalHead(input_dim=self.vision_embed_dim, output_dim=output_dim,
                                               num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,

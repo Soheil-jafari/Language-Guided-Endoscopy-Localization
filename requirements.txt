@@ -43,6 +43,13 @@ tensorboard==2.16.2
 # (comment out if not needed)
 # kornia==0.7.2
 
+# Optional: official Mamba state-space kernels for the SSM temporal head
+# (TEMPORAL_HEAD_TYPE='SSM' with SSM_USE_OFFICIAL_MAMBA=True). Requires a matching
+# CUDA toolchain; if it cannot be installed, the code auto-falls back to the built-in
+# MambaBlock, so these are NOT required.
+# mamba-ssm==2.2.2
+# causal-conv1d==1.4.0
+
 # NOTE:
 # - Install the correct CUDA-enabled PyTorch builds if using GPU:
 #   See https://pytorch.org/get-started/locally/ for the exact pip command.

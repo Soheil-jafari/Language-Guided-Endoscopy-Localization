@@ -104,7 +104,19 @@ class Config:
             self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"
             self.HEAD_NUM_ATTENTION_HEADS = 8
             self.HEAD_NUM_LAYERS = 2
+
+            # --- Temporal head selection ---
+            # 'TRANSFORMER' (default) or 'SSM' to use the Mamba state-space head.
             self.TEMPORAL_HEAD_TYPE = 'TRANSFORMER'
+            # SSM (Mamba) temporal-head options; only used when TEMPORAL_HEAD_TYPE == 'SSM'.
+            # Prefer the official mamba_ssm CUDA library; auto-fallback to the built-in
+            # MambaBlock if it is not installed (so training never breaks on a missing lib).
+            self.SSM_USE_OFFICIAL_MAMBA = True
+            self.SSM_NUM_LAYERS = 4
+            self.SSM_D_STATE = 16
+            self.SSM_D_CONV = 4
+            self.SSM_EXPAND = 2
+
             self.USE_UNCERTAINTY = False
             self.USE_CONFIDENCE_FUSION = False
             # This embed_dim is for the text encoder and heads.
