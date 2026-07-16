@@ -857,7 +857,7 @@ def main(args):
         evaluate_single_query(model, tokenizer_for_dataloaders, config,
                               video_id_int=args.video_id,
                               query_text=args.query,
-                              gt_segments_csv=args.gt_segments or "/users/2/240331715/data/project_folder/Language-Guided-Endoscopy-Localization/gt_segments.csv")
+                              gt_segments_csv=args.gt_segments or os.path.join(config.PROJECT_ROOT, "gt_segments.csv"))
         return
 
     if args.debug:
@@ -978,7 +978,7 @@ def main(args):
                 query_text=args.query,
                 gt_segments_csv=(
                         args.gt_segments
-                        or "/users/2/240331715/data/project_folder/Language-Guided-Endoscopy-Localization/gt_segments.csv"
+                        or os.path.join(config.PROJECT_ROOT, "gt_segments.csv")
                 ),
             )
 
