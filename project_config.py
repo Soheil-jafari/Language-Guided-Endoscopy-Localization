@@ -5,14 +5,18 @@ import os
 class Config:
     def __init__(self):
         # --- Base Directories on ML Server ---
-        self.ML_SERVER_HOME = "/users/2/240331715/"
+        # Override with the PROJECT_HOME environment variable if your server layout
+        # differs; otherwise defaults to RunPod's standard persistent-volume mount.
+        self.ML_SERVER_HOME = os.environ.get("PROJECT_HOME", "/workspace/")
 
         self.UNIFIED_MEDICAL_VIDEOS_DIR = os.path.join(self.ML_SERVER_HOME, "data", "unified_medical_videos")
 
         self.PROJECT_ROOT = os.path.join(self.ML_SERVER_HOME, "data", "project_folder",
                                          "Language-Guided-Endoscopy-Localization")
 
-        self.EXTRACTED_FRAMES_DIR = "/users/2/240331715/data/unified_medical_videos/extracted_frames"
+        # Derived from UNIFIED_MEDICAL_VIDEOS_DIR (not hardcoded separately) so changing
+        # ML_SERVER_HOME/PROJECT_HOME is the only edit needed on a new machine.
+        self.EXTRACTED_FRAMES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "extracted_frames")
         self.SPLIT_FILES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "cholec80_splits")
         self.OUTPUT_TRIPLETS_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets")
         self.CHOLEC80_PARSED_ANNOTATIONS = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "parsed_annotations",
