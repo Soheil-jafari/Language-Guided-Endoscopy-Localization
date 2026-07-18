@@ -22,12 +22,17 @@ class Config:
         self.CHOLEC80_PARSED_ANNOTATIONS = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "parsed_annotations",
                                                         "CHOLEC80_parsed_annotations.csv")
 
+        # NOTE: these point at the _remapped triplets (see
+        # dataset_preprocessing/remap_triplet_paths.py). The original CSVs still
+        # contain frame_path values from whatever server they were first generated
+        # on; the _remapped copies have frame_path rewritten to this machine's
+        # EXTRACTED_FRAMES_DIR. Do not point this back at the un-remapped files.
         self.TRAIN_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
-                                                    "cholec80_train_triplets.csv")
+                                                    "cholec80_train_triplets_remapped.csv")
         self.VAL_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
-                                                  "cholec80_val_triplets.csv")
+                                                  "cholec80_val_triplets_remapped.csv")
         self.TEST_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
-                                                   "cholec80_test_triplets.csv")
+                                                   "cholec80_test_triplets_remapped.csv")
         self.VIDEO_ROOT_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR,
                                             "extracted_frames")
 
@@ -131,7 +136,12 @@ class Config:
         def __init__(self):
             self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
             self.LEARNING_RATE = 2e-5
-            self.BATCH_SIZE = 32
+            # BATCH_SIZE=32 OOMs a single RTX 4090 on the very first forward pass
+            # (measured: 22.7GB used before crashing). 8 is confirmed to run cleanly
+            # with headroom to spare on this model. Paired with
+            # GRADIENT_ACCUMULATION_STEPS=24 below to preserve the same effective
+            # batch size (8*24 = 32*6 = 192) the rest of the config was tuned around.
+            self.BATCH_SIZE = 8
             self.NUM_EPOCHS = 20
             self.TEMPORAL_LOSS_WEIGHT = 0.45
             # Positive-class weight for BCEWithLogitsLoss. Per-frame relevance is
@@ -141,7 +151,7 @@ class Config:
             self.WARMUP_EPOCHS = 3
             self.WEIGHT_DECAY = 0.2
             self.EVIDENTIAL_LAMBDA = 0.2
-            self.GRADIENT_ACCUMULATION_STEPS = 6
+            self.GRADIENT_ACCUMULATION_STEPS = 24
             # Mixed-precision dtype for autocast: 'fp16' (default) or 'bf16'. Use 'bf16'
             # on Ampere+ GPUs (A100/H100/RTX 30xx+) for more stable training with no loss
             # scaling. The GradScaler is disabled automatically when using bf16.

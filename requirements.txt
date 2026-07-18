@@ -28,6 +28,11 @@ ftfy==6.2.0
 regex==2024.5.15
 # Use the maintained anytorch wheel for easy install across CUDA/CPU
 clip-anytorch==2.6.0
+# Required by models.py (CLIPTextModel, AutoTokenizer) and dataset.py (AutoTokenizer).
+# Left unpinned since the exact compatible version depends on your installed torch
+# build (e.g. differs between the 2.3.1 this file otherwise targets and newer
+# preinstalled versions on some cloud GPU templates).
+transformers
 
 # Visualization (attention maps, debugging)
 matplotlib==3.8.4
