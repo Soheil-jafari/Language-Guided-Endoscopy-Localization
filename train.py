@@ -1,5 +1,6 @@
 import os
 import math
+import time
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -431,23 +432,48 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
 
 def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device, scaler,
-                    amp_dtype=torch.float16):
+                    amp_dtype=torch.float16, profile_io=False):
     """
     Trains the model for one epoch with optional gradient accumulation.
 
     `scaler` is created once in main() and reused across epochs so its dynamic
     loss scale is not reset at every epoch boundary. `amp_dtype` selects the
     autocast precision (torch.float16 or torch.bfloat16).
+
+    `profile_io=True` times each step's data-loading wait (time spent blocked on
+    `next(dataloader_iter)`) separately from GPU forward+backward+optimizer time,
+    using the existing `loss.item()` call below as the CUDA synchronization
+    boundary (CUDA ops are async; without an explicit sync point like .item(),
+    a naive wall-clock measurement would just measure kernel-enqueue time, not
+    actual GPU completion time). Prints running averages and a GPU-bound vs
+    I/O-bound verdict every LOG_INTERVAL steps -- does not change training
+    behavior when False.
     """
     model.train()
     running_loss = 0.0
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
+    data_iter = iter(progress_bar)
 
     # Zero the gradients once before the loop begins.
     optimizer.zero_grad()
     torch.backends.cudnn.benchmark = True
 
-    for i, batch in enumerate(progress_bar):
+    io_time_total = 0.0
+    compute_time_total = 0.0
+    profiled_steps = 0
+
+    i = -1
+    while True:
+        if profile_io:
+            t_wait_start = time.perf_counter()
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            break
+        if profile_io:
+            t_wait_end = time.perf_counter()
+        i += 1
+
         video_clip = batch['video_clip'].to(device, non_blocking=True)
         input_ids = batch['input_ids'].to(device, non_blocking=True)
         attention_mask = batch['attention_mask'].to(device, non_blocking=True)
@@ -497,8 +523,23 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device, 
             optimizer.zero_grad()
 
         # To log the correct loss, we multiply the scaled loss back up.
+        # loss.item() forces a CUDA synchronization -- if profiling, this is the
+        # point at which all GPU work for this step is actually guaranteed complete.
         running_loss += loss.item() * config.TRAIN.GRADIENT_ACCUMULATION_STEPS
         progress_bar.set_postfix(loss=f"{running_loss / (i + 1):.4f}")
+
+        if profile_io:
+            t_compute_end = time.perf_counter()
+            io_time_total += (t_wait_end - t_wait_start)
+            compute_time_total += (t_compute_end - t_wait_end)
+            profiled_steps += 1
+            if profiled_steps % config.TRAIN.LOG_INTERVAL == 0:
+                avg_io_ms = 1000.0 * io_time_total / profiled_steps
+                avg_compute_ms = 1000.0 * compute_time_total / profiled_steps
+                verdict = "I/O-BOUND (data loading is the bottleneck)" if avg_io_ms > avg_compute_ms \
+                    else "GPU-BOUND (compute is the bottleneck, data loading is keeping up)"
+                print(f"[PROFILE_IO] step {profiled_steps}: avg data-load wait={avg_io_ms:.1f}ms  "
+                      f"avg GPU compute (sync'd)={avg_compute_ms:.1f}ms  ->  {verdict}")
 
     leftover = (i + 1) % config.TRAIN.GRADIENT_ACCUMULATION_STEPS
     if leftover != 0:
@@ -506,6 +547,16 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scheduler, device, 
         scaler.update()
         scheduler.step()
         optimizer.zero_grad()
+
+    if profile_io and profiled_steps > 0:
+        avg_io_ms = 1000.0 * io_time_total / profiled_steps
+        avg_compute_ms = 1000.0 * compute_time_total / profiled_steps
+        verdict = "I/O-BOUND (data loading is the bottleneck)" if avg_io_ms > avg_compute_ms \
+            else "GPU-BOUND (compute is the bottleneck, data loading is keeping up)"
+        print(f"\n[PROFILE_IO] FINAL over {profiled_steps} steps: "
+              f"avg data-load wait={avg_io_ms:.1f}ms  avg GPU compute (sync'd)={avg_compute_ms:.1f}ms  "
+              f"total data-load time={io_time_total:.1f}s  total GPU compute time={compute_time_total:.1f}s  "
+              f"->  {verdict}\n")
 
     return running_loss / len(dataloader)
 
@@ -936,7 +987,7 @@ def main(args):
     for epoch in range(epochs):
         print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device, scaler,
-                                     amp_dtype=amp_dtype)
+                                     amp_dtype=amp_dtype, profile_io=args.profile_io)
         val_loss, auroc, auprc, val_acc_05, best_f1, thr, acc_at_thr = validate_one_epoch(
             model, val_loader, criterion, device
         )
@@ -1006,6 +1057,9 @@ if __name__ == '__main__':
                         help="Path to model weights to load before evaluation (e.g., best_model.pth).")
     parser.add_argument("--eval_single_each_epoch", action="store_true",
                         help="After each epoch, run single (video,query) evaluation (prints tIoU).")
+    parser.add_argument("--profile_io", action="store_true",
+                        help="Time data-loading wait separately from GPU compute (sync'd via loss.item()) "
+                            "and print a running GPU-bound vs I/O-bound verdict every LOG_INTERVAL steps.")
 
     args = parser.parse_args()
     main(args)
