@@ -3,6 +3,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import pandas as pd
 import os
 import cv2
+import zipfile
 import torchvision.transforms.v2 as T
 from transformers import AutoTokenizer
 import sys
@@ -57,6 +58,11 @@ class EndoscopyLocalizationDataset(Dataset):
         self.clip_length = clip_length
         self.is_training = is_training
         self._video_bounds = {}
+        # Cache of open ZipFile handles, keyed by video_dir. Populated lazily per
+        # Dataset instance -- i.e. per DataLoader worker process when num_workers > 0 --
+        # so repeated frame reads from the same video are seek+read on an already-open
+        # handle instead of a fresh file open each time. See _get_zip_handle/_load_frame.
+        self._zip_handles = {}
 
         # ==================== CONCEPT-BASED LABEL LOOKUP ====================
         print("Building concept-based label lookup from parsed annotations...")
@@ -127,10 +133,51 @@ class EndoscopyLocalizationDataset(Dataset):
     def __len__(self):
         return len(self.triplets_df)
 
-    def _load_frame(self, frame_path):
-        if not os.path.exists(frame_path):
+    def _get_zip_handle(self, video_dir):
+        """
+        Return a cached, already-open ZipFile handle for this video's archive
+        (extract_needed_frames.py's ZIP_STORED output), or None if no archive exists
+        for it -- e.g. a video extracted before the archive format was introduced,
+        which still has a loose-file directory instead. Cached per Dataset instance
+        (per DataLoader worker process), so every read after the first for a given
+        video is a seek+read on an already-open handle rather than a fresh file open
+        -- this is what makes per-batch frame loading fast on network filesystems.
+        """
+        if video_dir in self._zip_handles:
+            return self._zip_handles[video_dir]
+        zip_path = video_dir.rstrip(os.sep) + ".zip"
+        zf = None
+        if os.path.exists(zip_path):
+            try:
+                zf = zipfile.ZipFile(zip_path, "r")
+            except zipfile.BadZipFile:
+                zf = None
+        self._zip_handles[video_dir] = zf
+        return zf
+
+    def _load_frame(self, video_dir, fname):
+        """
+        Load a single frame given its video directory and entry filename (e.g.
+        'frame_0000001.jpg'). Prefers video_dir's zip archive if one exists; falls
+        back to a loose file directly in video_dir for videos extracted before the
+        archive format was introduced.
+        """
+        zf = self._get_zip_handle(video_dir)
+        if zf is not None:
+            try:
+                data = zf.read(fname)
+            except KeyError:
+                return None
+            img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                return None
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Legacy loose-file fallback.
+        fpath = os.path.join(video_dir, fname)
+        if not os.path.exists(fpath):
             return None
-        img = cv2.imread(frame_path)
+        img = cv2.imread(fpath)
         if img is None:
             return None
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -150,12 +197,15 @@ class EndoscopyLocalizationDataset(Dataset):
         start_frame_idx = max(0, center_frame_idx - self.clip_length // 2)
         video_dir = os.path.dirname(frame_path)
 
-        # discover min/max once per video dir
+        # discover min/max once per video dir (from the zip archive's entries if one
+        # exists, otherwise from the loose-file directory listing)
         if video_dir not in self._video_bounds:
             min_idx, max_idx = 0, 0
             try:
                 idxs = []
-                for f in os.listdir(video_dir):
+                zf = self._get_zip_handle(video_dir)
+                names = zf.namelist() if zf is not None else os.listdir(video_dir)
+                for f in names:
                     m2 = re.match(r"frame_(\d+)\.jpg$", f)
                     if m2:
                         idxs.append(int(m2.group(1)))
@@ -174,8 +224,8 @@ class EndoscopyLocalizationDataset(Dataset):
         frames, last_valid = [], None
         for t in range(self.clip_length):
             fidx = start_frame_idx + t
-            fpath = os.path.join(video_dir, f"frame_{fidx:0{digits}d}.jpg")
-            img = self._load_frame(fpath)
+            fname = f"frame_{fidx:0{digits}d}.jpg"
+            img = self._load_frame(video_dir, fname)
             if img is None:
                 if last_valid is not None:
                     frames.append(last_valid.copy())

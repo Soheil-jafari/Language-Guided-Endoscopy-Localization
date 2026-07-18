@@ -4,21 +4,30 @@ Extract only the frames actually referenced (directly, or via the +/- clip_lengt
 sliding window used by dataset.EndoscopyLocalizationDataset.__getitem__) by the
 existing triplets CSVs, instead of every frame of every Cholec80 video.
 
-Why: extracting every frame of all 80 Cholec80 videos can be several hundred GB of
-JPEGs, but the triplets CSVs already reference a sparse, stride-subsampled set of
-center frames, and __getitem__ only ever reads a `clip_length`-frame window around
-each one. This script extracts exactly that set (plus each video's true frame 0 and
-last frame, so dataset.py's listdir-based bounds detection sees the video's REAL
-start/end and clamps windows identically to how they are computed here) instead of
-the full dense extraction -- typically a small fraction of the total video.
+Why one archive per video, not loose files: on network-filesystem-backed storage
+(e.g. RunPod's MooseFS-backed /workspace), writing/reading millions of individual
+small JPEG files each pays a per-file open/metadata round-trip -- observed at
+~44ms/file on such a mount, vs ~0.05ms/file on local disk. Writing all of a video's
+needed frames into ONE ZIP_STORED archive (opened once, closed once) collapses
+that to a handful of large-file operations instead of millions of tiny ones.
+ZIP_STORED (no compression) is used because JPEG bytes are already compressed --
+paying CPU for deflate on top buys essentially nothing.
+
+Output layout: <output_frames_dir>/CHOLEC80__videoNN.zip, containing entries named
+exactly like the original loose-file convention (frame_0000000.jpg, etc.) so
+dataset.py's frame-index parsing is unaffected. See dataset.py's _get_zip_handle /
+_load_frame for the matching read side (falls back to legacy loose-directory reads
+if a video predates this format and has no .zip).
 
 Your existing triplets CSVs and parsed annotations CSV do not need to change at all;
-this script only recreates the frame image files they already point to.
+this script only recreates the frame images they already point to, in a different
+on-disk container format.
 """
 import argparse
 import os
 import re
 import sys
+import zipfile
 
 import cv2
 import pandas as pd
@@ -48,8 +57,8 @@ def needed_indices_for_video(center_indices, clip_length, total_frames):
         start = min(start, max(min_idx, max_idx - clip_length + 1))
         for t in range(clip_length):
             needed.add(start + t)
-    # Always include the true first/last frame so dataset.py's os.listdir-based bounds
-    # detection discovers the REAL video bounds, not just the bounds of this sparse set.
+    # Always include the true first/last frame so dataset.py's bounds detection
+    # discovers the REAL video bounds, not just the bounds of this sparse set.
     needed.add(min_idx)
     needed.add(max_idx)
     return needed
@@ -74,23 +83,46 @@ def collect_centers_by_video(triplets_csvs):
     return by_video
 
 
+def entry_name(idx, digits=7):
+    return f"frame_{idx:0{digits}d}.jpg"
+
+
+def existing_entries(zip_path):
+    """Names already present in a video's archive, if it exists. Empty set otherwise."""
+    if not os.path.exists(zip_path):
+        return set()
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            return set(zf.namelist())
+    except zipfile.BadZipFile:
+        # Truncated/corrupt archive (e.g. from an interrupted run) -- treat as empty
+        # so this video gets fully re-extracted rather than silently skipped.
+        print(f"[warn] {zip_path} is corrupt/unreadable, re-extracting from scratch.")
+        return set()
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Extract only the frames needed by existing triplets CSVs (space-efficient alternative "
-                    "to extract_cholec80_frames.py's full dense extraction)."
+        description="Extract only the frames needed by existing triplets CSVs into one ZIP_STORED "
+                    "archive per video (space- and network-filesystem-friendly alternative to "
+                    "extract_cholec80_frames.py's full dense, loose-file extraction)."
     )
     ap.add_argument("--cholec80_videos_dir", type=str, required=True,
                     help="Directory containing raw videoXX.mp4 files.")
     ap.add_argument("--output_frames_dir", type=str, default=config.EXTRACTED_FRAMES_DIR,
-                    help="Root directory to write extracted frames into (must match config.EXTRACTED_FRAMES_DIR "
-                        "on the machine you train on).")
+                    help="Root directory to write extracted frame archives into (must match "
+                        "config.EXTRACTED_FRAMES_DIR on the machine you train on).")
     ap.add_argument("--triplets_csvs", type=str, nargs="+", default=[
         config.TRAIN_TRIPLETS_CSV_PATH, config.VAL_TRIPLETS_CSV_PATH, config.TEST_TRIPLETS_CSV_PATH
     ], help="Triplets CSVs to scan for referenced frames (default: train/val/test from project_config.py).")
     ap.add_argument("--clip_length", type=int, default=config.DATA.CLIP_LENGTH,
                     help="Must match the clip_length dataset.py is constructed with (default: from config).")
     ap.add_argument("--overwrite", action="store_true",
-                    help="Re-extract frames even if the target file already exists.")
+                    help="Re-extract frames even if already present in a video's archive.")
+    ap.add_argument("--delete_source_after_extract", action="store_true",
+                    help="Delete each video's raw .mp4 immediately after its archive is fully "
+                        "written and verified, to keep peak disk usage down instead of keeping "
+                        "all raw videos until the whole run finishes.")
     args = ap.parse_args()
 
     print("Scanning triplets CSVs for referenced frames...")
@@ -113,8 +145,15 @@ def main():
         video_num = int(m.group(1))
         video_filename = f"video{video_num:02d}.mp4"
         video_path = os.path.join(args.cholec80_videos_dir, video_filename)
+        zip_path = os.path.join(args.output_frames_dir, f"{video_id}.zip")
+
         if not os.path.exists(video_path):
-            print(f"[skip] source video not found: {video_path}")
+            # Source already deleted (e.g. from a prior --delete_source_after_extract run).
+            # That's fine as long as the archive already has everything it needs.
+            if os.path.exists(zip_path):
+                print(f"[ok] {video_id}: source video already removed, archive present -- skipping.")
+            else:
+                print(f"[skip] source video not found and no archive exists: {video_path}")
             continue
 
         cap = cv2.VideoCapture(video_path)
@@ -125,43 +164,62 @@ def main():
             continue
 
         needed = needed_indices_for_video(centers, args.clip_length, total_frames)
-        out_dir = os.path.join(args.output_frames_dir, video_id)
-        os.makedirs(out_dir, exist_ok=True)
-
-        to_write = set()
-        for idx in needed:
-            fpath = os.path.join(out_dir, f"frame_{idx:07d}.jpg")
-            if args.overwrite or not os.path.exists(fpath):
-                to_write.add(idx)
+        have = set() if args.overwrite else existing_entries(zip_path)
+        to_write = {idx for idx in needed if entry_name(idx) not in have}
 
         total_needed_all += len(needed)
         total_frames_all += total_frames
 
         if not to_write:
-            print(f"{video_id}: all {len(needed)} needed frames already present, skipping.")
+            print(f"{video_id}: all {len(needed)} needed frames already in archive, skipping.")
             cap.release()
+            if args.delete_source_after_extract and os.path.exists(video_path):
+                os.remove(video_path)
             continue
 
         pct = 100.0 * len(needed) / total_frames
         print(f"{video_id}: need {len(needed)}/{total_frames} frames ({pct:.1f}% of the full video), "
-              f"{len(to_write)} not yet on disk. Decoding sequentially...")
+              f"{len(to_write)} not yet in archive. Decoding sequentially...")
 
-        # Sequential decode (not cv2.CAP_PROP_POS_FRAMES seeking, which is unreliable
-        # across codecs). Cost is one full decode pass per video, same as the original
-        # extract_cholec80_frames.py -- the saving here is disk space, not decode time.
-        for i in tqdm(range(total_frames), desc=video_id):
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            if i not in to_write:
-                continue
-            fpath = os.path.join(out_dir, f"frame_{i:07d}.jpg")
-            cv2.imwrite(fpath, frame)
-            total_written += 1
+        # Append to the existing archive if resuming (mode 'a'), else create fresh.
+        zip_mode = "a" if (have and not args.overwrite) else "w"
+        if args.overwrite and os.path.exists(zip_path):
+            os.remove(zip_path)  # 'w' would otherwise append duplicate entries to a stale zip
+            zip_mode = "w"
+
+        written_this_video = 0
+        with zipfile.ZipFile(zip_path, zip_mode, compression=zipfile.ZIP_STORED) as zf:
+            # Sequential decode (not cv2.CAP_PROP_POS_FRAMES seeking, which is unreliable
+            # across codecs). Cost is one full decode pass per video, same as before --
+            # the change here is the OUTPUT container, not the decode strategy.
+            for i in tqdm(range(total_frames), desc=video_id):
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                if i not in to_write:
+                    continue
+                ok, buf = cv2.imencode(".jpg", frame)
+                if not ok:
+                    print(f"  [warn] failed to encode frame {i} of {video_id}", file=sys.stderr)
+                    continue
+                zf.writestr(entry_name(i), buf.tobytes())
+                written_this_video += 1
+                total_written += 1
 
         cap.release()
 
-    print(f"\nDone. Wrote {total_written} new frame files to {args.output_frames_dir}")
+        if args.delete_source_after_extract:
+            # Verify the archive actually has everything needed before deleting the source.
+            final_entries = existing_entries(zip_path)
+            missing = {entry_name(idx) for idx in needed} - final_entries
+            if missing:
+                print(f"  [warn] {video_id}: archive still missing {len(missing)} entries after "
+                      f"extraction -- NOT deleting source video.", file=sys.stderr)
+            else:
+                os.remove(video_path)
+                print(f"  {video_id}: source video deleted (archive verified complete).")
+
+    print(f"\nDone. Wrote {total_written} new frame entries to archives in {args.output_frames_dir}")
     if total_frames_all > 0:
         print(f"Needed frames were {total_needed_all}/{total_frames_all} "
               f"({100.0*total_needed_all/total_frames_all:.1f}%) of the full dense extraction.")
