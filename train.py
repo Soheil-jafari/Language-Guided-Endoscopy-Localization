@@ -1,7 +1,9 @@
 import os
+import csv
 import math
 import time
 import argparse
+from datetime import datetime, timezone
 import numpy as np
 from tqdm import tqdm
 
@@ -216,6 +218,35 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ma
     if scaler and ckpt.get('scaler_state_dict'):
         scaler.load_state_dict(ckpt['scaler_state_dict'])
     return ckpt
+
+
+_METRICS_CSV_FIELDS = [
+    "epoch", "timestamp_utc", "train_loss", "val_loss", "auroc", "auprc",
+    "val_acc_at_0.5", "best_f1", "best_f1_threshold", "acc_at_best_f1_threshold",
+    "learning_rate",
+]
+
+
+def append_epoch_metrics(csv_path, row):
+    """
+    Append one epoch's metrics as a row to a persistent CSV (writing the header only
+    if the file doesn't exist yet, so this is safe to call across a --resume_from
+    boundary -- prior epochs' rows are preserved, new ones just get appended).
+
+    This is the durable record of the full per-epoch training trajectory: unlike
+    terminal output (lost if not explicitly redirected to a file) or the checkpoint
+    files (which only store the current/best epoch, not the full history), this CSV
+    on its own is enough for a reconnecting session -- or you -- to see the entire
+    run's history at a glance, and doubles as the raw data for a training-curve
+    figure later.
+    """
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_METRICS_CSV_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
 
 from project_config import config
 from models import LocalizationFramework
@@ -1028,6 +1059,24 @@ def main(args):
         print(f"\tValidation Loss: {val_loss:.4f}")
         print(f"\tValidation Accuracy@0.50: {val_acc_05:.4f} ({val_acc_05:.2%})")
         print(f"\tCurrent Learning Rate: {current_lr:.6f}")
+
+        # Persistent, structured record of this epoch -- survives disconnects and even
+        # a full container reset, since checkpoint_dir lives on /workspace, not the
+        # ephemeral container disk. See append_epoch_metrics() docstring.
+        metrics_csv_path = os.path.join(checkpoint_dir, "training_metrics.csv")
+        append_epoch_metrics(metrics_csv_path, {
+            "epoch": epoch + 1,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "train_loss": f"{train_loss:.6f}",
+            "val_loss": f"{val_loss:.6f}",
+            "auroc": f"{auroc:.6f}",
+            "auprc": f"{auprc:.6f}",
+            "val_acc_at_0.5": f"{val_acc_05:.6f}",
+            "best_f1": f"{best_f1:.6f}",
+            "best_f1_threshold": f"{thr:.4f}",
+            "acc_at_best_f1_threshold": f"{acc_at_thr:.6f}",
+            "learning_rate": f"{current_lr:.8f}",
+        })
 
         # --- Save checkpoints (latest and best) ---
         # A single, overwritten "latest" file, not one per epoch -- this file's only
