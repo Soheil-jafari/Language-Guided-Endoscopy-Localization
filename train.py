@@ -1030,7 +1030,10 @@ def main(args):
         print(f"\tCurrent Learning Rate: {current_lr:.6f}")
 
         # --- Save checkpoints (latest and best) ---
-        latest_model_path = os.path.join(checkpoint_dir, f"latest_model_epoch_{epoch + 1}.pth")
+        # A single, overwritten "latest" file, not one per epoch -- this file's only
+        # purpose is --resume_from after an interruption, and keeping every epoch's
+        # copy separately grows disk usage unboundedly over a long run for no benefit.
+        latest_model_path = os.path.join(checkpoint_dir, "latest_model.pth")
         save_checkpoint(model, optimizer, scheduler, scaler, epoch + 1, best_val_loss, latest_model_path)
 
         if math.isfinite(val_loss) and val_loss < best_val_loss:
@@ -1080,7 +1083,8 @@ if __name__ == '__main__':
                         help="Time data-loading wait separately from GPU compute (sync'd via loss.item()) "
                             "and print a running GPU-bound vs I/O-bound verdict every LOG_INTERVAL steps.")
     parser.add_argument("--resume_from", type=str, default=None,
-                        help="Path to a checkpoint (e.g. latest_model_epoch_N.pth) to FULLY resume training "
+                        help="Path to a checkpoint (checkpoints/<tag>/latest_model.pth, overwritten each "
+                            "epoch) to FULLY resume training "
                             "from -- restores model, optimizer, scheduler, and scaler state plus the epoch "
                             "number and best_val_loss, so a run interrupted mid-training continues exactly "
                             "where it left off instead of restarting the LR schedule and epoch count from 0. "
