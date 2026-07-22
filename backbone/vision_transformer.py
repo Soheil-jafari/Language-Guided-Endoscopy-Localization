@@ -155,7 +155,13 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
     if pretrained_model and os.path.exists(pretrained_model):
         _logger.info(f'Loading pretrained from local: {pretrained_model}')
         try:
-            ckpt = torch.load(pretrained_model, map_location='cpu')
+            # weights_only=False: PyTorch 2.6+ defaults torch.load to weights_only=True,
+            # which rejects legacy pickled globals (e.g. numpy.core.multiarray.scalar)
+            # some older checkpoints contain, raising instead of loading. This is our
+            # own checkpoint from a trusted source (not an untrusted third-party
+            # download), so the security tradeoff of weights_only=False is acceptable
+            # here.
+            ckpt = torch.load(pretrained_model, map_location='cpu', weights_only=False)
             sd = ckpt.get('model', ckpt)
             sd = _clean_sd(sd)
             sd = _maybe_drop_head(sd)
@@ -164,8 +170,17 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
             _logger.info(f'loaded. missing:{len(missing)} unexpected:{len(unexpected)}')
             return
         except Exception as e:
-            _logger.error(f"Local load failed: {e}")
-            warnings.warn(f"Failed local load: {e}. Falling back to URL/random.")
+            # A local checkpoint path was explicitly given and the file exists, so the
+            # caller clearly expects pretrained weights to load. Silently falling back
+            # to URL/random init here would train on a randomly-initialized backbone
+            # while looking like a normal run -- fail loudly instead so this can never
+            # go unnoticed the way it did before this fix.
+            _logger.error(f"Local checkpoint load failed: {e}")
+            raise RuntimeError(
+                f"Found pretrained checkpoint at '{pretrained_model}' but failed to load it: {e}. "
+                f"Refusing to silently continue with random initialization -- fix the checkpoint "
+                f"or the load path, or explicitly pass pretrained_model='' to train from scratch."
+            ) from e
 
     # 2) URL
     if cfg.get('url'):
