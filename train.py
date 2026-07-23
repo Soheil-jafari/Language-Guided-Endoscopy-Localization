@@ -963,6 +963,31 @@ def main(args):
     print(f"Uncertainty Mode: {criterion.use_uncertainty}")
     print(f"Bilevel Consistency Mode: {criterion.use_bilevel}")
     best_val_loss = float('inf')
+
+    # Resolve autocast precision. bf16 needs no loss scaling, so disable the scaler then.
+    amp_dtype = torch.bfloat16 if str(getattr(config.TRAIN, "AMP_DTYPE", "fp16")).lower() == "bf16" \
+        else torch.float16
+    print(f"AMP dtype: {amp_dtype}")
+    # Create the AMP gradient scaler once and reuse it across all epochs.
+    scaler = GradScaler(enabled=(amp_dtype == torch.float16))
+
+    # --- Resume a genuinely interrupted run (distinct from --finetune_from, which only
+    # loads model weights and always starts a fresh 0-indexed run). Restores model,
+    # optimizer, scheduler, and scaler state, plus the epoch number and best_val_loss,
+    # so a multi-day run can survive a disconnect without losing the LR schedule
+    # position or restarting epoch numbering from scratch. ---
+    start_epoch = 0
+    if args.resume_from:
+        print(f"Resuming full training state from: {args.resume_from}")
+        resumed_ckpt = load_checkpoint(args.resume_from, model, optimizer=optimizer,
+                                       scheduler=scheduler, scaler=scaler, map_location=device)
+        start_epoch = int(resumed_ckpt.get('epoch', 0) or 0)
+        resumed_best_val_loss = resumed_ckpt.get('best_val_loss')
+        if resumed_best_val_loss is not None and math.isfinite(resumed_best_val_loss):
+            best_val_loss = resumed_best_val_loss
+        print(f"Resumed at epoch {start_epoch} (of {epochs} total), "
+              f"best_val_loss so far: {best_val_loss:.4f}")
+
     print("\n--- Beginning Training and Validation Epochs ---")
     print("\n===== Fine-tune / Training Settings =====")
     print(f"Subset ratio (effective): {current_subset_ratio:.2f}")
@@ -978,13 +1003,7 @@ def main(args):
     print(f"Evidential lambda:     {config.TRAIN.EVIDENTIAL_LAMBDA}")
     print("=========================================\n")
 
-    # Resolve autocast precision. bf16 needs no loss scaling, so disable the scaler then.
-    amp_dtype = torch.bfloat16 if str(getattr(config.TRAIN, "AMP_DTYPE", "fp16")).lower() == "bf16" \
-        else torch.float16
-    print(f"AMP dtype: {amp_dtype}")
-    # Create the AMP gradient scaler once and reuse it across all epochs.
-    scaler = GradScaler(enabled=(amp_dtype == torch.float16))
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         print(f"\n===== Epoch {epoch + 1}/{epochs} =====")
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scheduler, device, scaler,
                                      amp_dtype=amp_dtype, profile_io=args.profile_io)
@@ -1011,14 +1030,17 @@ def main(args):
         print(f"\tCurrent Learning Rate: {current_lr:.6f}")
 
         # --- Save checkpoints (latest and best) ---
-        latest_model_path = os.path.join(checkpoint_dir, f"latest_model_epoch_{epoch + 1}.pth")
-        save_checkpoint(model, optimizer, scheduler, None, epoch + 1, best_val_loss, latest_model_path)
+        # A single, overwritten "latest" file, not one per epoch -- this file's only
+        # purpose is --resume_from after an interruption, and keeping every epoch's
+        # copy separately grows disk usage unboundedly over a long run for no benefit.
+        latest_model_path = os.path.join(checkpoint_dir, "latest_model.pth")
+        save_checkpoint(model, optimizer, scheduler, scaler, epoch + 1, best_val_loss, latest_model_path)
 
         if math.isfinite(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
             print(f"	*** New best model found! Validation loss: {val_loss:.4f} ***")
-            save_checkpoint(model, optimizer, scheduler, None, epoch + 1, best_val_loss, best_model_path)
+            save_checkpoint(model, optimizer, scheduler, scaler, epoch + 1, best_val_loss, best_model_path)
 
         if args.eval_single_each_epoch:
             evaluate_single_query(
@@ -1060,6 +1082,13 @@ if __name__ == '__main__':
     parser.add_argument("--profile_io", action="store_true",
                         help="Time data-loading wait separately from GPU compute (sync'd via loss.item()) "
                             "and print a running GPU-bound vs I/O-bound verdict every LOG_INTERVAL steps.")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to a checkpoint (checkpoints/<tag>/latest_model.pth, overwritten each "
+                            "epoch) to FULLY resume training "
+                            "from -- restores model, optimizer, scheduler, and scaler state plus the epoch "
+                            "number and best_val_loss, so a run interrupted mid-training continues exactly "
+                            "where it left off instead of restarting the LR schedule and epoch count from 0. "
+                            "Different from --finetune_from, which only loads model weights.")
 
     args = parser.parse_args()
     main(args)
