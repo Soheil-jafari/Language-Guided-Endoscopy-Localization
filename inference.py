@@ -157,10 +157,10 @@ def run_inference(args):
 
     model.eval()
 
-    # Enable cross-attention capture only if we intend to save XAI heatmaps.
+    # Enable the spatial relevance (XAI) map only if we intend to save heatmaps.
     if int(args.save_xai) == 1:
         _core = model.module if isinstance(model, torch.nn.DataParallel) else model
-        _core.language_guided_head.return_attention = True
+        _core.language_guided_head.return_xai_map = True
 
     # --- Video sampling (dense, constant-rate) ---
     video_path = args.video_path
@@ -300,7 +300,7 @@ def run_inference(args):
                 if len(outputs) >= 6 and outputs[5] is not None:
                     alpha_beta = outputs[5]  # shape [B, T, 2] -> (alpha, beta) pre-softplus/ReLU
                 if len(outputs) >= 3 and outputs[2] is not None:
-                    xai_maps = outputs[2]  # cross-attention weights for XAI
+                    xai_maps = outputs[2]  # per-patch spatial relevance map for XAI
             else:
                 # Fallback: older tuple
                 refined_scores, raw_scores = outputs, None
@@ -447,9 +447,13 @@ def run_inference(args):
     def _save_heatmap_overlay(rgb, attn_0to1, out_png, out_npy):
         H, W = rgb.shape[:2]
         hm = cv2.resize(attn_0to1.astype(np.float32), (W, H), interpolation=cv2.INTER_CUBIC)
-        heat = cv2.applyColorMap((hm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        overlay = (0.6 * heat + 0.4 * rgb).clip(0, 255).astype(np.uint8)
-        cv2.imwrite(str(out_png), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        hm = np.clip(hm, 0.0, 1.0)  # cubic interpolation can overshoot [0,1]; avoid uint8 wraparound
+        # cv2.applyColorMap returns BGR; frames are stored RGB. Blend in a common BGR
+        # space so JET reads correctly (hot=red) and the frame keeps its true colors.
+        heat_bgr = cv2.applyColorMap((hm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        overlay_bgr = (0.6 * heat_bgr + 0.4 * rgb_bgr).clip(0, 255).astype(np.uint8)
+        cv2.imwrite(str(out_png), overlay_bgr)  # imwrite expects BGR
         np.save(str(out_npy), hm)
 
     if int(args.save_xai) == 1 and xai_maps is not None:
@@ -483,10 +487,10 @@ def run_inference(args):
                 text_feats = cached_text_features.expand(B, -1, -1).contiguous()
 
                 outs = model(batch_clips, rep_ids, rep_mask, text_features=text_feats)
-                # Pull the spatial attention map (output index 2; see model forward contract)
+                # Pull the spatial relevance map (output index 2; see model forward contract)
                 attn = None
                 if isinstance(outs, (list, tuple)) and len(outs) >= 3 and outs[2] is not None:
-                    attn = outs[2]  # [B, T, H', W'] spatial attention map
+                    attn = outs[2]  # [B, T, H', W'] spatial relevance map
 
                 if attn is None:
                     continue

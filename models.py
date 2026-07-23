@@ -180,12 +180,16 @@ class LanguageGuidedHead(nn.Module):
                                                    dim_feedforward=visual_embed_dim * 4,
                                                    batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
-        # Cross-attention (XAI) weights are captured on demand only. nn.TransformerDecoder
-        # deep-copies `decoder_layer`, so a hook/patch must target the CLONED layers in
-        # self.transformer_decoder.layers, not the template. This is kept OFF during
-        # training (so the fast attention path is preserved) and can be flipped on for
-        # inference/visualization via `model.language_guided_head.return_attention = True`.
-        self.return_attention = False
+        # Per-patch relevance projection. It scores each frame by acting on the
+        # mean-pooled fused feature (see LocalizationFramework.forward) and -- when
+        # `return_xai_map` is enabled -- it is applied per patch to build the spatial
+        # explainability map. Because it is linear,
+        #     fc_relevance(mean_patches(F)) == mean_patches(fc_relevance(F)),
+        # so the per-patch map is an exact additive decomposition of the frame's
+        # relevance logit across space (a faithful attribution, not a post-hoc proxy).
+        # Kept OFF during training (zero overhead); flip on for inference/visualization
+        # via `model.language_guided_head.return_xai_map = True`.
+        self.return_xai_map = False
         self.fc_relevance = nn.Linear(visual_embed_dim, 1)
         self.text_proj = nn.Linear(text_embed_dim, visual_embed_dim)
 
@@ -208,53 +212,32 @@ class LanguageGuidedHead(nn.Module):
             confidence_scores = self.confidence_module(visual_features, text_features_expanded)
             visual_features = visual_features * confidence_scores.unsqueeze(1)
 
-        # Optionally capture cross-attention weights (query=visual patches, key=text tokens)
-        # from the LAST decoder layer, for explainability. Patch + hook the real cloned layer.
-        handle = None
-        restore = None
-        attn_holder = {}
-        if self.return_attention and len(self.transformer_decoder.layers) > 0:
-            last_attn = self.transformer_decoder.layers[-1].multihead_attn
-            _orig_forward = last_attn.forward
-
-            def _forward_with_weights(*args, **kwargs):
-                kwargs["need_weights"] = True
-                kwargs["average_attn_weights"] = False
-                return _orig_forward(*args, **kwargs)
-
-            last_attn.forward = _forward_with_weights
-            restore = (last_attn, _orig_forward)
-
-            def _xai_hook(mod, inp, out):
-                if isinstance(out, tuple) and len(out) == 2:
-                    attn_holder['w'] = out[1]
-
-            handle = last_attn.register_forward_hook(_xai_hook)
-
-        # This is the full spatial feature map (needed for optical flow)
+        # Cross-attention fusion: visual patches (query) attend over the text tokens
+        # (key/value). Output is the text-conditioned per-patch feature map, also used
+        # downstream for the spatial (optical-flow) loss.
         fused_spatial_features = self.transformer_decoder(
             tgt=visual_features,
             memory=text_features_expanded,
             memory_key_padding_mask=~text_mask_expanded.bool()
         )
 
-        # This is the averaged semantic feature vector (for the temporal head)
+        # Averaged semantic feature vector (fed to the temporal head)
         semantic_features_for_temporal_head = fused_spatial_features.mean(dim=1)
 
-        # Reduce raw cross-attention (B_T, heads, N_patches, L_text) to a per-patch
-        # relevance map (B_T, N_patches): mean over heads, mask-weighted mean over text.
+        # Explainability map, computed on demand for inference/visualization.
+        # We resolve the model's OWN relevance function spatially: apply fc_relevance to
+        # every fused patch feature to get a per-patch relevance logit (B_T, N_patches).
+        # Since the frame relevance is fc_relevance of the mean-pooled feature and
+        # fc_relevance is linear, this map is an exact additive decomposition of that
+        # relevance logit across space -- a faithful attribution rather than a proxy
+        # derived from a single attention layer. It is NOT a softmax distribution, so
+        # (unlike raw patch->text cross-attention averaged over the text axis) it retains
+        # genuine spatial contrast instead of collapsing to a constant.
         xai_weights = None
-        if handle is not None:
-            handle.remove()
-            if restore is not None:
-                restore[0].forward = restore[1]
-            raw_attn = attn_holder.get('w', None)
-            if raw_attn is not None:
-                a = raw_attn.mean(dim=1)                          # (B_T, N_patches, L_text)
-                m = text_mask_expanded.unsqueeze(1).to(a.dtype)   # (B_T, 1, L_text)
-                xai_weights = (a * m).sum(-1) / m.sum(-1).clamp(min=1e-6)  # (B_T, N_patches)
+        if self.return_xai_map:
+            xai_weights = self.fc_relevance(fused_spatial_features).squeeze(-1)  # (B_T, N_patches)
 
-        # Return the semantic vector, the full spatial map (for the loss), and XAI weights
+        # Return the semantic vector, the full spatial map (for the loss), and the XAI map
         return semantic_features_for_temporal_head, fused_spatial_features, xai_weights
 
 # --- Temporal Head ---
