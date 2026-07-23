@@ -932,7 +932,10 @@ def main(args):
                                                                                   nn.DataParallel) else model.text_encoder.tokenizer
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location="cpu")
-        missing, unexpected = model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
+        # save_checkpoint() writes weights under 'model_state_dict'; also accept a bare
+        # 'model' key or a raw state_dict so any checkpoint format loads correctly.
+        state = ckpt.get("model_state_dict", ckpt.get("model", ckpt)) if isinstance(ckpt, dict) else ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"[LOAD] Loaded checkpoint. missing={len(missing)} unexpected={len(unexpected)}")
 
     if args.eval_single_query:

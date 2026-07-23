@@ -13,12 +13,21 @@ import numpy as np
 from project_config import config
 
 # --- KEYWORD MAPPING ---
+# Order matters: parse_query_kind() and the annotation-lookup builder below both take
+# the FIRST keyword that is a substring of the text, so specific keys must precede
+# generic ones. In particular "calot" MUST come before "dissection": the label
+# CalotTriangleDissection contains the substring "dissection", so a leading "dissection"
+# entry would swallow it and collapse Calot (id 1) into GallbladderDissection (id 3),
+# conflating the two phases and leaving id 1 unused. IDs follow the canonical Cholec80
+# phase order (0..6) and must be unique per phase.
 PHASE_KEYWORDS = {
-    "calot triangle dissection": 3,
-    "dissection": 3,
-    "preparation": 0, "calot": 1, "clipping": 2, "cutting": 2,
-    "packaging": 4, "cleaning": 5, "coagulation": 5,
-    "retraction": 6
+    "preparation": 0,                 # Preparation
+    "calot": 1,                       # CalotTriangleDissection
+    "clipping": 2, "cutting": 2,      # ClippingCutting
+    "dissection": 3,                  # GallbladderDissection (Calot handled above)
+    "packaging": 4,                   # GallbladderPackaging
+    "cleaning": 5, "coagulation": 5,  # CleaningCoagulation
+    "retraction": 6,                  # GallbladderRetraction
 }
 
 TOOL_KEYWORDS = {
