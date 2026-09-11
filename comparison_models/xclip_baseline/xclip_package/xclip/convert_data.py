@@ -1,64 +1,32 @@
+"""Interchange export only; repaired X-CLIP training takes frame triplets directly."""
+import argparse
 import json
+from pathlib import Path
+import math
 import pandas as pd
-import os
-import argparse  # NEW: Import argparse
 
 
-def convert_jsonl_to_csv(jsonl_path, csv_path):
-    """
-    Reads a .jsonl file with video-level annotations and converts it to a
-    .csv file with one row per timestamp.
-    """
-    print(f"🚀 Starting conversion...")
-    print(f"Reading from: {jsonl_path}")
-
-    csv_rows = []
-    try:
-        with open(jsonl_path, 'r') as f:
-            for line in f:
-                data = json.loads(line)
-                video_id = data.get("video") or data.get("video_id") or data.get("vid")
-                query = data.get("query")
-                timestamps = data.get("timestamps", [])
-
-                if not all([video_id, query, timestamps]):
-                    print(f"⚠️  Skipping invalid line: {line.strip()}")
-                    continue
-
-                for ts in timestamps:
-                    start_frame, end_frame = ts
-                    csv_rows.append({
-                        "video_id": video_id,
-                        "query": query,
-                        "start_frame": int(start_frame),
-                        "end_frame": int(end_frame),
-                    })
-    except FileNotFoundError:
-        print(f"❌ ERROR: The input file was not found at '{jsonl_path}'. Please check the path.")
-        return
-    except Exception as e:
-        print(f"❌ ERROR: An unexpected error occurred: {e}")
-        return
-
-    if not csv_rows:
-        print("🤷 No data was converted. The output file will not be created.")
-        return
-
-    df = pd.DataFrame(csv_rows)
-    output_dir = os.path.dirname(csv_path)
-    os.makedirs(output_dir, exist_ok=True)
-    df.to_csv(csv_path, index=False)
-
-    print(f"✅ Conversion complete!")
-    print(f"Successfully created {len(df)} entries.")
-    print(f"Output saved to: {csv_path}")
+def convert_jsonl_to_csv(jsonl_path,csv_path):
+    if Path(csv_path).exists(): raise FileExistsError(csv_path)
+    rows=[]; seen=set()
+    for line in Path(jsonl_path).read_text().splitlines():
+        if not line.strip(): continue
+        data=json.loads(line); video=data['video']; query=data['query']; duration=float(data['duration'])
+        key=(video,query)
+        if key in seen: raise ValueError('Duplicate video/query records; group spans first')
+        seen.add(key)
+        if not math.isfinite(duration) or duration<=0: raise ValueError('Invalid duration')
+        for span in data['timestamps']:
+            start,end=map(float,span)
+            if not 0<=start<end<=duration: raise ValueError(f'Invalid seconds: {span}')
+            rows.append(dict(video_id=video,query=query,start_time=start,end_time=end,absent=False,duration=duration))
+        if not data['timestamps']:
+            rows.append(dict(video_id=video,query=query,start_time=None,end_time=None,absent=True,duration=duration))
+    if not rows: raise ValueError('Empty segment manifest')
+    Path(csv_path).parent.mkdir(parents=True,exist_ok=True); pd.DataFrame(rows).to_csv(csv_path,index=False)
 
 
-if __name__ == "__main__":
-    # --- NEW: Use argparse to get file paths from the command line ---
-    parser = argparse.ArgumentParser(description="Convert a .jsonl annotation file to a .csv triplet file.")
-    parser.add_argument("--input-jsonl", required=True, help="Path to the input .jsonl file.")
-    parser.add_argument("--output-csv", required=True, help="Path to save the output .csv file.")
-    args = parser.parse_args()
-
-    convert_jsonl_to_csv(args.input_jsonl, args.output_csv)
+if __name__=='__main__':
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--input-jsonl',required=True); p.add_argument('--output-csv',required=True)
+    a=p.parse_args(); convert_jsonl_to_csv(a.input_jsonl,a.output_csv)

@@ -123,15 +123,16 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
                     attention_type='divided_space_time', pretrained_model='',
                     strict=False):
     """
-    Load ViT weights (local file wins; else URL). Defaults to strict=False so
-    temporal params missing in 2D ViTs won't break loading.
+    Load compatible ViT weights with >=90% parameter coverage. Any intended
+    architecture conversion outside that coverage needs an explicit migration.
     """
     if cfg is None:
         cfg = getattr(model, 'default_cfg', None) or default_cfgs.get('vit_base_patch16_224')
         if cfg is None:
-            _logger.warning("No cfg and no default_cfg; using random init.")
-            warnings.warn("No valid pretrained model found. Using random initialization.")
-            return
+            raise ValueError('No pretrained configuration')
+
+    if pretrained_model and not os.path.isfile(pretrained_model):
+        raise FileNotFoundError(pretrained_model)
 
     if filter_fn is None:
         filter_fn = _conv_filter
@@ -162,11 +163,17 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
             # download), so the security tradeoff of weights_only=False is acceptable
             # here.
             ckpt = torch.load(pretrained_model, map_location='cpu', weights_only=False)
-            sd = ckpt.get('model', ckpt)
+            sd = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt.get('model', ckpt)))
             sd = _clean_sd(sd)
             sd = _maybe_drop_head(sd)
             sd = filter_fn(sd, model)  # <— pass model for Conv3d inflation
+            expected = model.state_dict()
+            matched = sum(v.numel() for k,v in expected.items() if k in sd and sd[k].shape == v.shape)
+            coverage = matched / max(1, sum(v.numel() for v in expected.values()))
+            if coverage < 0.9:
+                raise ValueError(f'Backbone weight coverage {coverage:.1%} is below 90%; wrong checkpoint/key mapping')
             missing, unexpected = model.load_state_dict(sd, strict=strict)
+            print(f'Backbone load coverage={coverage:.2%}; missing={missing}; unexpected={unexpected}')
             _logger.info(f'loaded. missing:{len(missing)} unexpected:{len(unexpected)}')
             return
         except Exception as e:
@@ -191,13 +198,16 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
             sd = _clean_sd(sd)
             sd = _maybe_drop_head(sd)
             sd = filter_fn(sd, model)
+            expected = model.state_dict()
+            coverage = sum(v.numel() for k,v in expected.items() if k in sd and sd[k].shape == v.shape) / max(1,sum(v.numel() for v in expected.values()))
+            if coverage < .9: raise ValueError(f'Pretrained URL coverage {coverage:.1%} is below 90%')
             missing, unexpected = model.load_state_dict(sd, strict=strict)
             _logger.info(f'loaded. missing:{len(missing)} unexpected:{len(unexpected)}')
             return
         except Exception as e:
-            warnings.warn(f"Failed URL load: {e}. Using random init.")
+            raise RuntimeError(f'Pretrained URL load failed: {e}') from e
 
-    warnings.warn("No valid pretrained model; using random initialization.")
+    raise ValueError('No valid pretrained model; construct the model without load_pretrained for explicit random initialization')
 
 # --- Core Backbone Classes ---
 
@@ -565,7 +575,7 @@ class VisionTransformer(nn.Module):
         current_full_sequence_length = x.size(1)
 
         if current_full_sequence_length != original_pos_embed_length:
-            warnings.warn("Positional embedding size mismatch. Resizing dynamically. Performance may be impacted.")
+            # Tiling a single-frame spatial embedding over time is expected here.
             # Call the modified _resize_pos_embed function with the new spatial dimensions AND num_frames (T)
             new_pos_embed = self._resize_pos_embed(
                 self.pos_embed,
@@ -602,7 +612,7 @@ class VisionTransformer(nn.Module):
         for blk in self.blocks:
             if self.use_checkpoint and self.training:
                 x = checkpoint.checkpoint(
-                    lambda inp: blk(inp, B, T, self.patch_embed.num_patches_w),
+                    lambda inp, block=blk: block(inp, B, T, self.patch_embed.num_patches_w),
                     x, use_reentrant=False)
             else:
                 x = blk(x, B, T, self.patch_embed.num_patches_w)

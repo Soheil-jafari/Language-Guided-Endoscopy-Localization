@@ -1,62 +1,14 @@
-# ===== Core =====
-#torch==2.3.1
-#torchvision==0.18.1
-#torchaudio==2.3.1
-
-# Array & utils
-numpy==1.26.4
-tqdm==4.66.4
-einops==0.7.0
-scipy==1.11.4
-pandas==2.2.2
-scikit-learn==1.4.2
-
-# Images & video I/O
-Pillow==10.3.0
-opencv-python==4.9.0.80
-decord==0.6.0
-
-# Config & serialization
-PyYAML==6.0.1
-omegaconf==2.3.0
-
-# Vision backbones & modeling helpers
-timm==0.9.16
-
-# CLIP & text processing
-ftfy==6.2.0
-regex==2024.5.15
-# Use the maintained anytorch wheel for easy install across CUDA/CPU
-clip-anytorch==2.6.0
-# Required by models.py (CLIPTextModel, AutoTokenizer) and dataset.py (AutoTokenizer).
-# Left unpinned since the exact compatible version depends on your installed torch
-# build (e.g. differs between the 2.3.1 this file otherwise targets and newer
-# preinstalled versions on some cloud GPU templates).
-transformers
-
-# Visualization (attention maps, debugging)
-matplotlib==3.8.4
-
-# Moment-DETR / DETR-style dependencies
-pycocotools==2.0.7
-
-# Optional: metrics & logging
-torchmetrics==1.4.0.post0
-tensorboard==2.16.2
-
-# If RAFT optical flow is used for bi-level consistency, install these
-# (comment out if not needed)
-# kornia==0.7.2
-
-# Optional: official Mamba state-space kernels for the SSM temporal head
-# (TEMPORAL_HEAD_TYPE='SSM' with SSM_USE_OFFICIAL_MAMBA=True). Requires a matching
-# CUDA toolchain; if it cannot be installed, the code auto-falls back to the built-in
-# MambaBlock, so these are NOT required.
-# mamba-ssm==2.2.2
-# causal-conv1d==1.4.0
-
-# NOTE:
-# - Install the correct CUDA-enabled PyTorch builds if using GPU:
-#   See https://pytorch.org/get-started/locally/ for the exact pip command.
-# - If you face issues with decord on Windows, try prebuilt wheels from:
-#   https://github.com/dmlc/decord
+# Tested with Python 3.12. Install the appropriate CPU/CUDA PyTorch wheel first.
+torch==2.5.1
+torchvision==0.20.1
+transformers==4.44.2
+einops==0.8.0
+numpy==2.3.5
+pandas==3.0.1
+scipy==1.18.1
+scikit-learn==1.5.2
+Pillow==12.3.0
+opencv-python-headless==4.10.0.84
+pytest==8.3.3
+# Optional official Mamba: install separately for the server CUDA/toolchain.
+# No fallback is performed if that selected backend is unavailable.

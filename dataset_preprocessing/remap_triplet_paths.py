@@ -55,18 +55,18 @@ def _with_suffix(path, suffix):
 
 def remap_csv(csv_path: str, new_extracted_frames_dir: str, in_place: bool, suffix: str):
     if not os.path.exists(csv_path):
-        print(f"[skip] not found: {csv_path}")
-        return
+        raise FileNotFoundError(csv_path)
     df = pd.read_csv(csv_path)
     if "frame_path" not in df.columns:
-        print(f"[skip] no 'frame_path' column in: {csv_path}")
-        return
+        raise ValueError(f"No frame_path column: {csv_path}")
 
     before = df["frame_path"].iloc[0] if len(df) else None
     df["frame_path"] = df["frame_path"].apply(lambda p: remap_path(str(p), new_extracted_frames_dir))
     after = df["frame_path"].iloc[0] if len(df) else None
 
     out_path = csv_path if in_place else _with_suffix(csv_path, suffix)
+    if not in_place and os.path.exists(out_path):
+        raise FileExistsError(out_path)
     df.to_csv(out_path, index=False)
     print(f"[OK] {csv_path} -> {out_path}  ({len(df)} rows)")
     if before is not None:

@@ -18,33 +18,28 @@ class Config:
         # ML_SERVER_HOME/PROJECT_HOME is the only edit needed on a new machine.
         self.EXTRACTED_FRAMES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "extracted_frames")
         self.SPLIT_FILES_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "cholec80_splits")
-        self.OUTPUT_TRIPLETS_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets")
+        self.OUTPUT_TRIPLETS_DIR = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets", "repaired_v2")
         self.CHOLEC80_PARSED_ANNOTATIONS = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "parsed_annotations",
-                                                        "CHOLEC80_parsed_annotations.csv")
+                                                        "CHOLEC80_parsed_annotations_v2.csv")
 
-        # NOTE: these point at the _remapped triplets (see
-        # dataset_preprocessing/remap_triplet_paths.py). The original CSVs still
-        # contain frame_path values from whatever server they were first generated
-        # on; the _remapped copies have frame_path rewritten to this machine's
-        # EXTRACTED_FRAMES_DIR. Do not point this back at the un-remapped files.
-        self.TRAIN_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
-                                                    "cholec80_train_triplets_remapped.csv")
-        self.VAL_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
-                                                  "cholec80_val_triplets_remapped.csv")
-        self.TEST_TRIPLETS_CSV_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, "final_triplets",
-                                                   "cholec80_test_triplets_remapped.csv")
+        # New manifests are separated from historical supervision. Frame paths
+        # identify video/source-frame; EXTRACTED_FRAMES_DIR supplies the local root.
+        self.TRAIN_TRIPLETS_CSV_PATH = os.path.join(self.OUTPUT_TRIPLETS_DIR, 'cholec80_train_triplets.csv')
+        self.VAL_TRIPLETS_CSV_PATH = os.path.join(self.OUTPUT_TRIPLETS_DIR, 'cholec80_val_triplets.csv')
+        self.TEST_TRIPLETS_CSV_PATH = os.path.join(self.OUTPUT_TRIPLETS_DIR, 'cholec80_test_triplets.csv')
         self.VIDEO_ROOT_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR,
                                             "extracted_frames")
 
         # --- Model & Checkpoint Paths  ---
         self.BACKBONE_WEIGHTS_PATH = os.path.join(self.PROJECT_ROOT, "pretrained", "checkpoint.pth")
         # Directory to save training checkpoints
-        self.EXPERIMENT_TAG = "baseline"  # or "improved"
+        self.EXPERIMENT_TAG = "baseline_repaired_v2"
         self.CHECKPOINT_DIR = os.path.join(self.PROJECT_ROOT, "checkpoints", f"cholec80_{self.EXPERIMENT_TAG}")
         # Directory for model outputs (e.g., inference results, visualizations)
         self.OUTPUT_DIR = os.path.join(self.PROJECT_ROOT, "outputs", "cholec80")
 
         self.DATA = self.DataConfig()
+        self.VIDEO_METADATA_PATH = os.path.join(self.UNIFIED_MEDICAL_VIDEOS_DIR, 'video_metadata.json')
         self.TRAIN = self.TrainConfig()
         self.MODEL = self.ModelConfig(project_root=self.PROJECT_ROOT)
         # --- TimeSformer (M²CRL Backbone) Specific Parameters ---
@@ -94,6 +89,7 @@ class Config:
             self.AUGMENT_PROB = 0.5
             self.NUM_FRAMES = 16
             self.FRAME_RATE = 30
+            self.SAMPLE_FPS = 1.0  # Source FPS comes only from video_metadata.json.
             self.CLIP_LENGTH = 16
             self.NUM_INFERENCE_FRAMES = 50
 
@@ -118,8 +114,8 @@ class Config:
             # 'TRANSFORMER' (default) or 'SSM' to use the Mamba state-space head.
             self.TEMPORAL_HEAD_TYPE = 'TRANSFORMER'
             # SSM (Mamba) temporal-head options; only used when TEMPORAL_HEAD_TYPE == 'SSM'.
-            # Prefer the official mamba_ssm CUDA library; auto-fallback to the built-in
-            # MambaBlock if it is not installed (so training never breaks on a missing lib).
+            # Official Mamba fails explicitly when unavailable. Setting False selects
+            # a different, custom recurrent SSM that must be labelled separately.
             self.SSM_USE_OFFICIAL_MAMBA = True
             self.SSM_NUM_LAYERS = 4
             self.SSM_D_STATE = 16
@@ -135,6 +131,8 @@ class Config:
     class TrainConfig:
         def __init__(self):
             self.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+            self.SEED = 42
+            self.EVIDENTIAL_ANNEAL_EPOCHS = 10
             self.LEARNING_RATE = 2e-5
             # BATCH_SIZE=32 OOMs a single RTX 4090 on the very first forward pass
             # (measured: 22.7GB used before crashing). 8 is confirmed to run cleanly

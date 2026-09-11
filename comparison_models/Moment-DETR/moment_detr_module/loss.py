@@ -10,6 +10,9 @@ class SetCriterion(nn.Module):
     def loss_spans(self, outputs, targets, indices):
         idx = self._get_src_permutation_idx(indices)
         src, target = outputs['pred_spans'][idx], torch.cat([t['spans'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        if src.numel() == 0:
+            zero = outputs['pred_spans'].sum()*0
+            return {'loss_span':zero,'loss_giou':zero}
         return {'loss_span': F.l1_loss(src, target, reduction='mean'), 'loss_giou': 1 - torch.diag(generalized_temporal_iou(span_cxw_to_xx(src), span_cxw_to_xx(target))).mean()}
     def loss_labels(self, outputs, targets, indices):
         src_logits = outputs['pred_logits']; idx = self._get_src_permutation_idx(indices)
@@ -36,4 +39,3 @@ class SetCriterion(nn.Module):
         # --- END OF BLOCK ---
 
         return losses
-

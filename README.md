@@ -1,259 +1,146 @@
-# An Explainable, Language-Guided Framework for Open-Set Temporal Localization in Endoscopic Videos
+# Language-Guided Endoscopy Localization
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
-[![Transformers](https://img.shields.io/badge/🤗%20Transformers-blue)](https://github.com/huggingface/transformers)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Research code for language-conditioned relevance scoring in Cholec80 videos.
+The main model combines a TimeSformer visual backbone, CLIP text encoder, a
+cross-attention head and a short-window temporal head. Optional components are
+LoRA, evidential binary outputs, and temporal/optical-flow consistency.
 
-This repository contains the official implementation for the dissertation titled: *“An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos”* by Soheil Jafarifard Bidgoli (MSc Computer Science, Aston University).
+This revision repairs data, training, checkpoint and evaluation defects. **New
+training and evaluation are required. Historical dissertation numbers are not
+validated results from this revision.** See [REPAIR_NOTES.md](REPAIR_NOTES.md) for
+the complete change/migration checklist and verification limits.
 
-The project introduces a novel framework for localizing arbitrary, language-described events in long-form surgical videos, moving beyond the limitations of traditional closed-set recognition models.
+## Environment
 
-## 🚀 Overview
+The local CPU checks use Python 3.12, PyTorch 2.5.1 and torchvision 0.20.1.
+Install the matching CPU or CUDA PyTorch build for the machine, then install
+`requirements.txt`. Run `python -m pytest tests -q` before an experiment.
+The optional official Mamba backend requires its own compatible CUDA installation;
+it is never silently replaced by the custom SSM.
 
-Surgical and endoscopic procedures generate vast amounts of video data. Clinicians often need to find specific moments, but traditional AI models can only recognize a fixed, predefined set of events (e.g., "Phase 1," "Phase 2"). This framework breaks that limitation by enabling **open-vocabulary temporal localization**. Users can query long, untrimmed videos with free-form natural language to find relevant events (e.g., *“find when the grasper retracts the gallbladder”*).
+## Data contract
 
-Our framework is built on three pillars:
-1.  **Open-Vocabulary Localization**: Leverages powerful vision-language models to understand and locate events described by arbitrary text queries, not just fixed labels.
-2.  **Architectural Scalability**: Employs a hybrid Transformer and Structured State Space Model (SSM) architecture to efficiently process long-form surgical videos, overcoming the quadratic complexity of traditional attention mechanisms.
-3.  **Trustworthiness & Explainability**: Integrates Evidential Deep Learning to quantify model uncertainty and provides visual attention maps to explain its predictions, fostering clinical trust and safety.
+- JPEG names contain **zero-based source-video frame IDs**, not positions in a
+  sparse folder: `CHOLEC80__video01/frame_0000025.jpg` means source frame 25.
+- `video_metadata.json` maps each video ID to `source_fps` and source
+  `frame_count`. Sampling defaults to 1 FPS; source FPS is read from metadata.
+  These tools assume constant-frame-rate videos.
+- Seven phase concepts and seven tool concepts have canonical IDs in
+  `data_contract.py`. A query's original sentence reaches the text encoder.
+  `query_kind` and `concept_id` identify its **supervised target**, including for
+  independently written paraphrases. These labels do not establish unseen-concept
+  generalization.
+- Missing tool observations have label `-100`; they are not negative labels.
+  Phase rows define intervals until the next phase row. Corrupt/missing images,
+  contradictory labels, and unrecognized targets stop a run.
+- Loose-frame folders and flat per-video ZIP archives are supported.
 
-### Visualizing Temporal Localization
-The following demonstration shows the framework successfully localizing the **"Calot triangle dissection phase"** in a 40-minute untrimmed procedure based solely on a natural language query.
+## Prepare and check a new run
 
-![Surgical Localization Demo](surgical_localization_demo.gif)
-*Query: "Calot triangle dissection phase" | Peak Confidence: 99.9%*
-## ✨ Key Features
+Use fresh output paths. Recover the original video split lists if comparing to a
+historical run. `create_splits.py` can create a **new** reproducible split using
+explicit ratios, but cannot recover old splits.
 
-* **End-to-End Open-Vocabulary TAL**: A complete pipeline from data preprocessing to language-guided inference for surgical video analysis.
-* **Flexible Vision Backbones**: Supports both a powerful **M²CRL** pretrained video transformer and a highly efficient **EndoMamba** (SSM) backbone for long-sequence modeling.
-* **Parameter-Efficient Fine-Tuning (PEFT)**: Uses Low-Rank Adaptation (**LoRA**) to efficiently adapt a pretrained CLIP text encoder to the surgical domain with minimal computational cost.
-* **Advanced Temporal Modeling**: Features a state-of-the-art **Mamba-based Temporal Head** that scales linearly with sequence length, making it ideal for hour-long procedural videos.
-* **Bi-Level Consistency Loss**: A novel training objective that enforces temporal consistency at both the semantic and spatial levels using optical flow (**RAFT**) to regularize the model.
-* **Uncertainty Quantification**: Implements **Evidential Deep Learning (EDL)** to allow the model to express its own confidence, reliably identifying out-of-distribution or ambiguous events.
-* **Built-in Explainability (XAI)**: Generates cross-modal attention maps to visualize which parts of a frame the model focused on to make its decision, a critical feature for clinical validation.
-* **Comprehensive Baseline Suite**: Includes code and instructions to benchmark against canonical baselines like **CLIP**, **X-CLIP**, **Moment-DETR**, and **TeCNO**.
-
-## 🏗️ Framework Architecture
-
-The system is a multi-stage pipeline designed to process spatial, semantic, and temporal information through specialized components:
-
-1.  **Vision Backbone**: A pretrained M²CRL model extracts a grid of powerful visual feature vectors from each video frame.
-2.  **Text Encoder**: A LoRA-adapted CLIP text encoder processes the natural language query into a semantic feature vector.
-3.  **Language-Guided Fusion Head**: A cross-modal transformer uses attention to fuse the visual and textual features. It identifies relevant spatial regions in the frame corresponding to the query, outputting initial `raw_scores`, intermediate features for the consistency loss, and `attention_weights` for XAI.
-4.  **Temporal Head (SSM/Mamba)**: This highly efficient head analyzes the sequence of fused features from the entire clip. It models long-range context to smooth predictions and fill gaps, producing final, contextually-aware `refined_scores`.
-5.  **Uncertainty & Prediction Head**: In its SOTA configuration, this head uses Evidential Deep Learning to output not just a final score but also the parameters of a Beta distribution (`evidential_output`), allowing for robust uncertainty quantification.
-
-## 📂 Repository Structure
-
-    Language-Guided-Endoscopy-Localization/
-    │
-    ├── backbone/                         # Vision backbones
-    │   ├── endomamba.py                  # EndoMamba (SSM-based backbone)
-    │   └── vision_transformer.py         # ViT-based backbone (M²CRL, etc.)
-    │
-    ├── checkpoints/                      # Saved checkpoints and logs
-    │
-    ├── comparison_models/                # Baseline and benchmark models
-    │   ├── clip_baseline/
-    │   │   └── clip_baseline.py          # CLIP zero-shot / linear probe
-    │   │
-    │   ├── Moment-DETR/                  # Moment-DETR temporal grounding
-    │   │   ├── run_evaluation.py
-    │   │   ├── run_feature_extraction.py
-    │   │   ├── run_preprocessing.py
-    │   │   ├── run_training.py
-    │   │   └── moment_detr_module/
-    │   │       ├── __init__.py
-    │   │       ├── configs.py
-    │   │       ├── dataset.py
-    │   │       ├── engine.py
-    │   │       ├── loss.py
-    │   │       ├── matcher.py
-    │   │       ├── modeling.py
-    │   │       ├── position_encoding.py
-    │   │       ├── transformer.py
-    │   │       ├── utils.py
-    │   │       └── README.md
-    │   │
-    │   └── xclip_baseline/               # X-CLIP video-language baseline
-    │       ├── train_xclip.py
-    │       ├── eval_xclip.py
-    │       ├── infer_xclip.py
-    │       ├── requirements.txt
-    │       ├── project_config.py
-    │       ├── README_XCLIP.md
-    │       └── xclip_package/
-    │           └── xclip/
-    │               ├── __init__.py
-    │               ├── data.py
-    │               ├── losses.py
-    │               ├── metrics.py
-    │               ├── model.py
-    │               └── utils.py
-    │
-    ├── dataset_preprocessing/            # Preprocessing for Cholec80 dataset
-    │   ├── create_splits.py
-    │   ├── extract_cholec80_frames.py
-    │   └── prepare_cholec80.py
-    │
-    ├── pretrained/                       # Pretrained model weights
-    │   └── checkpoint.pth
-    │
-    ├── dataset.py                        # Dataset wrapper
-    ├── inference.py                      # Inference script (language-guided)
-    ├── models.py                         # Main model components
-    ├── project_config.py                 # Config file for project settings
-    ├── train.py                          # Training entry point
-    │
-    ├── README.md                         # Project documentation
-    └── .gitignore
-
-
-## 🧑‍⚕️ Dataset: Cholec80
-
-This framework is developed and evaluated on the **Cholec80 dataset**, which contains 80 videos of laparoscopic cholecystectomy procedures. Our preprocessing pipeline transforms this dataset into a format suitable for open-vocabulary learning.
-
-### Preprocessing Pipeline
-
-1.  **Frame Extraction**: Videos are decoded into individual frames at a specified sampling rate.
-    ```bash
-    python dataset_preprocessing/extract_cholec80_frames.py --cholec80_videos_dir /path/to/videos --output_frames_dir /path/to/frames
-    ```
-2.  **Create Data Splits**: The 80 videos are randomly partitioned into training, validation, and test sets to ensure fair evaluation.
-    ```bash
-    python dataset_preprocessing/create_splits.py --video_dir /path/to/videos
-    ```
-3.  **Generate Language Triplets**: The core preprocessing step. This script reads the official phase and tool annotations and generates a CSV file of `(frame_path, text_query, relevance_label)` triplets. This creates positive and negative examples for training the vision-language alignment.
-    ```bash
-    # Run for each split
-    python dataset_preprocessing/prepare_cholec80.py --split train
-    python dataset_preprocessing/prepare_cholec80.py --split val
-    python dataset_preprocessing/prepare_cholec80.py --split test
-    ```
-
-## ⚙️ Setup and Usage
-
-### Installation
-
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/soheil-jafari/language-guided-endoscopy-localization.git
-    cd language-guided-endoscopy-localization
-    ```
-2.  Create a Python environment and install dependencies. We recommend using Conda.
-    ```bash
-    conda create -n endo-tal python=3.9 -y
-    conda activate endo-tal
-    pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu118
-    pip install -r requirements.txt 
-    ```
-
-3.  **Configuration**: Before running any scripts, review and update the paths in `project_config.py` to match your system's directory structure.
-
-### Training
-
-The main training script `train.py` handles model training with support for various configurations controlled by `project_config.py` and command-line arguments.
-
-* **To train the model from scratch or fine-tune:**
-    ```bash
-    python train.py
-    ```
-* **To fine-tune from an existing checkpoint:**
-    ```bash
-    python train.py --finetune_from /path/to/your/checkpoint.pth
-    ```
-* **To run in debug mode on a small data subset:**
-    ```bash
-    python train.py --debug
-    ```
-* **To adjust the training subset size (e.g., 50% of the data):**
-    ```bash
-    python train.py --subset 0.5
-    ```
-
-### Inference
-
-Use `inference.py` to run a trained model on a video to localize a specific language query.
-
-```bash
-python inference.py \
-    --video_path /path/to/your/video.mp4 \
-    --text_query "a grasper is present" \
-    --checkpoint_path /path/to/your/best_model.pth
+```sh
+python dataset_preprocessing/build_dataset.py annotations --phases /data/phase_annotations --tools /data/tool_annotations --output /data/parsed_v2.csv
+python dataset_preprocessing/build_dataset.py extract --videos /data/videos --frames /data/frames_v2 --metadata /data/video_metadata.json --sample-fps 1
 ```
-## 📈 Performance & Key Results
 
-The framework was evaluated on the held-out Cholec80 test split (8 full-length videos). Despite the computational constraints limiting training to only **4 epochs**, the model demonstrated state-of-the-art potential in frame-level discrimination.
+A split JSON has exactly `train`, `val`, and `test` lists containing standardized
+video IDs such as `CHOLEC80__video01`. For a deliberately new split, use:
 
-### Quantitative Benchmarking
-Our framework significantly outperforms general-domain baselines when applied to the specialized surgical environment.
-
-| Model | AUROC (Discrimination) | AUPRC (Precision-Recall) | Best F1-Score |
-| :--- | :--- | :--- | :--- |
-| **Proposed Framework (4 Epochs)** | **0.933** | **0.887** | **0.820** |
-| CLIP Baseline (Linear Probe) | 0.52 | 0.08 | 0.10 |
-| X-CLIP Baseline | 0.50 | 0.07 | 0.12 |
-| Moment-DETR | 0.51 | 0.06 | 0.11 |
-
-*Note: Baselines were trained and evaluated under identical conditions using the same Cholec80 splits.*
-
-### Visualizing Model Accuracy
-The following Precision-Recall curve demonstrates the framework's ability to maintain high precision across various recall levels, achieving an AUPRC of 0.887.
-
-![Precision-Recall Curve](pr_curve.png)
-
-### Qualitative Success
-In a focused case study on the **"Calot triangle dissection phase"** (Video 05), the model successfully identified the correct temporal neighborhood, achieving a peak confidence score of **0.9994**.
-
-### Temporal Localization Analysis
-The timeline below illustrates the model's activation scores across Video 05. Note the distinct probability peak aligned with the "Calot triangle dissection phase" ground truth.
-
-![Temporal Localization Timeline](timeline.png)
-
-📊 Baselines and Comparisons
-This repository includes the necessary code and instructions to benchmark our framework against three key families of models:
-
-* General Vision-Language Models: For open-set, text-driven evaluation.
-* CLIP: Zero-shot and linear-probe per-frame relevance scoring.
-* X-CLIP: A powerful video-language model for scoring short clips.
-* Temporal Grounding Models: For the direct task of localizing events from text.
-* Moment-DETR: Predicts start/end boundaries from a language query.
-* Surgical Specialist Models: Closed-set baselines trained specifically for Cholec80.
-* TeCNO: A temporal convolutional network for surgical phase recognition.
-* The code for these baselines can be found in the comparison_models/ directory. Each subfolder contains a README with specific instructions for running that model.
-
-## 🔍 Explainability & Trustworthiness
-
-In high-stakes clinical environments, "black-box" predictions are insufficient. This framework integrates designed-in trustworthiness through two key mechanisms:
-
-### 1. Uncertainty Quantification (EDL)
-The system employs **Evidential Deep Learning (EDL)** to predict the parameters of a Beta distribution ($\alpha, \beta$) for every frame. 
-* **Inverse Uncertainty**: The total evidence ($S_t = \alpha_t + \beta_t$) provides an explicit measure of model confidence.
-* **Safety**: This allows the system to flag ambiguous or out-of-distribution events that require human surgeon review.
-
-### 2. Visual Rationales
-The framework generates **Cross-Modal Attention Maps** to visualize the model's reasoning. 
-* **Focus**: These heatmaps highlight the specific surgical tools (e.g., clip applier, grasper) or anatomical structures the model prioritized during a query.
-* **Validation**: This provides clinicians with interpretable evidence that aligns AI predictions with familiar visual cues.
-
-### 📚 Citation
-If you use this framework or ideas from our work in your research, please cite the following dissertation:
-
-Code snippet
-```bash
-@mastersthesis{jafarifard2025,
-  title={An Explainable, Language-Guided Framework for Open-Set Temporal Localization on Endoscopic Videos},
-  author={Soheil Jafarifard Bidgoli},
-  school={Aston University},
-  year={2025}
-}
+```sh
+python dataset_preprocessing/create_splits.py --metadata /data/video_metadata.json --output /data/splits_v2.json --train-ratio 0.8 --val-ratio 0.1 --seed 42
+python dataset_preprocessing/build_dataset.py triplets --annotations /data/parsed_v2.csv --metadata /data/video_metadata.json --frames /data/frames_v2 --splits /data/splits_v2.json --output /data/triplets_v2 --sample-fps 1
+python audit_data.py --train /data/triplets_v2/cholec80_train_triplets.csv --val /data/triplets_v2/cholec80_val_triplets.csv --test /data/triplets_v2/cholec80_test_triplets.csv --annotations /data/parsed_v2.csv --metadata /data/video_metadata.json --frames /data/frames_v2 --output /data/preflight_v2.json --decode-all
 ```
-### 🤝 Acknowledgements
-This work was completed as part of the CS4700 Dissertation for the MSc in Computer Science at Aston University.
 
-Supervisor: Dr. Zhuangzhuang Dai.
+The extractor refuses existing video folders/archives. Existing correctly indexed
+frames can be reused with independently verified source metadata and a successful
+preflight; a folder's JPEG count is not source-video duration.
 
-This project builds upon the foundational work of the Cholec80 dataset creators and the authors of M²CRL, VideoMamba, CLIP, Moment-DETR, and other referenced works.
-    
-       
+## Train and resume
+
+Edit a JSON configuration override; an example is
+[`examples/run_config.json`](examples/run_config.json). Set actual data,
+pretrained-backbone and new checkpoint paths. Unknown configuration fields fail.
+An empty backbone-weight path deliberately selects random visual initialization;
+a nonempty missing/incompatible path is an error.
+
+```sh
+python train.py --config examples/run_config.json
+python train.py --config examples/run_config.json --resume_from /runs/new_run/latest_model.pth
+```
+
+Resume restores an **epoch-boundary** checkpoint, not a partially completed batch.
+It requires matching configuration and input-file fingerprints. `--finetune_from`
+loads same-architecture weights strictly and starts a new experiment. Old checkpoints
+lacking the repaired metadata are not accepted as repaired-run inference/resume.
+
+## Export predictions and evaluate
+
+Use full split manifests for evaluation. Training subsets never reduce validation.
+The proposed model exports one averaged score per video/query/source-frame:
+
+```sh
+python predict.py --checkpoint /runs/new_run/best_model.pth --triplets /data/triplets_v2/cholec80_val_triplets.csv --metadata /data/video_metadata.json --frames /data/frames_v2 --annotations /data/parsed_v2.csv --output /results/proposed_val.csv
+python build_reference.py --triplets /data/triplets_v2/cholec80_val_triplets.csv --metadata /data/video_metadata.json --frames /data/frames_v2 --annotations /data/parsed_v2.csv --output /results/val_reference.csv
+python evaluate.py --predictions /results/proposed_val.csv --reference /results/val_reference.csv --split validation --select-threshold --output /results/proposed_calibration.json
+```
+
+Repeat the two exports on the **test** manifest, then evaluate with the saved
+validation operating threshold:
+
+```sh
+python evaluate.py --predictions /results/proposed_test.csv --reference /results/test_reference.csv --split test --calibration /results/proposed_calibration.json --output /results/proposed_test_metrics.json
+```
+
+Frame reports contain AP, AUROC, fixed-threshold F1, Brier score, ECE, and AURC,
+with per-video and per-query breakdowns. Undefined metrics are `null`. EDL runs
+also export evidence uncertainty and report its separate error-ranking AURC.
+Confidence/uncertainty is not proof of unknown-event recognition.
+
+For a standalone video and arbitrary sentence:
+
+```sh
+python inference.py --checkpoint /runs/new_run/best_model.pth --video /data/videos/video01.mp4 --query "Calot triangle dissection phase" --output /results/example
+```
+
+`--raw-patch-maps` exports raw relevance-head patch logits, **not attention maps
+or explanations of the final temporal score**. Inference uses short windows and
+does not carry hour-long state.
+
+## Baselines and temporal metrics
+
+`benchmark.py` runs Hugging Face CLIP or Microsoft's X-CLIP on the shared frame
+grid. Specify the exact pretrained model name; it is saved with the output.
+`train_xclip.py` is an adapted supervised contrastive training script. It uses
+the official model's video/text logits and observed multi-positive targets.
+These are not a CLIP linear probe or the original papers' evaluation protocols.
+
+```sh
+python benchmark.py --model clip --model-name openai/clip-vit-large-patch14 --triplets /data/triplets_v2/cholec80_val_triplets.csv --metadata /data/video_metadata.json --frames /data/frames_v2 --annotations /data/parsed_v2.csv --output /results/clip_val.csv
+```
+
+Run `python benchmark.py --help` and `python train_xclip.py --help` for X-CLIP
+options. Scores are rescaled cosine similarities, not calibrated probabilities;
+select each model's threshold on validation only. Microsoft's X-CLIP is the
+Ni et al. model; do not identify it as the different Ma et al. retrieval model.
+
+The code in `comparison_models/Moment-DETR` is a **ResNet50/RoBERTa adapted DETR**,
+not an official Moment-DETR reproduction. Its revised preprocessing groups all
+spans for a video/query and keeps absent queries. See that directory's README.
+
+Use its `run_preprocessing.py` to create complete sampled-grid reference segments.
+`export_segments.py` converts proposed/CLIP/X-CLIP frame CSVs against that same
+reference; it requires a fixed threshold or a validation calibration JSON. Then:
+
+```sh
+python evaluate.py --segments --predictions /results/model_segments.jsonl --reference /data/moment/test.jsonl --split test --output /results/model_temporal_metrics.json
+```
+
+Temporal reports distinguish pooled AP at tIoU 0.3/0.5/0.7, positive-query R@1,
+and absent-query false alarms. AP at one tIoU is not labelled an overall mAP.
+Incomplete tool annotations cannot be silently converted into complete absence
+or segment targets. Old evaluation entry points delegate to the new explicit-input
+CLIs; old arguments and implicit artifact searches have been retired.

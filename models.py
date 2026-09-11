@@ -15,6 +15,8 @@ from backbone.vision_transformer import VisionTransformer, load_pretrained, _cfg
 class LoRALinear(nn.Module):
     def __init__(self, linear_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
+        if r <= 0:
+            raise ValueError('LoRA rank must be positive')
         self.r = r
         self.alpha = alpha
         self.dropout = nn.Dropout(dropout)
@@ -31,7 +33,7 @@ class LoRALinear(nn.Module):
 
     def forward(self, x):
         original_output = F.linear(x, self.original_weight, self.original_bias)
-        lora_output = (self.dropout(x @ self.lora_A) @ self.lora_B) * (self.alpha / self.r)
+        lora_output = (self.dropout(x) @ self.lora_A @ self.lora_B) * (self.alpha / self.r)
         return original_output + lora_output
 
 def apply_lora_to_linear_layers_selective(module, r=8, alpha=16, dropout=0.0, name_filter=None, _prefix=""):
@@ -72,13 +74,14 @@ class ConfidenceAwareFusion(nn.Module):
             nn.Sigmoid() # Squeezes the output to a score between 0 and 1
         )
 
-    def forward(self, visual_features, text_features_expanded):
+    def forward(self, visual_features, text_features_expanded, text_mask):
         # visual_features: (B*T, N_patches, C)
         # text_features_expanded: (B*T, L, C)
 
         # Create a single summary vector for all visual patches and all text tokens
         avg_visual = visual_features.mean(dim=1) # Shape: (B*T, C)
-        avg_text = text_features_expanded.mean(dim=1) # Shape: (B*T, C)
+        weights = text_mask.to(text_features_expanded.dtype).unsqueeze(-1)
+        avg_text = (text_features_expanded * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
 
         # Concatenate the summaries and compute the confidence score
         combined_features = torch.cat([avg_visual, avg_text], dim=1)
@@ -86,8 +89,8 @@ class ConfidenceAwareFusion(nn.Module):
 
         return confidence_scores
 
-# --- Self-Contained Mamba Block Implementation ---
-class MambaBlock(nn.Module):
+# Custom recurrent SSM, distinct from the official selective Mamba architecture.
+class CustomSSMBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
         self.d_model = d_model
@@ -100,8 +103,7 @@ class MambaBlock(nn.Module):
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner, out_channels=self.d_inner,
             bias=True, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, padding_mode='zeros'
-        ).to(memory_format=torch.channels_last)
-        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)
+        )
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
         self.act = nn.SiLU()
 
@@ -156,13 +158,14 @@ class TextEncoder(nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(config.MODEL.TEXT_ENCODER_MODEL)
         self.embed_dim = self.text_encoder.config.hidden_size
         if config.TRAIN.USE_PEFT:
+            self.text_encoder.requires_grad_(False)
             # Restrict LoRA to the modules named in config (default: q_proj/v_proj),
             # instead of wrapping every Linear in the text encoder.
             target_modules = config.TRAIN.LORA_TARGET_MODULES
             apply_lora_to_linear_layers_selective(
                 self.text_encoder, r=config.TRAIN.LORA_R, alpha=config.TRAIN.LORA_ALPHA,
                 dropout=config.TRAIN.LORA_DROPOUT,
-                name_filter=lambda full_name: any(t in full_name for t in target_modules)
+                name_filter=lambda full_name: full_name.rsplit('.', 1)[-1] in target_modules
             )
             print(f"LoRA applied to Text Encoder modules matching {target_modules}.")
 
@@ -174,7 +177,7 @@ class TextEncoder(nn.Module):
 
 
 class LanguageGuidedHead(nn.Module):
-    def __init__(self, visual_embed_dim, text_embed_dim, num_attention_heads=8, num_layers=2):
+    def __init__(self, visual_embed_dim, text_embed_dim, num_attention_heads=8, num_layers=2, use_confidence_fusion=False):
         super().__init__()
         decoder_layer = nn.TransformerDecoderLayer(d_model=visual_embed_dim, nhead=num_attention_heads,
                                                    dim_feedforward=visual_embed_dim * 4,
@@ -186,14 +189,14 @@ class LanguageGuidedHead(nn.Module):
         # explainability map. Because it is linear,
         #     fc_relevance(mean_patches(F)) == mean_patches(fc_relevance(F)),
         # so the per-patch map is an exact additive decomposition of the frame's
-        # relevance logit across space (a faithful attribution, not a post-hoc proxy).
+        # RAW relevance logit across space; it does not explain the final temporal score.
         # Kept OFF during training (zero overhead); flip on for inference/visualization
         # via `model.language_guided_head.return_xai_map = True`.
         self.return_xai_map = False
         self.fc_relevance = nn.Linear(visual_embed_dim, 1)
         self.text_proj = nn.Linear(text_embed_dim, visual_embed_dim)
 
-        if config.MODEL.USE_CONFIDENCE_FUSION:
+        if use_confidence_fusion:
             self.confidence_module = ConfidenceAwareFusion(visual_embed_dim)
         else:
             self.confidence_module = None
@@ -209,7 +212,7 @@ class LanguageGuidedHead(nn.Module):
         text_mask_expanded = text_attention_mask.unsqueeze(1).expand(-1, T_frames, -1).reshape(B_T, L_text)
 
         if self.confidence_module is not None:
-            confidence_scores = self.confidence_module(visual_features, text_features_expanded)
+            confidence_scores = self.confidence_module(visual_features, text_features_expanded, text_mask_expanded)
             visual_features = visual_features * confidence_scores.unsqueeze(1)
 
         # Cross-attention fusion: visual patches (query) attend over the text tokens
@@ -229,7 +232,7 @@ class LanguageGuidedHead(nn.Module):
         # every fused patch feature to get a per-patch relevance logit (B_T, N_patches).
         # Since the frame relevance is fc_relevance of the mean-pooled feature and
         # fc_relevance is linear, this map is an exact additive decomposition of that
-        # relevance logit across space -- a faithful attribution rather than a proxy
+        # raw relevance logit across space; it is not an explanation of the final score
         # derived from a single attention layer. It is NOT a softmax distribution, so
         # (unlike raw patch->text cross-attention averaged over the text axis) it retains
         # genuine spatial contrast instead of collapsing to a constant.
@@ -268,12 +271,8 @@ class TemporalHeadSSM(nn.Module):
     mapping a (B, T, D) sequence to (B, T, D), followed by a norm and an output
     projection.
 
-    The mixer is selected at build time:
-      * If `use_official_mamba` is True AND the `mamba_ssm` CUDA library imports
-        successfully, the fast official `mamba_ssm.Mamba` is used.
-      * Otherwise it falls back to the self-contained `MambaBlock` in this file,
-        so the head works even when `mamba_ssm` is not installed.
-    Both implementations expose the same (B, L, D) -> (B, L, D) interface.
+    True requires the official mamba_ssm implementation. False explicitly selects
+    CustomSSMBlock, a different architecture. There is no automatic substitution.
     """
 
     def __init__(self, input_dim, output_dim, num_layers=4, use_official_mamba=True,
@@ -290,16 +289,14 @@ class TemporalHeadSSM(nn.Module):
 
                 print("[SSM] TemporalHeadSSM using official mamba_ssm.Mamba mixer.")
             except Exception as e:
-                mixer_factory = None
-                print(f"[SSM] mamba_ssm unavailable ({type(e).__name__}: {e}); "
-                      f"falling back to built-in MambaBlock.")
+                raise RuntimeError('Official Mamba requested but unavailable. Install mamba_ssm, or explicitly select the custom SSM; they are different architectures.') from e
 
         if mixer_factory is None:
             def mixer_factory():
-                return MambaBlock(d_model=input_dim, d_state=d_state, d_conv=d_conv, expand=expand)
+                return CustomSSMBlock(d_model=input_dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
             if use_official_mamba is False:
-                print("[SSM] TemporalHeadSSM using built-in MambaBlock (official Mamba disabled by config).")
+                print('[SSM] Using explicitly selected custom recurrent SSM (not official Mamba).')
 
         self.layers = nn.ModuleList([mixer_factory() for _ in range(num_layers)])
         self.norm = nn.LayerNorm(input_dim)
@@ -320,7 +317,7 @@ class TemporalHeadSSM(nn.Module):
 
 
 class LocalizationFramework(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, initialize_backbone=True):
         super().__init__()
         self.config = config
 
@@ -334,7 +331,9 @@ class LocalizationFramework(nn.Module):
                 attention_type=config.TIMESFORMER.ATTENTION_TYPE,
                 use_checkpoint=getattr(config.TRAIN, "USE_GRADIENT_CHECKPOINTING", False)
             )
-            if config.MODEL.M2CRL_WEIGHTS_PATH and os.path.exists(config.MODEL.M2CRL_WEIGHTS_PATH):
+            if initialize_backbone and config.MODEL.M2CRL_WEIGHTS_PATH:
+                if not os.path.isfile(config.MODEL.M2CRL_WEIGHTS_PATH):
+                    raise FileNotFoundError(config.MODEL.M2CRL_WEIGHTS_PATH)
                 load_pretrained(
                     self.vision_backbone, cfg=_cfg(), num_classes=0,
                     img_size=config.DATA.TRAIN_CROP_SIZE,
@@ -345,10 +344,7 @@ class LocalizationFramework(nn.Module):
                 )
                 print(f"Loaded pretrained M2CRL weights from {config.MODEL.M2CRL_WEIGHTS_PATH}")
         elif config.MODEL.VISION_BACKBONE_NAME == 'EndoMamba':
-            # This part is a placeholder
-            print("Initializing Vision Backbone: EndoMamba (Conceptual)")
-            self.vision_backbone = VisionTransformer(img_size=config.DATA.TRAIN_CROP_SIZE,
-                                                     num_frames=config.DATA.NUM_FRAMES)
+            raise NotImplementedError('EndoMamba is not integrated. The former branch constructed a TimeSformer. An official checkpoint-compatible implementation is required.')
         else:
             raise ValueError(f"Unknown VISION_BACKBONE_NAME: {config.MODEL.VISION_BACKBONE_NAME}")
 
@@ -375,7 +371,8 @@ class LocalizationFramework(nn.Module):
         self.language_guided_head = LanguageGuidedHead(visual_embed_dim=self.vision_embed_dim,
                                                        text_embed_dim=self.text_encoder.embed_dim,
                                                        num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
-                                                       num_layers=config.MODEL.HEAD_NUM_LAYERS)
+                                                       num_layers=config.MODEL.HEAD_NUM_LAYERS,
+                                                       use_confidence_fusion=config.MODEL.USE_CONFIDENCE_FUSION)
 
         output_dim = 2 if config.MODEL.USE_UNCERTAINTY else 1
         if config.MODEL.TEMPORAL_HEAD_TYPE == 'SSM':
@@ -388,10 +385,12 @@ class LocalizationFramework(nn.Module):
                 d_conv=getattr(config.MODEL, 'SSM_D_CONV', 4),
                 expand=getattr(config.MODEL, 'SSM_EXPAND', 2),
             )
-        else:  # 'TRANSFORMER'
+        elif config.MODEL.TEMPORAL_HEAD_TYPE == 'TRANSFORMER':
             self.temporal_head = TemporalHead(input_dim=self.vision_embed_dim, output_dim=output_dim,
                                               num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
                                               num_layers=config.MODEL.HEAD_NUM_LAYERS)
+        else:
+            raise ValueError(f'Unknown temporal head: {config.MODEL.TEMPORAL_HEAD_TYPE}')
 
     def forward(self, video_clip, input_ids, attention_mask, text_features=None):
         B, _, T, H, W = video_clip.shape
@@ -413,7 +412,7 @@ class LocalizationFramework(nn.Module):
         )
 
         if xai_weights is not None:
-            # (B*T, N_patches) -> (B, T, num_patches_h, num_patches_w) spatial attention map
+            # Raw relevance-head patch logit map, not an attention map.
             xai_weights = xai_weights.reshape(B, T, num_patches_h, num_patches_w)
 
         semantic_features_reshaped = semantic_features_for_temporal.reshape(B, T, self.vision_embed_dim)
@@ -429,7 +428,7 @@ class LocalizationFramework(nn.Module):
         final_output = self.temporal_head(semantic_features_reshaped)
 
         if self.config.MODEL.USE_UNCERTAINTY:
-            # The four evidential parameters are the final output for the loss function.
+            # Two nonnegative evidence values: positive class, negative class.
             evidential_params = final_output
 
             # The single 'refined_score' is for validation/inference, not the primary loss here.
@@ -448,4 +447,3 @@ class LocalizationFramework(nn.Module):
             # The evidential_output is None.
             return (refined_scores, raw_relevance_scores, xai_weights,
                     semantic_features_reshaped, spatial_features_reshaped, None)
-
