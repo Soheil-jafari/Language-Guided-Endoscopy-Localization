@@ -2,8 +2,10 @@
 
 Frame IDs always refer to the zero-based source video frame. Metadata is a JSON
 mapping video_id -> {source_fps, frame_count}; frame_count is the SOURCE count.
-Phase annotations describe intervals until the next phase row. Tool annotations
-are observations at exact source frames; missing observations stay unknown (-100).
+Phase annotations describe intervals until the next phase row; the final phase
+interval ends at the last annotated frame of that video (any row type), and frames
+after it are unknown (-100), never an extrapolated phase. Tool annotations are
+observations at exact source frames; missing observations stay unknown (-100).
 """
 import json
 import re
@@ -88,6 +90,38 @@ def load_video_metadata(path):
             raise ValueError(f'Invalid source_fps/frame_count for {video}')
         row['source_fps'], row['frame_count'] = fps, count
     return metadata
+
+
+FPS_SNAP_TOLERANCE = 0.01
+FRAME_COUNT_TOLERANCE = 0.01
+FRAME_COUNT_TOLERANCE_FRAMES = 2
+
+
+def snap_fps(fps, tolerance=FPS_SNAP_TOLERANCE):
+    """Round container FPS that is within `tolerance` of an integer (e.g. 24.99 -> 25).
+
+    Tool annotations exist only at exact multiples of the nominal source rate, so a
+    reported 24.9999 would move every sampled index off the annotated frames.
+    Genuine fractional rates (29.97) are left unchanged.
+    """
+    fps = float(fps)
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError(f'Invalid source FPS: {fps}')
+    nearest = round(fps)
+    return float(nearest) if nearest > 0 and abs(fps - nearest) <= tolerance else fps
+
+
+def check_decoded_count(decoded, reported, name=''):
+    """Container frame counts are estimates. Accept small overestimates; refuse
+    an empty or clearly truncated decode. The decoded count is authoritative."""
+    decoded, reported = int(decoded), int(reported)
+    if decoded <= 0:
+        raise OSError(f'No frames decoded from {name}')
+    allowed = max(FRAME_COUNT_TOLERANCE_FRAMES, int(np.ceil(FRAME_COUNT_TOLERANCE * max(reported, 0))))
+    if decoded < reported - allowed:
+        raise OSError(f'{name}: decoded {decoded} frames but the container reports {reported}; '
+                      f'more than {allowed} missing suggests a truncated/corrupt file')
+    return decoded
 
 
 def sample_indices(frame_count, source_fps, sample_fps):
@@ -210,6 +244,8 @@ class AnnotationIndex:
                 self.tools[key] = int(value)
         for (video, idx), phase in sorted(phase_rows.items()):
             self.phases.setdefault(video, []).append((idx, phase))
+        if not tool_cols and not phase_rows:
+            raise ValueError('Annotations contain neither phase labels nor tool columns')
         # Dense phase rows carry the same interval label repeatedly. Retain only
         # changes so each DataLoader worker does not duplicate a per-frame table.
         for video,rows in self.phases.items():
@@ -221,7 +257,8 @@ class AnnotationIndex:
         if kind == 'tool':
             return self.tools.get((video, int(idx), concept_id), IGNORE_INDEX)
         rows = self.phases.get(video)
-        if rows is None:
+        # No phase is extrapolated past the last annotated frame of the video.
+        if rows is None or int(idx) > self.maximum_frame.get(video, -1):
             return IGNORE_INDEX
         pos = np.searchsorted(rows[:, 0], idx, side='right') - 1
         return IGNORE_INDEX if pos < 0 else int(rows[pos, 1] == concept_id)

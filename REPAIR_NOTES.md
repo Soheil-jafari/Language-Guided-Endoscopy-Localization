@@ -1,9 +1,35 @@
 # Repair and migration notes
 
-Base revision: `f4e68e3c4f29603a613c7b63e7175bf9b3c61ff2`.
-This patch supersedes the earlier limited `audit_fixes.patch`. Apply it to the
-base revision, not on top of that earlier patch. No GitHub commits or pushes were
-made. There are no new Cholec80 performance results in this package.
+Revision history:
+
+- Revision 1: `audit_fixes.patch` (superseded).
+- Revision 2: commit `7b6ba8e` ("Repair data, training, inference, and evaluation
+  pipelines"), on top of base `f4e68e3c4f29603a613c7b63e7175bf9b3c61ff2`. Its
+  change table is the second section below.
+- Revision 3: this revision (first section below). It changes the model state
+  dictionary and the training-window definition, so revision-2 checkpoints and
+  training curves are not comparable to revision-3 runs.
+
+There are no new Cholec80 performance results in this repository. Every number
+reported for this code must come from a run of the current revision.
+
+## Revision 3 changes
+
+| Area | Change |
+|---|---|
+| Backbone fidelity | `Block` gains the TimeSformer `temporal_fc` projection on the temporal-attention residual (zero-initialised after block 0, as in the reference implementation). Checkpoint key `time_embed` is renamed to `temporal_embed` on load. `pos_embed` / `temporal_embed` are resized on load when the pretraining grid or clip length differs. |
+| Backbone loading | The 90 % coverage heuristic is gone. Every model tensor must come from the checkpoint and every checkpoint tensor must have a destination; shape mismatches are errors. Exceptions are declared in `MODEL.BACKBONE_IGNORE_UNEXPECTED_PREFIXES` (default `["head."]`) and `MODEL.BACKBONE_ALLOW_MISSING_KEYS` (default empty). The full missing/unexpected/ignored lists are always printed. `strict=False` is rejected. |
+| Video decoding | Extraction and `inference.py` decode to end of stream. The container's `CAP_PROP_FRAME_COUNT` is treated as an estimate: the decoded count is recorded as `frame_count` (the reported value is kept as `reported_frame_count`), overestimates of up to max(2, 1 %) frames are tolerated, and a clearly truncated decode is an error. Grid membership is computed from the fixed sample-time sequence, so it never depends on the estimate. A failed video's partial frame folder is removed. |
+| Source FPS | `snap_fps` rounds a container FPS within 0.01 of an integer (24.9999 -> 25) so the 1 FPS grid stays on the tool-annotated frames; genuine fractional rates (29.97) are unchanged. Both values are stored in `video_metadata.json`. |
+| Phase intervals | The final phase interval ends at the last annotated frame of the video (any row type). Frames after it are `-100`, not an extrapolated phase. |
+| Training windows | Windows are cut on a fixed stride per (video, query) (`DATA.TRAIN_WINDOW_STRIDE`, default half a window) and only windows with an observed target are kept, instead of one window per triplet row. An epoch is now one pass over a defined set. `TRAIN.POSITIVE_WINDOW_WEIGHT` optionally oversamples windows containing a positive frame through a weighted sampler driven by the global torch RNG (exact resume still holds). Triplet rows are still validated against the annotations. |
+| Preprocessing | Training augmentation acts on the frame after the same full-frame square resize used at evaluation (`DATA.TRAIN_AUG_SCALE`, `DATA.TRAIN_AUG_RATIO`), so train and evaluation share field of view and aspect distortion. |
+| Temporal head | `TemporalHead` has a learned positional embedding of length `DATA.CLIP_LENGTH` and refuses longer inputs. |
+| Configuration | Removed unused fields: `MODEL.EMBED_DIM`, `MODEL.ENDOMAMBA_WEIGHTS_PATH`, `DATA.AUGMENT_PROB`, `DATA.FRAME_RATE`, `DATA.NUM_INFERENCE_FRAMES`, `INFER_IMG_SIZE`, `SEGMENT_THRESHOLD`, `LABEL_TO_TEXT_QUERY` (superseded by `data_contract.ALIASES`), `TIMESFORMER.PRETRAINED_MODEL`. |
+| Repository | Added `LICENSE` (MIT). `.idea/` untracked and ignored. Removed the stray `comparison_models/xclip_baseline/xclip_package/xclip_package` duplicate of `project_config.py`. `benchmark.py` no longer carries a dead default model name. |
+| Verification | `tests/test_revision3.py` covers each item above. The full suite (45 tests) passes on CPU with the pinned `requirements.txt` versions (Python 3.12, torch 2.5.1, transformers 4.44.2, pandas 3.0.1, numpy 2.3.5). An end-to-end CPU run of `build_dataset` -> `audit_data` -> `train` (with resume) -> `predict` -> `build_reference` -> `evaluate` -> `inference` on synthetic videos with tiny models completes. Not validated: the real M2CRL checkpoint key set (run the model constructor on the server and read the printed backbone load line), GPU/AMP behaviour, throughput, and any accuracy claim. |
+
+## Revision 2 changes
 
 ## Implemented repairs
 

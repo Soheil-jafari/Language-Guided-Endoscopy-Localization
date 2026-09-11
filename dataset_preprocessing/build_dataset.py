@@ -5,11 +5,13 @@ Phase labels represent annotated intervals; sparse tool labels remain observatio
 """
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import pandas as pd
-from data_contract import AnnotationIndex, FrameStore, canonical_query, load_video_metadata, sample_indices
+from data_contract import (AnnotationIndex, FrameStore, canonical_query, check_decoded_count,
+                           load_video_metadata, sample_indices, snap_fps)
 
 
 def parse_annotations(phases,tools,output):
@@ -36,6 +38,15 @@ def parse_annotations(phases,tools,output):
 
 
 def extract(videos, frames, metadata, sample_fps):
+    """Decode every video to EOF and write the frames on the sampling grid.
+
+    The container's frame count is only an estimate; the decoded count is what is
+    recorded as `frame_count` and what every later grid is built from. Small
+    overestimates are tolerated (see data_contract.check_decoded_count); a clearly
+    truncated decode is an error. Source FPS within 0.01 of an integer is snapped so
+    the 1 FPS grid stays on the tool-annotated frames. A failed video's partial
+    folder is removed so the run can be retried.
+    """
     import cv2
     videos,frames,metadata=Path(videos),Path(frames),Path(metadata)
     if metadata.exists(): raise FileExistsError(metadata)
@@ -48,19 +59,31 @@ def extract(videos, frames, metadata, sample_fps):
         if destination.exists() or destination.with_suffix('.zip').exists(): raise FileExistsError(destination)
         cap=cv2.VideoCapture(str(source))
         if not cap.isOpened(): raise OSError(f'Cannot open {source}')
-        fps=float(cap.get(cv2.CAP_PROP_FPS)); count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        grid=sample_indices(count,fps,sample_fps)
+        reported_fps=float(cap.get(cv2.CAP_PROP_FPS)); fps=snap_fps(reported_fps)
+        reported=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Grid membership does not depend on the (unreliable) total: sample times are
+        # a fixed sequence, so build it for a generous bound and truncate afterwards.
+        bound=2*max(reported,0)+100_000
+        wanted=set(map(int,sample_indices(bound,fps,sample_fps)))
         destination.mkdir(parents=True)
-        wanted=set(map(int,grid)); decoded=0
+        decoded=0
         try:
-            while decoded<count:
+            while True:
                 ok,image=cap.read()
-                if not ok: raise OSError(f'Decode failed at {source}:{decoded}; incomplete output must be removed before retry')
+                if not ok: break
                 if decoded in wanted and not cv2.imwrite(str(destination/f'frame_{decoded:07d}.jpg'),image):
                     raise OSError('JPEG write failed')
                 decoded+=1
+            if decoded>=bound: raise OSError(f'{source}: decoded more frames than the safety bound {bound}')
+            check_decoded_count(decoded,reported,str(source))
+            grid=sample_indices(decoded,fps,sample_fps)
+            written={int(p.stem.split('_')[1]) for p in destination.glob('frame_*.jpg')}
+            if set(map(int,grid))-written: raise OSError(f'{source}: sampled frames missing after decode')
+        except Exception:
+            shutil.rmtree(destination,ignore_errors=True); raise
         finally: cap.release()
-        result[video]=dict(source_fps=fps,frame_count=count,sample_fps=sample_fps,source_file=str(source.resolve()))
+        result[video]=dict(source_fps=fps,frame_count=decoded,reported_fps=reported_fps,reported_frame_count=reported,
+                           sample_fps=sample_fps,source_file=str(source.resolve()))
     metadata.parent.mkdir(parents=True,exist_ok=True)
     metadata.write_text(json.dumps(result,indent=2))
 

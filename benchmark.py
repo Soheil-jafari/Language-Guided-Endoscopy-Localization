@@ -40,7 +40,7 @@ def main():
     if Path(a.output).exists(): raise FileExistsError(a.output)
     if a.batch_size<1: raise ValueError('Batch size must be positive')
     from transformers import CLIPModel,CLIPProcessor,XCLIPModel,XCLIPProcessor
-    name=a.model_name or ('openai/clip-vit-large-patch14' if a.model=='clip' else 'microsoft/xclip-base-patch32')
+    name=a.model_name
     model=(CLIPModel if a.model=='clip' else XCLIPModel).from_pretrained(name).to(a.device).eval()
     processor=(CLIPProcessor if a.model=='clip' else XCLIPProcessor).from_pretrained(name)
     if a.checkpoint:

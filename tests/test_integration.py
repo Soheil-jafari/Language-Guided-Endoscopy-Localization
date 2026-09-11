@@ -23,8 +23,10 @@ def test_dataset_real_files_full_validation_and_leakage(tmp_path):
         folder=tmp_path/'frames'/video; folder.mkdir(parents=True)
         metadata[video]=dict(source_fps=25,frame_count=125)
         for i in range(0,125,25): Image.new('RGB',(20,20),(i,0,0)).save(folder/f'frame_{i:07d}.jpg')
+        # The final phase interval ends at the last annotated frame (100); frames after it are unknown.
         annotations.extend([dict(standardized_video_id=video,frame_idx=0,original_label='Preparation',grasper=1),
-                            dict(standardized_video_id=video,frame_idx=50,original_label='CalotTriangleDissection',grasper=0)])
+                            dict(standardized_video_id=video,frame_idx=50,original_label='CalotTriangleDissection',grasper=0),
+                            dict(standardized_video_id=video,frame_idx=100,original_label='CalotTriangleDissection')])
     (tmp_path/'meta.json').write_text(json.dumps(metadata)); pd.DataFrame(annotations).to_csv(cfg.CHOLEC80_PARSED_ANNOTATIONS,index=False)
     for split,video in [('train','v1'),('val','v2')]:
         pd.DataFrame([dict(frame_path=f'old/{video}/frame_0000000.jpg',text_query='Preparation phase',relevance_label=1)]).to_csv(tmp_path/(split+'.csv'),index=False)
@@ -34,6 +36,13 @@ def test_dataset_real_files_full_validation_and_leakage(tmp_path):
     assert ds[0]['video_clip'].shape==(3,4,16,16)
     train,val=create_dataloaders(tmp_path/'train.csv',tmp_path/'val.csv',Tokenizer(),4,.2,cfg)
     assert len(val.dataset)==2  # includes final tail, not a validation subset
+    # Training windows come from a fixed stride over the (video, query) grid, not one per triplet row.
+    full=EndoscopyLocalizationDataset(tmp_path/'train.csv',Tokenizer(),4,True,cfg)
+    assert [r[2] for r in full.records]==[0,1] and full.positive_windows==[True,True]
+    cfg.TRAIN.POSITIVE_WINDOW_WEIGHT=3.
+    weighted,_=create_dataloaders(tmp_path/'train.csv',tmp_path/'val.csv',Tokenizer(),4,1.,cfg)
+    assert isinstance(weighted.sampler,torch.utils.data.WeightedRandomSampler) and len(list(weighted.sampler))==2
+    cfg.TRAIN.POSITIVE_WINDOW_WEIGHT=1.
     with pytest.raises(ValueError,match='leakage'):
         create_dataloaders(tmp_path/'train.csv',tmp_path/'train.csv',Tokenizer(),4,1.,cfg)
     (tmp_path/'frames'/'v2'/'frame_0000025.jpg').unlink()
@@ -121,9 +130,10 @@ def test_real_video_extraction_and_inference_share_time_grid(tmp_path):
     writer.release()
     extract(source,tmp_path/'frames',tmp_path/'meta.json',1.)
     meta=json.loads((tmp_path/'meta.json').read_text())['CHOLEC80__video01']
-    images,ids,fps,duration=read_sampled_video(video,1.,16)
+    images,ids,fps,duration,info=read_sampled_video(video,1.,16)
     assert ids.tolist()==[0,30,60]
     assert meta['frame_count']==61 and meta['source_fps']==pytest.approx(fps)
+    assert meta['reported_frame_count']==info['reported_frame_count'] and info['decoded_frame_count']==61
     assert duration==pytest.approx(61/fps) and len(images)==3
     assert sorted(p.name for p in (tmp_path/'frames'/'CHOLEC80__video01').glob('*.jpg'))==[f'frame_{i:07d}.jpg' for i in ids]
     with pytest.raises(FileExistsError): extract(source,tmp_path/'frames',tmp_path/'meta.json',1.)

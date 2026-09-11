@@ -1,9 +1,10 @@
 """Source-frame sampling with explicit supervision and disjoint-video validation."""
+import math
 import random
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 from torchvision.transforms import v2 as T
 from project_config import config
 from data_contract import (AnnotationIndex, FrameStore, load_video_metadata,
@@ -12,9 +13,25 @@ from data_contract import (AnnotationIndex, FrameStore, load_video_metadata,
 parse_query_kind = query_spec
 
 
-def image_transform(size, training=False):
-    # One stacked clip shares geometric augmentation across its frames.
-    ops = [T.RandomResizedCrop((size, size), scale=(0.8, 1.0)), T.RandomHorizontalFlip()] if training else [T.Resize((size, size))]
+def image_transform(size, training=False, scale=(0.8, 1.0), ratio=(0.9, 1.1)):
+    """Evaluation: the whole frame is resized to (size, size).
+
+    Training applies the same full-frame squish first (to a slightly larger square
+    so the crop never upsamples), then a random crop covering `scale` of it with
+    aspect jitter `ratio`, plus a horizontal flip. Train and evaluation therefore
+    see the same field of view and the same aspect distortion, up to augmentation.
+    One stacked clip (T, C, H, W) shares one geometric draw across its frames.
+    """
+    scale, ratio = tuple(float(x) for x in scale), tuple(float(x) for x in ratio)
+    if not (0 < scale[0] <= scale[1] <= 1) or not (0 < ratio[0] <= ratio[1]):
+        raise ValueError('TRAIN_AUG_SCALE must lie in (0,1] and TRAIN_AUG_RATIO must be positive')
+    if training:
+        pre = int(math.ceil(size / math.sqrt(scale[0])))
+        ops = [T.Resize((pre, pre), antialias=True),
+               T.RandomResizedCrop((size, size), scale=scale, ratio=ratio, antialias=True),
+               T.RandomHorizontalFlip()]
+    else:
+        ops = [T.Resize((size, size), antialias=True)]
     return T.Compose(ops + [T.ToDtype(torch.float32, scale=True),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
@@ -29,9 +46,12 @@ class EndoscopyLocalizationDataset(Dataset):
         self.annotations = AnnotationIndex(cfg.CHOLEC80_PARSED_ANNOTATIONS)
         self.store = FrameStore(cfg.EXTRACTED_FRAMES_DIR)
         self.tokenizer, self.clip_length = tokenizer, int(clip_length)
-        self.transform = image_transform(cfg.DATA.TRAIN_CROP_SIZE, is_training)
+        self.transform = image_transform(cfg.DATA.TRAIN_CROP_SIZE, is_training,
+            getattr(cfg.DATA, 'TRAIN_AUG_SCALE', (0.8, 1.0)), getattr(cfg.DATA, 'TRAIN_AUG_RATIO', (0.9, 1.1)))
         self.videos, self.grids, self.records = set(), {}, []
-        pairs, seen = {}, set()
+        # Per-record flag: window contains at least one positive observed frame.
+        self.positive_windows = []
+        pairs = {}
         for (_, row), spec in zip(self.triplets_df.iterrows(), specs):
             video, anchor = path_identity(row.frame_path)
             if video not in self.metadata:
@@ -47,27 +67,36 @@ class EndoscopyLocalizationDataset(Dataset):
             if 'relevance_label' in row and pd.notna(row.relevance_label) and int(row.relevance_label) != actual:
                 raise ValueError(f'Triplet disagrees with annotations: {video}/{anchor}/{row.text_query}')
             pairs[(video, str(row.text_query))] = spec
-            if is_training:
-                center = int(np.abs(grid - anchor).argmin())
-                start = max(0, min(center - self.clip_length // 2, len(grid) - self.clip_length))
-                key = (video, str(row.text_query), start)
-                if key not in seen:
-                    self.records.append((*key, spec))
-                    seen.add(key)
-        if not is_training:
-            for (video, query), spec in sorted(pairs.items()):
-                for start in window_positions(len(self.grids[video]), self.clip_length, self.clip_length):
-                    self.records.append((video, query, start, spec))
+        # Windows are cut on a fixed stride over each (video, query) grid. Training
+        # uses an overlapping stride (default half a window) and keeps only windows
+        # with an observed target; validation uses non-overlapping windows plus the
+        # overlapping tail so every source frame is scored.
+        if is_training:
+            stride = getattr(cfg.DATA, 'TRAIN_WINDOW_STRIDE', None)
+            stride = max(1, self.clip_length // 2) if stride is None else int(stride)
+            if not 0 < stride <= self.clip_length:
+                raise ValueError('TRAIN_WINDOW_STRIDE must be in (0, CLIP_LENGTH]')
+        else:
+            stride = self.clip_length
+        for (video, query), spec in sorted(pairs.items()):
+            grid = self.grids[video]
+            usable = 0
+            for start in window_positions(len(grid), self.clip_length, stride):
+                labels = [self.annotations.label(video, int(i), spec) for i in grid[start:start + self.clip_length]]
+                observed = any(l != IGNORE_INDEX for l in labels)
+                if is_training and not observed:
+                    continue
+                self.records.append((video, query, start, spec))
+                self.positive_windows.append(any(l == 1 for l in labels))
+                usable += observed
+            if is_training and not usable:
+                raise ValueError(f'{video}/{query}: no training window has an observed target on the declared grid')
         for video in self.videos:
             missing = set(map(int, self.grids[video])) - set(self.store.names(video))
             if missing:
                 raise FileNotFoundError(f'{video}: missing {len(missing)} sampled source frames; first={min(missing)}')
         if not self.records:
             raise ValueError('No usable clips')
-        if is_training:
-            for video,query,start,spec in self.records:
-                if not any(self.annotations.label(video,int(i),spec)!=IGNORE_INDEX for i in self.grids[video][start:start+self.clip_length]):
-                    raise ValueError(f'{video}/{query}: a training clip has no observed targets on the declared grid')
 
     def __len__(self):
         return len(self.records)
@@ -102,8 +131,18 @@ def create_dataloaders(train_csv_path, val_csv_path, tokenizer, clip_length=16, 
     val = EndoscopyLocalizationDataset(val_csv_path, tokenizer, clip_length, False, cfg)
     if train.videos & val.videos:
         raise ValueError(f'Train/validation video leakage: {sorted(train.videos & val.videos)}')
+    indices = list(range(len(train)))
     if subset_ratio < 1:
-        train = Subset(train, random.Random(cfg.TRAIN.SEED).sample(range(len(train)), max(1, int(len(train)*subset_ratio))))
+        indices = random.Random(cfg.TRAIN.SEED).sample(indices, max(1, int(len(train)*subset_ratio)))
+    positive_weight = float(getattr(cfg.TRAIN, 'POSITIVE_WINDOW_WEIGHT', 1.0))
+    if positive_weight <= 0:
+        raise ValueError('POSITIVE_WINDOW_WEIGHT must be positive')
+    weights = [positive_weight if train.positive_windows[i] else 1.0 for i in indices]
+    train = Subset(train, indices)
     kw = dict(batch_size=cfg.TRAIN.BATCH_SIZE, num_workers=cfg.DATA.NUM_WORKERS,
               pin_memory=torch.cuda.is_available(), worker_init_fn=seed_worker, persistent_workers=False)
+    if positive_weight != 1.0:
+        # generator=None -> global torch RNG, which checkpoints save and restore.
+        sampler = WeightedRandomSampler(weights, num_samples=len(indices), replacement=True)
+        return DataLoader(train, sampler=sampler, **kw), DataLoader(val, shuffle=False, **kw)
     return DataLoader(train, shuffle=True, **kw), DataLoader(val, shuffle=False, **kw)

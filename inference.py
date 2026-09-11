@@ -6,29 +6,39 @@ import numpy as np
 import pandas as pd
 import torch
 from checkpoint_utils import read_checkpoint,restore_config,load_model_state,file_hash
-from data_contract import sample_indices,window_positions
+from data_contract import check_decoded_count,sample_indices,snap_fps,window_positions
 from dataset import image_transform
 from metrics import segments_from_scores
 
 
 def read_sampled_video(path,sample_fps,image_size=224):
+    """Decode to EOF on the training time grid. Frame IDs are decode positions,
+    identical to the extractor's, so timestamps never shift; the decoded count is
+    authoritative (container counts are estimates, see check_decoded_count)."""
     import cv2
+    from torchvision.transforms.v2 import functional as VF
     cap=cv2.VideoCapture(str(path))
     if not cap.isOpened(): raise OSError(f'Cannot open video: {path}')
-    fps=float(cap.get(cv2.CAP_PROP_FPS)); count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    grid=sample_indices(count,fps,sample_fps)
-    wanted=set(map(int,grid)); frames=[]
+    reported_fps=float(cap.get(cv2.CAP_PROP_FPS)); fps=snap_fps(reported_fps)
+    reported=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    bound=2*max(reported,0)+100_000
+    wanted=set(map(int,sample_indices(bound,fps,sample_fps)))
+    kept={}; decoded=0
     try:
-        for idx in range(count):
+        while True:
             ok,frame=cap.read()
-            if not ok: raise OSError(f'Video decode failed at source frame {idx}; timestamps are not shifted to hide it')
-            if idx in wanted:
+            if not ok: break
+            if decoded in wanted:
                 # Keep resized images rather than full-resolution hour-long videos.
                 frame=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-                from torchvision.transforms.v2 import functional as VF
-                frames.append(VF.resize(torch.from_numpy(frame.copy()).permute(2,0,1),[image_size,image_size],antialias=True))
+                kept[decoded]=VF.resize(torch.from_numpy(frame.copy()).permute(2,0,1),[image_size,image_size],antialias=True)
+            decoded+=1
     finally: cap.release()
-    return frames,grid,fps,count/fps
+    if decoded>=bound: raise OSError(f'{path}: decoded more frames than the safety bound {bound}')
+    check_decoded_count(decoded,reported,str(path))
+    grid=sample_indices(decoded,fps,sample_fps)
+    frames=[kept[int(i)] for i in grid]
+    return frames,grid,fps,decoded/fps,dict(reported_fps=reported_fps,reported_frame_count=reported,decoded_frame_count=decoded)
 
 
 def load_model(checkpoint,device):
@@ -76,7 +86,7 @@ def main():
     args=p.parse_args(); output=Path(args.output)
     if output.exists() and any(output.iterdir()): raise FileExistsError(output)
     model,ckpt=load_model(args.checkpoint,args.device)
-    frames,indices,fps,duration=read_sampled_video(args.video,model.config.DATA.SAMPLE_FPS,model.config.DATA.TRAIN_CROP_SIZE)
+    frames,indices,fps,duration,decode_info=read_sampled_video(args.video,model.config.DATA.SAMPLE_FPS,model.config.DATA.TRAIN_CROP_SIZE)
     scores,maps=score_frames(model,frames,args.query,args.device,args.raw_patch_maps)
     threshold=args.threshold if args.threshold is not None else ckpt['validation_threshold']
     spans=segments_from_scores(indices/fps,scores,duration,threshold,model.config.MIN_SEGMENT_DURATION,model.config.MERGE_GAP)
@@ -84,7 +94,7 @@ def main():
     pd.DataFrame(dict(frame_idx=indices,time_sec=indices/fps,score=scores)).to_csv(output/'frame_scores.csv',index=False)
     (output/'segments.json').write_text(json.dumps(spans,indent=2))
     (output/'manifest.json').write_text(json.dumps(dict(query=args.query,video=str(Path(args.video).resolve()),source_fps=fps,
-        duration=duration,sample_fps=model.config.DATA.SAMPLE_FPS,threshold=threshold,checkpoint_sha256=file_hash(args.checkpoint),
+        duration=duration,sample_fps=model.config.DATA.SAMPLE_FPS,threshold=threshold,checkpoint_sha256=file_hash(args.checkpoint),**decode_info,
         map_description='Raw relevance-head patch logits; do not explain the final temporal/evidential output'),indent=2))
     if maps is not None: np.savez_compressed(output/'raw_relevance_patch_maps.npz',frame_idx=indices,maps=maps)
 

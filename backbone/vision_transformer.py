@@ -118,14 +118,79 @@ def _conv_filter(state_dict, model):
 
 # --- Helper function for loading pre-trained weights into VisionTransformer ---
 # This function explicitly handles local file paths first, then URLs, then random init.
+def _adapt_backbone_state(sd, model):
+    """Rename/resize keys from TimeSformer-family checkpoints to this module.
+
+    - `time_embed` -> `temporal_embed` (TimeSformer naming), interpolated over T
+      when the pretraining clip length differs (same rule as the forward pass).
+    - `pos_embed` is resized to this model's spatial grid when it was pretrained
+      at a different resolution (single-frame layout, CLS first).
+    Returns the adapted dictionary and a list of human-readable notes.
+    """
+    notes = []
+    sd = dict(sd)
+    if 'time_embed' in sd and 'temporal_embed' not in sd:
+        sd['temporal_embed'] = sd.pop('time_embed')
+        notes.append('renamed time_embed -> temporal_embed')
+    te = sd.get('temporal_embed')
+    target_t = model.temporal_embed.shape[1]
+    if te is not None and te.ndim == 3 and te.shape[1] != target_t and te.shape[2] == model.embed_dim:
+        sd['temporal_embed'] = F.interpolate(te.float().transpose(1, 2), size=target_t,
+                                             mode='linear', align_corners=False).transpose(1, 2).to(te.dtype)
+        notes.append(f'interpolated temporal_embed {te.shape[1]} -> {target_t} frames')
+    pe = sd.get('pos_embed')
+    if pe is not None and pe.ndim == 3 and pe.shape[1] != model.pos_embed.shape[1] and pe.shape[2] == model.embed_dim:
+        h, w = model.patch_embed.num_patches_h, model.patch_embed.num_patches_w
+        sd['pos_embed'] = model._resize_pos_embed(pe.float(), h, w, 1).to(pe.dtype)
+        notes.append(f'resized pos_embed {pe.shape[1]} -> {sd["pos_embed"].shape[1]} tokens')
+    return sd, notes
+
+
+def _strict_backbone_load(model, sd, allow_missing=(), ignore_unexpected_prefixes=('head.',)):
+    """Load with exact key accounting.
+
+    Every backbone tensor must come from the checkpoint unless its name is listed
+    in `allow_missing`; every checkpoint tensor must land in the backbone unless
+    its key starts with a listed prefix (pretraining heads, projectors). A shape
+    mismatch is an error. The lists are printed so a mismatch is never silent.
+    """
+    expected = model.state_dict()
+    ignored = sorted(k for k in sd if any(k.startswith(p) for p in ignore_unexpected_prefixes))
+    unexpected = sorted(k for k in sd if k not in expected and k not in ignored)
+    missing = sorted(k for k in expected if k not in sd)
+    mismatched = sorted(f'{k}: checkpoint {tuple(sd[k].shape)} vs model {tuple(v.shape)}'
+                        for k, v in expected.items() if k in sd and tuple(sd[k].shape) != tuple(v.shape))
+    not_allowed = [k for k in missing if k not in set(allow_missing)]
+    print(f'Backbone load: matched={len(expected) - len(missing)}/{len(expected)} tensors; '
+          f'missing={missing}; unexpected={unexpected}; ignored={ignored}; shape_mismatch={mismatched}')
+    problems = []
+    if not_allowed:
+        problems.append(f'missing (would stay randomly initialised): {not_allowed}')
+    if unexpected:
+        problems.append(f'unexpected (checkpoint tensors with no destination): {unexpected}')
+    if mismatched:
+        problems.append(f'shape mismatch: {mismatched}')
+    if problems:
+        raise ValueError('Backbone checkpoint does not match this architecture. ' + ' | '.join(problems)
+                         + '. If the unexpected keys are pretraining-only heads, add their prefix to '
+                           'MODEL.BACKBONE_IGNORE_UNEXPECTED_PREFIXES; if a missing tensor is deliberately '
+                           'trained from scratch, add its name to MODEL.BACKBONE_ALLOW_MISSING_KEYS.')
+    to_load = {k: v for k, v in sd.items() if k in expected}
+    model.load_state_dict(to_load, strict=not missing)
+    return missing, ignored
+
+
 def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=None,
                     img_size=224, num_frames=16, num_patches=196,
                     attention_type='divided_space_time', pretrained_model='',
-                    strict=False):
+                    strict=True, allow_missing=(), ignore_unexpected_prefixes=('head.',)):
     """
-    Load compatible ViT weights with >=90% parameter coverage. Any intended
-    architecture conversion outside that coverage needs an explicit migration.
+    Load backbone weights with exact key accounting (see `_strict_backbone_load`).
+    `strict=False` is no longer accepted: partially loaded backbones must be declared
+    explicitly through `allow_missing` / `ignore_unexpected_prefixes`.
     """
+    if not strict:
+        raise ValueError('load_pretrained requires strict=True; declare exceptions explicitly')
     if cfg is None:
         cfg = getattr(model, 'default_cfg', None) or default_cfgs.get('vit_base_patch16_224')
         if cfg is None:
@@ -152,36 +217,29 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
                     del sd[k]
         return sd
 
+    def _load(sd, source):
+        sd = _clean_sd(sd)
+        sd = _maybe_drop_head(sd)
+        sd = filter_fn(sd, model)  # Conv2d -> Conv3d(1,p,p) patch-embed inflation
+        sd, notes = _adapt_backbone_state(sd, model)
+        for note in notes:
+            print(f'Backbone load ({source}): {note}')
+        return _strict_backbone_load(model, sd, allow_missing, ignore_unexpected_prefixes)
+
     # 1) Local file
     if pretrained_model and os.path.exists(pretrained_model):
         _logger.info(f'Loading pretrained from local: {pretrained_model}')
         try:
-            # weights_only=False: PyTorch 2.6+ defaults torch.load to weights_only=True,
-            # which rejects legacy pickled globals (e.g. numpy.core.multiarray.scalar)
-            # some older checkpoints contain, raising instead of loading. This is our
-            # own checkpoint from a trusted source (not an untrusted third-party
-            # download), so the security tradeoff of weights_only=False is acceptable
-            # here.
+            # weights_only=False: legacy checkpoints may contain pickled numpy scalars.
+            # Only load checkpoints you trust.
             ckpt = torch.load(pretrained_model, map_location='cpu', weights_only=False)
             sd = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt.get('model', ckpt)))
-            sd = _clean_sd(sd)
-            sd = _maybe_drop_head(sd)
-            sd = filter_fn(sd, model)  # <— pass model for Conv3d inflation
-            expected = model.state_dict()
-            matched = sum(v.numel() for k,v in expected.items() if k in sd and sd[k].shape == v.shape)
-            coverage = matched / max(1, sum(v.numel() for v in expected.values()))
-            if coverage < 0.9:
-                raise ValueError(f'Backbone weight coverage {coverage:.1%} is below 90%; wrong checkpoint/key mapping')
-            missing, unexpected = model.load_state_dict(sd, strict=strict)
-            print(f'Backbone load coverage={coverage:.2%}; missing={missing}; unexpected={unexpected}')
-            _logger.info(f'loaded. missing:{len(missing)} unexpected:{len(unexpected)}')
+            if not isinstance(sd, dict) or not all(hasattr(v, 'shape') for v in sd.values()):
+                raise ValueError('checkpoint does not contain a tensor state dictionary')
+            missing, ignored = _load(sd, 'local')
+            _logger.info(f'loaded. missing:{len(missing)} ignored:{len(ignored)}')
             return
         except Exception as e:
-            # A local checkpoint path was explicitly given and the file exists, so the
-            # caller clearly expects pretrained weights to load. Silently falling back
-            # to URL/random init here would train on a randomly-initialized backbone
-            # while looking like a normal run -- fail loudly instead so this can never
-            # go unnoticed the way it did before this fix.
             _logger.error(f"Local checkpoint load failed: {e}")
             raise RuntimeError(
                 f"Found pretrained checkpoint at '{pretrained_model}' but failed to load it: {e}. "
@@ -195,14 +253,8 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
         try:
             sd = torch.hub.load_state_dict_from_url(cfg['url'], map_location='cpu', progress=True)
             sd = sd.get('model', sd)
-            sd = _clean_sd(sd)
-            sd = _maybe_drop_head(sd)
-            sd = filter_fn(sd, model)
-            expected = model.state_dict()
-            coverage = sum(v.numel() for k,v in expected.items() if k in sd and sd[k].shape == v.shape) / max(1,sum(v.numel() for v in expected.values()))
-            if coverage < .9: raise ValueError(f'Pretrained URL coverage {coverage:.1%} is below 90%')
-            missing, unexpected = model.load_state_dict(sd, strict=strict)
-            _logger.info(f'loaded. missing:{len(missing)} unexpected:{len(unexpected)}')
+            missing, ignored = _load(sd, 'url')
+            _logger.info(f'loaded. missing:{len(missing)} ignored:{len(ignored)}')
             return
         except Exception as e:
             raise RuntimeError(f'Pretrained URL load failed: {e}') from e
@@ -293,6 +345,11 @@ class Block(nn.Module):
             self.temporal_norm1 = norm_layer(dim)
             self.temporal_attn = Attention(
                 dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            # TimeSformer projects the temporal-attention residual before adding it.
+            # Checkpoints derived from TimeSformer (M2CRL included) carry
+            # `blocks.N.temporal_fc.*`; omitting the layer changes the pretrained
+            # function even though most weights still load.
+            self.temporal_fc = nn.Linear(dim, dim)
 
         # drop path
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -331,6 +388,7 @@ class Block(nn.Module):
             # ViT-style: norm -> attn ; apply DropPath at the add
             temp_out = self.temporal_attn(self.temporal_norm1(xt))  # ((B*H*W), T, D)
             temp_out = rearrange(temp_out, '(b h w) t d -> b (t h w) d', b=B, h=H, w=W, t=T)  # (B, T*H*W, D)
+            temp_out = self.temporal_fc(temp_out)
 
             # build a residual tensor aligned with x: zeros for CLS, temporal residual for patches
             temp_residual_full = torch.zeros_like(x)
@@ -485,6 +543,14 @@ class VisionTransformer(nn.Module):
         trunc_normal_(self.cls_token, std=.02)
         trunc_normal_(self.temporal_embed, std=.02)  # Initialize time embedding
         self.apply(self._init_weights)
+        if attention_type == 'divided_space_time':
+            # Same rule as the TimeSformer reference implementation: every block
+            # after the first starts with a zero temporal projection, so a randomly
+            # initialised model begins as a per-frame ViT.
+            for i, blk in enumerate(self.blocks):
+                if i > 0:
+                    nn.init.constant_(blk.temporal_fc.weight, 0)
+                    nn.init.constant_(blk.temporal_fc.bias, 0)
 
 
     def _init_weights(self, m):
@@ -534,13 +600,15 @@ class VisionTransformer(nn.Module):
                         best = (score, h, w)
             _, old_h, old_w = best
 
-        # (1, old_H*old_W, D) -> (1, D, old_H, old_W)
-        posemb_grid = posemb_grid.reshape(1, old_h, old_w, -1).permute(0, 3, 1, 2)
-        # resize to (H', W')
-        posemb_grid = F.interpolate(posemb_grid, size=(grid_size_height, grid_size_width),
-                                    mode="bicubic", align_corners=False)
-        # (1, D, H', W') -> (1, H'*W', D)
-        posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, grid_size_height * grid_size_width, -1)
+        if (old_h, old_w) != (grid_size_height, grid_size_width):
+            # (1, old_H*old_W, D) -> (1, D, old_H, old_W)
+            posemb_grid = posemb_grid.reshape(1, old_h, old_w, -1).permute(0, 3, 1, 2)
+            # resize to (H', W')
+            posemb_grid = F.interpolate(posemb_grid, size=(grid_size_height, grid_size_width),
+                                        mode="bicubic", align_corners=False)
+            # (1, D, H', W') -> (1, H'*W', D)
+            posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, grid_size_height * grid_size_width, -1)
+        # else: same spatial grid -- tiling over time is the only change (no interpolation).
         # tile across time
         posemb_grid = posemb_grid.repeat(1, num_frames, 1)  # (1, T*H'*W', D)
         # concat CLS back

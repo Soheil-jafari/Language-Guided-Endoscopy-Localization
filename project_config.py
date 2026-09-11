@@ -45,53 +45,25 @@ class Config:
         # --- TimeSformer (M²CRL Backbone) Specific Parameters ---
         self.TIMESFORMER = self.TimesformerConfig()
 
-        # Inference Settings
-        self.SEGMENT_THRESHOLD = 0.5  # higher = fewer/cleaner segments, lower = more/longer segments
-        self.MIN_SEGMENT_DURATION = 0.4  # drop very short bursts
-        self.MERGE_GAP = 0.2  # merge close segments
-        self.INFER_IMG_SIZE = 224
-
-        self.LABEL_TO_TEXT_QUERY = {
-            # phases — canonical short keys
-            "calot": "Calot triangle dissection phase",
-            "dissection": "Gallbladder dissection phase",
-            "cleaning": "Cleaning and coagulation phase",
-            "clipping": "Clipping and cutting phase",
-            "preparation": "Preparation phase",
-            "packaging": "Gallbladder packaging phase",
-            "retraction": "Retraction phase",
-
-            # phases — raw CHOLEC80 names
-            "CalotTriangleDissection": "Calot triangle dissection phase",
-            "GallbladderDissection": "Gallbladder dissection phase",
-            "CleaningCoagulation": "Cleaning and coagulation phase",
-            "ClippingCutting": "Clipping and cutting phase",
-            "Preparation": "Preparation phase",
-            "GallbladderPackaging": "Gallbladder packaging phase",
-            "GallbladderRetraction": "Retraction phase",
-
-            # tools
-            "grasper": "a grasper is present",
-            "bipolar": "a bipolar forceps is present",
-            "hook": "a hook cautery is present",
-            "scissors": "scissors are present",
-            "clip": "a clip applier is present",
-            "clipper": "a clip applier is present",
-            "irrigator": "an irrigator is present",
-            "suction": "a suction instrument is present",
-            "specimen": "a specimen retrieval bag is present",
-            "bag": "a specimen retrieval bag is present",
-        }
+        # Segment post-processing used by inference.py (the operating threshold itself
+        # is the validation-selected value stored in the checkpoint).
+        self.MIN_SEGMENT_DURATION = 0.4  # drop very short bursts (seconds)
+        self.MERGE_GAP = 0.2  # merge segments separated by at most this gap (seconds)
 
     class DataConfig:
         def __init__(self):
             self.TRAIN_CROP_SIZE = 224
-            self.AUGMENT_PROB = 0.5
             self.NUM_FRAMES = 16
-            self.FRAME_RATE = 30
             self.SAMPLE_FPS = 1.0  # Source FPS comes only from video_metadata.json.
             self.CLIP_LENGTH = 16
-            self.NUM_INFERENCE_FRAMES = 50
+            # Training windows are cut on a fixed stride per (video, query) so that an
+            # epoch is one pass over a well-defined set. None = CLIP_LENGTH // 2.
+            self.TRAIN_WINDOW_STRIDE = None
+            # Augmentation acts on the frame AFTER it is squished to a square, so the
+            # train-time aspect distortion matches evaluation (full-frame resize).
+            # Crop covers [scale] of the squished frame with aspect jitter [ratio].
+            self.TRAIN_AUG_SCALE = [0.8, 1.0]
+            self.TRAIN_AUG_RATIO = [0.9, 1.1]
 
             self.MAX_TEXT_LENGTH = 77
             self.NUM_WORKERS = 4
@@ -103,7 +75,12 @@ class Config:
 
             # --- Backbone-Specific Paths ---
             self.M2CRL_WEIGHTS_PATH = os.path.join(project_root, "pretrained", "checkpoint.pth")
-            self.ENDOMAMBA_WEIGHTS_PATH = os.path.join(project_root, "pretrained", "checkpoint-499.pth")
+            # Backbone loading is exact: every model tensor must be in the checkpoint and
+            # every checkpoint tensor must have a destination. Declare exceptions here.
+            # Prefixes of checkpoint-only tensors to ignore (pretraining heads/projectors).
+            self.BACKBONE_IGNORE_UNEXPECTED_PREFIXES = ["head."]
+            # Model tensors deliberately left at random initialisation (e.g. "temporal_embed").
+            self.BACKBONE_ALLOW_MISSING_KEYS = []
 
             # --- General Model Parameters ---
             self.TEXT_ENCODER_MODEL = "openai/clip-vit-base-patch32"
@@ -124,9 +101,6 @@ class Config:
 
             self.USE_UNCERTAINTY = False
             self.USE_CONFIDENCE_FUSION = False
-            # This embed_dim is for the text encoder and heads.
-            # The vision_embed_dim will be set dynamically in the model itself.
-            self.EMBED_DIM = 768
 
     class TrainConfig:
         def __init__(self):
@@ -146,6 +120,11 @@ class Config:
             # negative-skewed (most frames are not the queried concept), so a value > 1
             # (e.g. the neg/pos ratio) trades precision for recall. Default 1.0 = no weighting.
             self.BCE_POS_WEIGHT = 1.0
+            # Sampling weight for training windows that contain at least one positive
+            # frame (windows without one get weight 1). 1.0 = plain shuffling; > 1
+            # draws positive windows more often (with replacement, one epoch = one
+            # pass worth of draws). Uses the global torch RNG so exact resume holds.
+            self.POSITIVE_WINDOW_WEIGHT = 1.0
             self.WARMUP_EPOCHS = 3
             self.WEIGHT_DECAY = 0.2
             self.EVIDENTIAL_LAMBDA = 0.2
@@ -181,7 +160,6 @@ class Config:
     class TimesformerConfig:
         def __init__(self):
             self.ATTENTION_TYPE = 'divided_space_time'  # Crucial for spatio-temporal M²CRL
-            self.PRETRAINED_MODEL = ""  # Optional: If using a TimeSformer-specific pre-trained model URL/path
 
 
 # Instantiate the config for use in other scripts

@@ -245,15 +245,29 @@ class LanguageGuidedHead(nn.Module):
 
 # --- Temporal Head ---
 class TemporalHead(nn.Module):
-    def __init__(self, input_dim, output_dim, num_attention_heads=8, num_layers=2):
+    """Transformer temporal head over one clip window.
+
+    A learned positional embedding (one vector per window position) makes the
+    head order-aware in its own right, instead of relying on whatever temporal
+    signal survives mean-pooling of the backbone tokens. `max_length` is the
+    training/inference window length (DATA.CLIP_LENGTH); longer inputs are refused.
+    """
+    def __init__(self, input_dim, output_dim, num_attention_heads=8, num_layers=2, max_length=16):
         super().__init__()
+        if max_length < 1:
+            raise ValueError('max_length must be positive')
         encoder_layer = nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_attention_heads, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_length, input_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
         # The output layer's dimension is controlled by the 'output_dim' parameter
         self.fc_output = nn.Linear(input_dim, output_dim)
 
     def forward(self, frame_features_seq):
-        temporal_features = self.transformer_encoder(frame_features_seq)
+        length = frame_features_seq.shape[1]
+        if length > self.pos_embed.shape[1]:
+            raise ValueError(f'Window of {length} frames exceeds the head positional length {self.pos_embed.shape[1]}')
+        temporal_features = self.transformer_encoder(frame_features_seq + self.pos_embed[:, :length])
         # The output can now be a single score or 4 evidential parameters
         logits = self.fc_output(temporal_features)
 
@@ -340,7 +354,9 @@ class LocalizationFramework(nn.Module):
                     num_frames=config.DATA.NUM_FRAMES,
                     num_patches=self.vision_backbone.patch_embed.num_patches,
                     attention_type=config.TIMESFORMER.ATTENTION_TYPE,
-                    pretrained_model=config.MODEL.M2CRL_WEIGHTS_PATH
+                    pretrained_model=config.MODEL.M2CRL_WEIGHTS_PATH,
+                    allow_missing=tuple(getattr(config.MODEL, 'BACKBONE_ALLOW_MISSING_KEYS', ()) or ()),
+                    ignore_unexpected_prefixes=tuple(getattr(config.MODEL, 'BACKBONE_IGNORE_UNEXPECTED_PREFIXES', ('head.',)) or ()),
                 )
                 print(f"Loaded pretrained M2CRL weights from {config.MODEL.M2CRL_WEIGHTS_PATH}")
         elif config.MODEL.VISION_BACKBONE_NAME == 'EndoMamba':
@@ -388,7 +404,8 @@ class LocalizationFramework(nn.Module):
         elif config.MODEL.TEMPORAL_HEAD_TYPE == 'TRANSFORMER':
             self.temporal_head = TemporalHead(input_dim=self.vision_embed_dim, output_dim=output_dim,
                                               num_attention_heads=config.MODEL.HEAD_NUM_ATTENTION_HEADS,
-                                              num_layers=config.MODEL.HEAD_NUM_LAYERS)
+                                              num_layers=config.MODEL.HEAD_NUM_LAYERS,
+                                              max_length=config.DATA.CLIP_LENGTH)
         else:
             raise ValueError(f'Unknown temporal head: {config.MODEL.TEMPORAL_HEAD_TYPE}')
 
