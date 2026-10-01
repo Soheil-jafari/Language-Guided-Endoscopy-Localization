@@ -1,3 +1,12 @@
+# Third-party code notice
+# ------------------------
+# The divided space-time VisionTransformer in this file is adapted from TimeSformer
+# (https://github.com/facebookresearch/TimeSformer, Bertasius et al., ICML 2021), which is
+# licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0).
+# Helper functions (trunc_normal_, DropPath, _ntuple, ...) originate from pytorch-image-models
+# (https://github.com/huggingface/pytorch-image-models, Apache License 2.0).
+# Those licences, not this repository's MIT licence, govern the adapted portions.
+
 import math
 import os
 from collections import OrderedDict

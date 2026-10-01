@@ -10,6 +10,20 @@ training and evaluation are required. Historical dissertation numbers are not
 validated results from this revision.** See [REPAIR_NOTES.md](REPAIR_NOTES.md) for
 the complete change/migration checklist and verification limits.
 
+## One-command run (HPC / batch scheduler)
+
+The whole experiment (data download, frame extraction, labels, splits, training,
+evaluation and a summary report) runs from a single resumable command:
+
+```sh
+bash setup_env.sh                                            # once: conda env "lgel"
+bash run.sh --preset full --root /path/to/big/scratch/lgel   # resubmit the same command to resume
+```
+
+See [README_HPC.md](README_HPC.md) for the inputs it needs, the presets, the offline
+workflow and troubleshooting. The sections below describe the individual tools that
+`main.py` drives.
+
 ## Environment
 
 The local CPU checks use Python 3.12, PyTorch 2.5.1 and torchvision 0.20.1.
@@ -144,3 +158,14 @@ and absent-query false alarms. AP at one tIoU is not labelled an overall mAP.
 Incomplete tool annotations cannot be silently converted into complete absence
 or segment targets. Old evaluation entry points delegate to the new explicit-input
 CLIs; old arguments and implicit artifact searches have been retired.
+
+## Third-party code and data
+
+This repository is MIT-licensed except for adapted third-party code, which keeps its
+original licence:
+
+- `backbone/vision_transformer.py` is adapted from
+  [TimeSformer](https://github.com/facebookresearch/TimeSformer) (CC BY-NC 4.0) and
+  [pytorch-image-models](https://github.com/huggingface/pytorch-image-models) (Apache 2.0).
+- Pretrained models (the M2CRL backbone checkpoint, CLIP, X-CLIP) and the Cholec80
+  dataset are **not** distributed here and are subject to their owners' terms.

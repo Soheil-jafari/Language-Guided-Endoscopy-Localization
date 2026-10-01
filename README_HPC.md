@@ -19,20 +19,23 @@ finished epoch.
 
 | Resource | Requirement |
 |---|---|
-| GPU | 1 CUDA GPU with **>= 24 GB** memory (A100 / L40 / RTX 4090 / 5090 class). The code is single-GPU by design; asking for more GPUs will not make it faster. |
+| GPU | 1 CUDA GPU with **>= 24 GB** memory (A100 / L40 / RTX 4090 / 5090 class). The code is single-GPU by design; asking for more GPUs will not make it faster (but several runs, e.g. different seeds, can run side by side). Ampere or newer GPUs train in bf16 automatically; older ones (V100, T4) use fp16. |
 | CPU | 8+ cores recommended (frame extraction runs in parallel, one video per process). |
 | RAM | 32 GB or more recommended. |
 | Disk | About **200 GB free** under `--root`. The peak is roughly 150-170 GB, while the ~70 GB zip and the ~80 GB of extracted videos coexist. The zip is deleted after extraction, and the videos can also be deleted with `--cleanup-raw`. |
 | Internet | Needed for the **first** run only (dataset, weights, a small text model). If compute nodes have no internet see section 5. |
-| Software | `conda` (Miniforge/Anaconda), Python 3.12, an NVIDIA driver that supports CUDA 12.4 wheels (`nvidia-smi` shows the driver version). |
+| Software | `conda` (Miniforge/Anaconda), Python 3.12 (installed by `setup_env.sh`), an NVIDIA driver that supports CUDA 12.4 wheels (`nvidia-smi` shows the driver version), Linux with glibc >= 2.28 (RHEL/Rocky/Alma 8+, Ubuntu 20.04+; `ldd --version` shows it). |
 
 ## 2. Install (once)
 
 ```bash
-git clone <repository-url> lgel && cd lgel
+git clone https://github.com/Soheil-jafari/Language-Guided-Endoscopy-Localization.git lgel && cd lgel
 # If conda needs a `module load`, copy site_env.sh.example to site_env.sh and edit it (optional).
 bash setup_env.sh          # creates the conda env "lgel" (roughly 10 minutes, needs internet)
 ```
+
+The environment is built from the conda-forge channel only, so no Anaconda Terms-of-Service
+prompt can stall it.
 
 If the cluster's driver is older or newer, pick the matching PyTorch build, e.g.
 `TORCH_CUDA=cu121 bash setup_env.sh` (see https://pytorch.org/get-started/previous-versions/).
@@ -54,13 +57,13 @@ unzipped folder) and `--weights-path` (the checkpoint) instead of the links.
 **Step A - 5-minute plumbing check on a fake mini-dataset (recommended before the big job):**
 
 ```bash
-python tools/make_synthetic_cholec80.py --out $SCRATCH/fake_cholec80 --videos 6
-bash run.sh --preset smoke --root $SCRATCH/lgel_smoke --data-dir $SCRATCH/fake_cholec80 --random-init
+bash run.sh --preset smoke --root $SCRATCH/lgel_smoke --synthetic 6 --random-init
 ```
 
-This proves the environment, GPU, frame extraction, training, prediction and evaluation all run
-on this cluster. The numbers it produces are meaningless (tiny random data, 1 epoch); only
-"ALL DONE" matters. Run it inside a GPU job.
+This generates 6 small fake videos and proves the environment, GPU, frame extraction, training,
+prediction and evaluation all run on this cluster. The numbers it produces are meaningless
+(fake data, 1 epoch); only "ALL DONE" matters. Run it inside a GPU job. If `LGEL_WEIGHTS_URL`
+is set, dropping `--random-init` also tests the weights link and that the checkpoint loads.
 
 **Step B - the real experiment:**
 
@@ -79,6 +82,13 @@ default configuration samples 20 %. Pass `--subset-ratio 0.2` to reproduce that.
 
 The total run time has not been measured on this hardware. Run `pilot` first and read the epoch
 time from `logs/train.log` to estimate `full`.
+
+`pilot` and `full` (and extra seeds, `--seed N`) can use the **same** `--root`: the data is
+downloaded and prepared once, and each run gets its own `runs/<run>/` and `results/<run>/`
+(run name `<preset>_seed<seed>` unless `--run-name` is given).
+
+`--root` is required for `pilot` and `full`. Point it at a large scratch filesystem: home
+directories are usually too small, and the free-space check cannot see per-user quotas.
 
 ## 4. Time limits and resuming
 
@@ -158,7 +168,8 @@ chained (`sbatch --dependency=afterany:<jobid> ...`).
 |---|---|
 | `--root DIR` | Where everything is stored. Put it on scratch / a large filesystem. |
 | `--run-name NAME` | Name of this training run (default `<preset>_seed<seed>`). |
-| `--seed N` | Training seed (default 42). |
+| `--seed N` | Training seed (default 42). Different seeds can share one `--root`. |
+| `--synthetic N` | Use N generated fake videos instead of real data (plumbing test only). |
 | `--epochs N`, `--subset-ratio X` | Override the preset. |
 | `--batch-size N`, `--accum N` | Micro-batch and gradient accumulation; keep `batch-size x accum = 192` (the project default) so the optimisation stays the same. |
 | `--amp-dtype auto/fp16/bf16` | Mixed precision; `auto` picks bf16 when the GPU supports it. |
@@ -176,6 +187,7 @@ chained (`sbatch --dependency=afterany:<jobid> ...`).
 |---|---|
 | `CUDA out of memory` or `killed` during training | Lower `--batch-size` (8 -> 4 -> 2) and raise `--accum` so that the product stays 192, then resubmit. This is accepted as long as no checkpoint has been written yet. |
 | `no CUDA GPU is visible` | The job did not get a GPU; check the `--gres` / partition line. |
+| `--root is required for the pilot/full presets` | Add `--root /path/on/scratch/lgel` (or set `LGEL_ROOT`). |
 | `only N GB free under <root>` | Point `--root` at a larger filesystem, or lower `--min-free-gb` if you are sure. |
 | `Run ... already exists with different settings` | You changed flags after training started. Restore the flags, or use a new `--run-name`. |
 | `stage ... was already finished with different settings` | Same idea for data stages: use a new `--root`, or `--force <stage>`. |
@@ -187,17 +199,22 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-Verified (automated tests, 51 passing, plus end-to-end runs):
+Verified (automated tests, 58 passing, plus end-to-end runs):
 
 * The full chain on a synthetic Cholec80-format dataset with a deliberately **tiny** model on CPU:
   download/extract, frame extraction, annotation repair, splits, audit, training, resume,
-  prediction, evaluation, summary, including a killed-and-resumed download and an
-  "internet first, offline later" two-step run.
+  prediction, evaluation, summary, including a killed-and-resumed download, an
+  "internet first, offline later" two-step run, and `pilot` followed by `full` in one `--root`.
+* Killing training after epoch 2 and resuming gives bit-identical weights, optimizer/scheduler
+  state and metrics to an uninterrupted run (tiny model).
+* `run.sh` activating the conda env in a non-interactive shell (Miniforge, conda 26.7), and
+  `setup_env.sh` up to the PyTorch download.
 
 Not verified (could not be tested where this was written):
 
 * The real-size model, real GPU training, mixed precision and memory use on actual hardware.
-* `setup_env.sh` against a real conda installation and the CUDA 12.4 wheels.
+* Creating the environment from scratch (conda-forge + PyTorch CUDA 12.4 wheels): the build
+  machine could not reach those servers.
 * Slurm or any other scheduler.
 * The final dataset and weights download links, and Google-Drive links.
 * Training time and the quality of the final results. Run the `pilot` preset first.
@@ -209,4 +226,5 @@ removes such a row (only if it merely repeats the last phase), writes the cleane
 files are not modified.
 
 The dataset is distributed by its owners under their own terms. Check that you may use and move
-it on the cluster before uploading it anywhere.
+it on the cluster before uploading it anywhere. `backbone/vision_transformer.py` is adapted from
+TimeSformer (CC BY-NC 4.0) and keeps that licence; see the README's "Third-party code and data".

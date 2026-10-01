@@ -42,6 +42,10 @@ STAGES = ['preflight', 'fetch_models', 'fetch_weights', 'fetch_data', 'extract_f
           'sanitize_annotations', 'parse_annotations', 'splits', 'triplets', 'audit',
           'train', 'predict', 'evaluate', 'summary']
 ALWAYS_RUN = {'preflight', 'summary'}          # cheap, never skipped
+# Stages whose output belongs to one training run (<root>/runs/<run>, <root>/results/<run>): their
+# 'finished' markers are kept per run, so several runs (pilot, full, other seeds) can share one --root
+# and reuse its data stages.
+RUN_SCOPED = {'train', 'predict', 'evaluate'}
 
 # name -> defaults. CLI flags override any of these.
 PRESETS = {
@@ -110,7 +114,8 @@ def gb(n):
 
 class Paths:
     def __init__(self, root, run):
-        self.root = Path(root).resolve()
+        self.root = Path(root).expanduser().resolve()
+        self.run_name = run
         r = self.root
         self.raw, self.weights_dir, self.hf = r / 'raw', r / 'weights', r / 'hf_cache'
         self.zip, self.extracted, self.inventory = self.raw / 'dataset.zip', self.raw / 'extracted', self.raw / 'inventory.json'
@@ -129,6 +134,8 @@ class Paths:
         return self.triplets / f'cholec80_{split}_triplets.csv'
 
     def marker(self, stage):
+        if stage in RUN_SCOPED:
+            return self.state / f'{stage}.{self.run_name}.done.json'
         return self.state / f'{stage}.done.json'
 
 
@@ -179,6 +186,13 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None):
     return rc
 
 
+def native_bf16():
+    """True only on GPUs with bf16 tensor cores (compute capability >= 8: A100, L40, RTX 30xx+).
+    torch.cuda.is_bf16_supported() also counts *emulated* bf16 on V100/T4, which is much slower."""
+    import torch
+    return bool(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8)
+
+
 # --------------------------------------------------------------------------- settings
 def resolve_settings(a):
     preset = PRESETS[a.preset]
@@ -188,6 +202,11 @@ def resolve_settings(a):
     a.workers = a.workers or min(16, max(1, cpu_count()))
     if a.run_name is None:
         a.run_name = f'{a.preset}_seed{a.seed}'
+    for attr in ('data_zip', 'data_dir', 'weights_path', 'splits_json'):
+        if getattr(a, attr):
+            setattr(a, attr, str(Path(getattr(a, attr)).expanduser().resolve()))
+    if Path(a.text_model).expanduser().exists():                  # a local directory, not a HF model id
+        a.text_model = str(Path(a.text_model).expanduser().resolve())
     a.data_url = a.data_url or os.environ.get('LGEL_DATA_URL')
     a.weights_url = a.weights_url or os.environ.get('LGEL_WEIGHTS_URL')
     return a
@@ -197,7 +216,7 @@ def data_source_id(a):
     # Deliberately NOT the URL/path: download links often expire or carry a token, and a resumed or
     # --offline job must not be rejected just because the link is different or absent.
     # (To switch to a different dataset, use a fresh --root.)
-    return sha(f'videos<={a.max_videos}')
+    return sha(f'videos<={a.max_videos}|synthetic={a.synthetic or 0}')
 
 
 def stage_signature(stage, a):
@@ -229,7 +248,7 @@ def stage_preflight(a, p, selected):
         for i in range(torch.cuda.device_count()):
             pr = torch.cuda.get_device_properties(i)
             info['gpus'].append(dict(name=pr.name, memory_gb=round(gb(pr.total_memory), 1)))
-        info['bf16'] = bool(torch.cuda.is_bf16_supported())
+        info['bf16_native'] = native_bf16()
     free = gb(shutil.disk_usage(p.root).free)
     info['free_disk_gb'] = round(free, 1)
     for mod in ['cv2', 'pandas', 'sklearn', 'transformers', 'einops', 'PIL']:
@@ -245,7 +264,7 @@ def stage_preflight(a, p, selected):
     if need_data and free < a.min_free_gb:
         problems.append(f'only {free:.0f} GB free under {p.root}; this preset wants >= {a.min_free_gb} GB '
                         f'(override with --min-free-gb if you are sure)')
-    if any(s in selected for s in ('fetch_data',)) and not (a.data_url or a.data_zip or a.data_dir) \
+    if any(s in selected for s in ('fetch_data',)) and not (a.data_url or a.data_zip or a.data_dir or a.synthetic) \
             and not p.marker('fetch_data').exists():
         problems.append('no dataset source: pass --data-url / --data-zip / --data-dir (or set LGEL_DATA_URL)')
     if 'fetch_weights' in selected and not (a.weights_url or a.weights_path or a.random_init) \
@@ -411,7 +430,16 @@ def find_inventory(base, max_videos):
 
 
 def stage_fetch_data(a, p):
-    if a.data_dir:
+    if a.synthetic:
+        base = p.raw / 'synthetic'
+        if not base.exists():
+            partial = p.raw / 'synthetic.partial'
+            shutil.rmtree(partial, ignore_errors=True)
+            log(f'--synthetic: generating {a.synthetic} FAKE videos (plumbing test; numbers will be meaningless)')
+            run([sys.executable, REPO / 'tools' / 'make_synthetic_cholec80.py', '--out', partial,
+                 '--videos', a.synthetic, '--phantom-rows'], a, p, 'fetch_data')
+            os.replace(partial, base)
+    elif a.data_dir:
         base = Path(a.data_dir).resolve()
         if not base.is_dir():
             raise StageError(f'--data-dir not found: {base}')
@@ -644,7 +672,7 @@ def stage_train(a, p):
     import torch
     amp = a.amp_dtype
     if amp == 'auto':
-        amp = 'bf16' if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else 'fp16'
+        amp = 'bf16' if native_bf16() else 'fp16'
     workers = a.train_workers if a.train_workers is not None else min(8, max(0, cpu_count() - 1))
     cfg = train_config(a, p, workers, amp)
     if p.run_cfg.exists():
@@ -801,13 +829,17 @@ def main(argv=None):
     global _LOGFILE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--preset', choices=sorted(PRESETS), default='full')
-    ap.add_argument('--root', default=os.environ.get('LGEL_ROOT', str(REPO / 'lgel_run')),
-                    help='working directory for ALL data/checkpoints/results (put it on scratch; needs ~200 GB)')
+    ap.add_argument('--root', default=os.environ.get('LGEL_ROOT'),
+                    help='working directory for ALL data/checkpoints/results (put it on scratch; needs ~200 GB). '
+                         'Required for the pilot/full presets (or env LGEL_ROOT).')
     ap.add_argument('--run-name', help='default: <preset>_seed<seed>')
     g = ap.add_argument_group('inputs')
     g.add_argument('--data-url', help='direct link to the Cholec80 zip (or env LGEL_DATA_URL)')
     g.add_argument('--data-zip', help='already-downloaded zip file')
     g.add_argument('--data-dir', help='already-extracted folder containing the videos + phase/tool annotations')
+    g.add_argument('--synthetic', type=int, metavar='N',
+                   help='instead of real data, generate N small FAKE videos in the Cholec80 layout '
+                        '(plumbing test only; results are meaningless)')
     g.add_argument('--weights-url', help='direct link to the M2CRL checkpoint (or env LGEL_WEIGHTS_URL)')
     g.add_argument('--weights-path', help='existing M2CRL checkpoint file')
     g.add_argument('--random-init', action='store_true', help='deliberately start the vision backbone from random weights')
@@ -843,6 +875,12 @@ def main(argv=None):
     if a.list_stages:
         print('\n'.join(STAGES))
         return 0
+    if a.root is None:
+        if a.preset != 'smoke':
+            ap.error('--root is required for the pilot/full presets: give a folder on a large scratch filesystem '
+                     '(~200 GB). The home directory is usually too small, and quotas are not visible to the '
+                     'free-space check.')
+        a.root = str(REPO / 'lgel_run')
     a = resolve_settings(a)
     p = Paths(a.root, a.run_name)
     for d in (p.root, p.state, p.logs, p.tmp):

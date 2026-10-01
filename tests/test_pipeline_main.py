@@ -88,7 +88,7 @@ def test_new_split_matches_create_splits_for_80_videos_and_is_disjoint(tmp_path)
 
 def test_stage_signature_changes_with_video_limit_but_not_with_link():
     a = argparse.Namespace(text_model='m', weights_url='u', weights_path=None, random_init=False, data_url='d',
-                           data_zip=None, data_dir=None, max_videos=None, sample_fps=1.0, max_phantom_rows=3,
+                           data_zip=None, data_dir=None, synthetic=None, max_videos=None, sample_fps=1.0, max_phantom_rows=3,
                            split_seed=1, val_ratio=.1, test_ratio=.1, splits_json=None, audit='all', run_name='r')
     before = {s: pipeline.stage_signature(s, a) for s in ('fetch_data', 'fetch_weights', 'extract_frames')}
     # an expired/rotated link, or an --offline re-run without any link, must still resume
@@ -99,6 +99,9 @@ def test_stage_signature_changes_with_video_limit_but_not_with_link():
     a.max_videos = None
     a.random_init = True                                              # switching to random weights IS a change
     assert pipeline.stage_signature('fetch_weights', a) != before['fetch_weights']
+    a.random_init = False
+    a.synthetic = 6                                                   # fake data must never mix with real data
+    assert pipeline.stage_signature('fetch_data', a) != before['fetch_data']
 
 
 def test_weights_location_is_remembered_between_invocations(tmp_path):
@@ -113,3 +116,41 @@ def test_weights_location_is_remembered_between_invocations(tmp_path):
     assert pipeline.read_weights_path(p, a) == str((tmp_path / 'explicit.pth').resolve())
     a.random_init = True
     assert pipeline.read_weights_path(p, a) == ''
+
+
+def test_runs_sharing_one_root_keep_separate_run_markers(tmp_path):
+    pilot, full = pipeline.Paths(tmp_path, 'pilot_seed42'), pipeline.Paths(tmp_path, 'full_seed42')
+    for stage in ('train', 'predict', 'evaluate'):                      # per run: pilot then full must not collide
+        assert pilot.marker(stage) != full.marker(stage)
+    for stage in ('fetch_data', 'extract_frames', 'splits', 'triplets', 'audit'):   # data is shared and reused
+        assert pilot.marker(stage) == full.marker(stage)
+
+
+@pytest.mark.parametrize('capability,expected', [((7, 0), False), ((7, 5), False), ((8, 0), True), ((9, 0), True)])
+def test_auto_amp_uses_bf16_only_on_native_hardware(monkeypatch, capability, expected):
+    import torch
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda *a, **k: capability)
+    monkeypatch.setattr(torch.cuda, 'is_bf16_supported', lambda *a, **k: True)   # emulated support must not count
+    assert pipeline.native_bf16() is expected
+
+
+def test_real_runs_require_an_explicit_root(monkeypatch):
+    monkeypatch.delenv('LGEL_ROOT', raising=False)
+    for preset in ('pilot', 'full'):
+        with pytest.raises(SystemExit) as e:
+            pipeline.main(['--preset', preset, '--dry-run'])
+        assert e.value.code == 2
+
+
+def test_run_sh_keeps_relative_paths_relative_to_the_callers_directory(tmp_path):
+    import os
+    import subprocess
+    repo = Path(pipeline.__file__).resolve().parent
+    env = dict(os.environ, LGEL_SKIP_ENV='1')
+    env.pop('LGEL_ROOT', None)
+    out = subprocess.run(['bash', str(repo / 'run.sh'), '--preset', 'smoke', '--root', 'rel_root', '--dry-run'],
+                         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert f'root={tmp_path.resolve() / "rel_root"}' in out.stdout
+    assert not (repo / 'rel_root').exists()
