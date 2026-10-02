@@ -155,6 +155,25 @@ def _adapt_backbone_state(sd, model):
     return sd, notes
 
 
+# Tensors that exist only for M2CRL's masked-reconstruction pretraining (MMCRL
+# models/timesformer.py: `masked_embed`, `decoder = Sequential(Conv2d, PixelShuffle)`).
+# The encoder forward never reads them; exact names, not prefixes, so nothing else is hidden.
+_PRETRAIN_ONLY_KEYS = ('masked_embed', 'decoder.0.weight', 'decoder.0.bias')
+
+
+def _select_state_dict(ckpt):
+    """Pick the tensor dictionary out of a checkpoint container.
+
+    M2CRL/DINO training checkpoints (`train_ssl.py`) hold
+    {'student', 'teacher', 'optimizer', 'epoch', 'args', 'dino_loss', ...}; the official
+    downstream code loads 'teacher' (MMCRL eval_finetune.py), so it takes precedence.
+    """
+    for key in ('teacher', 'model_state_dict', 'state_dict', 'model'):
+        if isinstance(ckpt, dict) and isinstance(ckpt.get(key), dict):
+            return ckpt[key], key
+    return ckpt, None
+
+
 def _strict_backbone_load(model, sd, allow_missing=(), ignore_unexpected_prefixes=('head.',)):
     """Load with exact key accounting.
 
@@ -229,6 +248,11 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
     def _load(sd, source):
         sd = _clean_sd(sd)
         sd = _maybe_drop_head(sd)
+        own = model.state_dict()
+        dropped = sorted(k for k in _PRETRAIN_ONLY_KEYS if k in sd and k not in own)
+        if dropped:
+            sd = {k: v for k, v in sd.items() if k not in dropped}
+            print(f'Backbone load ({source}): dropped pretraining-only tensors {dropped}')
         sd = filter_fn(sd, model)  # Conv2d -> Conv3d(1,p,p) patch-embed inflation
         sd, notes = _adapt_backbone_state(sd, model)
         for note in notes:
@@ -242,7 +266,9 @@ def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=Non
             # weights_only=False: legacy checkpoints may contain pickled numpy scalars.
             # Only load checkpoints you trust.
             ckpt = torch.load(pretrained_model, map_location='cpu', weights_only=False)
-            sd = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt.get('model', ckpt)))
+            sd, key = _select_state_dict(ckpt)
+            if key is not None:
+                print(f"Backbone load (local): using checkpoint['{key}']")
             if not isinstance(sd, dict) or not all(hasattr(v, 'shape') for v in sd.values()):
                 raise ValueError('checkpoint does not contain a tensor state dictionary')
             missing, ignored = _load(sd, 'local')

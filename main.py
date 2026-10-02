@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import errno
 import hashlib
 import json
 import os
@@ -34,6 +35,11 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+
+try:
+    import fcntl                                 # POSIX advisory locks (not available on Windows)
+except ImportError:                              # pragma: no cover
+    fcntl = None
 
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
@@ -63,6 +69,9 @@ PRESETS = {
 
 class StageError(RuntimeError):
     pass
+
+
+CHECKPOINT_REJECTED = 3            # exit code of `main.py _check_model` when the checkpoint file itself is unusable
 
 
 # --------------------------------------------------------------------------- utilities
@@ -103,7 +112,7 @@ def cpu_count():
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')     # unique per process: no clash between jobs
     tmp.write_text(json.dumps(value, indent=2, sort_keys=True))
     os.replace(tmp, path)
 
@@ -128,6 +137,8 @@ class Paths:
         self.state, self.logs, self.tmp = r / 'state', r / 'logs', r / 'tmp'
         self.weights_ref = self.state / 'weights_ref.json'
         self.run, self.run_cfg = r / 'runs' / run, r / 'runs' / f'{run}.config.json'
+        self.run_inputs = r / 'runs' / f'{run}.inputs.json'
+        self.prep_lock, self.run_lock = self.state / 'prepare.lock', self.state / f'run.{run}.lock'
         self.results = r / 'results' / run
 
     def triplet_csv(self, split):
@@ -148,7 +159,7 @@ def stage_env(a, p):
     return env
 
 
-def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None):
+def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=None):
     """Run a subprocess, stream its output to the console and logs/<name>.log."""
     p.logs.mkdir(parents=True, exist_ok=True)
     logfile = p.logs / f'{name}.log'
@@ -172,6 +183,8 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None):
             for line in proc.stdout:
                 sys.stdout.write(line)
                 lf.write(line)
+                if on_line is not None:
+                    on_line(line)
             rc = proc.wait()
     finally:
         stop.set()
@@ -182,7 +195,9 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None):
                     'memory limit - request more --mem, or lower --train-workers / --batch-size)')
         elif rc == -15:
             hint = ' (terminated with SIGTERM: usually the scheduler hit the job time limit - just submit the same command again)'
-        raise StageError(f'`{cmd[0]} {cmd[1] if len(cmd) > 1 else ""}` exited with code {rc}{hint}. See {logfile}')
+        err = StageError(f'`{cmd[0]} {cmd[1] if len(cmd) > 1 else ""}` exited with code {rc}{hint}. See {logfile}')
+        err.rc = rc
+        raise err
     return rc
 
 
@@ -191,6 +206,136 @@ def native_bf16():
     torch.cuda.is_bf16_supported() also counts *emulated* bf16 on V100/T4, which is much slower."""
     import torch
     return bool(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8)
+
+
+class FileLock:
+    """Advisory lock on a file under <root>/state. The operating system releases it automatically
+    when the process ends, so a job killed by the scheduler can never leave a stale lock behind."""
+
+    def __init__(self, path):
+        self.path, self.fh = Path(path), None
+
+    def acquire(self, blocking, waiting_for=''):
+        if fcntl is None or self.fh is not None:
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.path, 'a+')
+        try:
+            fcntl.lockf(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                if not blocking:
+                    self.fh.close()
+                    self.fh = None
+                    return False
+                log(f'waiting: another job is {waiting_for} in this --root; continuing as soon as it is done ...')
+                fcntl.lockf(self.fh, fcntl.LOCK_EX)
+                return True
+            log(f'WARNING: this filesystem does not support file locks ({e}). Never run two jobs on the same '
+                f'--root at the same time.')
+            self.fh.close()
+            self.fh = None
+            return True
+
+    def release(self):
+        if self.fh is not None:
+            try:
+                fcntl.lockf(self.fh, fcntl.LOCK_UN)
+            finally:
+                self.fh.close()
+                self.fh = None
+
+
+def busy_runs(p):
+    """Names of runs whose lock is held by a live job right now."""
+    busy = []
+    if fcntl is None or not p.state.exists():
+        return busy
+    for f in sorted(p.state.glob('run.*.lock')):
+        lock = FileLock(f)
+        try:
+            if lock.acquire(blocking=False):
+                lock.release()
+            else:
+                busy.append(f.name[len('run.'):-len('.lock')])
+        except OSError:
+            pass
+    return busy
+
+
+def input_fingerprint(p):
+    """Hashes of every prepared file a training run consumes (and the test manifest it is evaluated on)."""
+    files = dict(splits=p.splits, train_triplets=p.triplet_csv('train'), val_triplets=p.triplet_csv('val'),
+                 test_triplets=p.triplet_csv('test'), video_metadata=p.metadata, parsed_annotations=p.parsed)
+    return {k: (file_sha(f) if f.exists() else None) for k, f in files.items()}
+
+
+def check_run_inputs(p, run_name):
+    """A run's checkpoints, predictions and metrics belong to the exact data they were made from.
+    If the shared data was rebuilt differently since (other split seed, other fps, --force ...),
+    reusing them would e.g. evaluate a model on test videos it was trained on. Refuse instead."""
+    current = input_fingerprint(p)
+    missing = sorted(k for k, v in current.items() if v is None)
+    if missing:
+        raise StageError(f'the prepared data is incomplete (missing: {missing}); run the data stages first '
+                         f'(the full command, or --to-stage audit).')
+    if p.run_inputs.exists():
+        saved = json.loads(p.run_inputs.read_text())
+        changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))
+        produced = (p.run.exists() and any(p.run.glob('*.pth'))) or \
+            (p.results.exists() and any(p.results.glob('proposed_*')))
+        if changed and not produced:
+            log(f'run "{run_name}" had not produced anything yet; recording the current data for it')
+            write_json(p.run_inputs, current)
+            return
+        if changed:
+            raise StageError(
+                f'the prepared data changed since run "{run_name}" was started (changed: {changed}). Its '
+                f'checkpoints and results belong to the old data and must not be reused or evaluated on the new '
+                f'data. Start a new run with a different --run-name (or use a new --root), or restore the '
+                f'original data settings. (Run folders: {p.run}, {p.results}.)')
+        return
+    checkpoints = sorted(p.run.glob('*.pth')) if p.run.exists() else []
+    if checkpoints:
+        # A run started before this check existed: compare with the provenance train.py stored.
+        import torch
+        ck = torch.load(checkpoints[0], map_location='cpu', weights_only=False)
+        prov = ck.get('provenance') or {}
+        pairs = dict(TRAIN_TRIPLETS_CSV_PATH='train_triplets', VAL_TRIPLETS_CSV_PATH='val_triplets',
+                     CHOLEC80_PARSED_ANNOTATIONS='parsed_annotations', VIDEO_METADATA_PATH='video_metadata')
+        bad = [ours for theirs, ours in pairs.items() if str(prov.get(theirs, ''))[:16] != current[ours]]
+        if bad:
+            raise StageError(f'run "{run_name}" was trained on different data ({bad}); use a new --run-name.')
+    write_json(p.run_inputs, current)
+
+
+GPU_CHECK = r"""
+import sys, torch
+d = torch.device('cuda')
+x = torch.randn(512, 512, device=d, requires_grad=True)
+(x @ x).relu().sum().backward()
+conv = torch.nn.Conv3d(3, 8, (1, 16, 16), stride=(1, 16, 16)).to(d)
+conv(torch.randn(2, 3, 2, 32, 32, device=d)).sum().backward()
+with torch.autocast('cuda', dtype=torch.bfloat16 if sys.argv[1] == 'bf16' else torch.float16):
+    y = torch.nn.functional.scaled_dot_product_attention(*(torch.randn(2, 4, 64, 32, device=d),) * 3)
+float(y.float().sum())
+torch.cuda.synchronize()
+print('GPU check OK:', torch.cuda.get_device_name(0), 'compute capability', torch.cuda.get_device_capability(0),
+      '| this PyTorch build supports', torch.cuda.get_arch_list())
+"""
+
+
+def pin_single_gpu(count):
+    """The code trains on one GPU. If the job sees several, expose only the first to every step, so
+    the run (whose checkpoints record the visible-device count for exact resume) can be resumed by a
+    job that sees one GPU, and vice versa."""
+    if count <= 1:
+        return None
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES', '').strip()
+    first = visible.split(',')[0].strip() if visible else '0'
+    os.environ['CUDA_VISIBLE_DEVICES'] = first
+    return first
 
 
 # --------------------------------------------------------------------------- settings
@@ -241,7 +386,11 @@ def stage_signature(stage, a):
 
 # --------------------------------------------------------------------------- stage: preflight
 def stage_preflight(a, p, selected):
-    import torch
+    try:
+        import torch
+    except Exception as e:                                      # noqa: BLE001
+        raise StageError(f'PyTorch is not importable ({e}): the environment is missing or incomplete. '
+                         f'Run `bash setup_env.sh` on a machine with internet.')
     info = dict(host=platform.node(), python=sys.version.split()[0], platform=platform.platform(),
                 cpus=cpu_count(), torch=torch.__version__, cuda=torch.cuda.is_available(), gpus=[])
     if info['cuda']:
@@ -249,6 +398,11 @@ def stage_preflight(a, p, selected):
             pr = torch.cuda.get_device_properties(i)
             info['gpus'].append(dict(name=pr.name, memory_gb=round(gb(pr.total_memory), 1)))
         info['bf16_native'] = native_bf16()
+        pinned = pin_single_gpu(torch.cuda.device_count())
+        if pinned is not None:
+            info['pinned_cuda_visible_devices'] = pinned
+            log(f'{torch.cuda.device_count()} GPUs visible; this code uses one, so every step will see only '
+                f'CUDA_VISIBLE_DEVICES={pinned} (request a single GPU to avoid reserving idle ones)')
     free = gb(shutil.disk_usage(p.root).free)
     info['free_disk_gb'] = round(free, 1)
     for mod in ['cv2', 'pandas', 'sklearn', 'transformers', 'einops', 'PIL']:
@@ -273,6 +427,16 @@ def stage_preflight(a, p, selected):
                         'or --random-init to deliberately train the backbone from scratch')
     if problems:
         raise StageError('preflight failed:\n  - ' + '\n  - '.join(problems))
+    if info['cuda'] and any(s in selected for s in ('train', 'predict')):
+        # Seeing a GPU is not the same as being able to run on it: run real kernels now, in seconds,
+        # instead of failing after hours of data preparation.
+        try:
+            run([sys.executable, '-c', GPU_CHECK, 'bf16' if native_bf16() else 'fp16'], a, p, 'gpu_check')
+        except StageError as e:
+            raise StageError(f'the GPU cannot run PyTorch kernels with this environment ({e}). Typical causes: a '
+                             f'GPU newer than the installed PyTorch build (RTX 50xx / Blackwell needs PyTorch >= 2.7 '
+                             f'with CUDA 12.8; this environment pins 2.5.1 + CUDA 12.4), or an NVIDIA driver too old '
+                             f'for CUDA 12.4. See logs/gpu_check.log.')
     write_json(p.logs / 'preflight.json', info)
     return info
 
@@ -308,9 +472,48 @@ def remote_size(url):
 
 
 def download(url, dest, a, p, name):
-    """Resumable download. Safe to call again after an interruption."""
+    """Resumable download. Safe to call again after an interruption: a finished file (recorded in
+    <file>.complete) is reused, a partial one is continued. Never touches the network with --offline."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    complete = dest.with_name(dest.name + '.complete')
+    if dest.exists() and complete.exists():
+        try:
+            recorded = json.loads(complete.read_text()).get('size')
+        except (OSError, ValueError):
+            recorded = None
+        if recorded == dest.stat().st_size:
+            log(f'{dest.name} already downloaded ({gb(recorded):.2f} GB)')
+            return
+    complete.unlink(missing_ok=True)
+    if a.offline:
+        raise StageError(f'--offline: {dest.name} has not been (completely) downloaded yet and the network may not be '
+                         f'used. Run the same command once without --offline on a machine with internet, adding '
+                         f'--to-stage fetch_data, or give a local file (--weights-path / --data-zip / --data-dir).')
+    if not url:
+        raise StageError(f'{dest.name} is missing and no download link was given.')
+    _download(url, dest, a, p, name)
+    with open(dest, 'rb') as f:
+        head = f.read(1024).lstrip().lower()
+    if head.startswith((b'<!doctype html', b'<html', b'<?xml', b'<head', b'<body')):
+        dest.unlink()
+        raise StageError(f'the link for {dest.name} returned a web page, not the file (a share page, a login page or an '
+                         f'expired link). Give a direct download link and run the same command again.')
+    write_json(complete, dict(size=dest.stat().st_size, finished=time.ctime()))
+
+
+def discard_download(path):
+    """Forget a downloaded file that turned out to be unusable, so the next run downloads it again."""
+    path = Path(path)
+    path.with_name(path.name + '.complete').unlink(missing_ok=True)
+    if path.exists():
+        aside = path.with_name(f'{path.name}.rejected-{time.strftime("%Y%m%d-%H%M%S")}')
+        os.replace(path, aside)
+        return aside
+    return None
+
+
+def _download(url, dest, a, p, name):
     if any(h in url for h in ('drive.google.com', 'docs.google.com')):
         if shutil.which('gdown') is None and subprocess.run([sys.executable, '-m', 'gdown', '--version'],
                                                             capture_output=True).returncode != 0:
@@ -356,8 +559,7 @@ def stage_fetch_weights(a, p):
             raise StageError(f'--weights-path not found: {a.weights_path}')
         weights = str(Path(a.weights_path).resolve())
     else:
-        if not p.weights.exists() or p.weights.stat().st_size == 0:
-            download(a.weights_url, p.weights, a, p, 'fetch_weights')
+        download(a.weights_url, p.weights, a, p, 'fetch_weights')   # continues a partial file; instant if complete
         weights = str(p.weights)
     # Build the real model once: this is the only place a wrong checkpoint would surface, and it
     # is far better to learn that now than after hours of frame extraction.
@@ -365,7 +567,15 @@ def stage_fetch_weights(a, p):
     p.tmp.mkdir(parents=True, exist_ok=True)
     cfg_path = p.tmp / 'check_model.json'
     write_json(cfg_path, cfg)
-    run([sys.executable, __file__, '_check_model', cfg_path], a, p, 'fetch_weights')
+    try:
+        run([sys.executable, __file__, '_check_model', cfg_path], a, p, 'fetch_weights')
+    except StageError as e:
+        if not a.weights_path and getattr(e, 'rc', None) == CHECKPOINT_REJECTED:   # our download, really unusable
+            aside = discard_download(p.weights)
+            raise StageError(f'{e}\n   The downloaded checkpoint does not load (moved to {aside.name if aside else "-"}). '
+                             f'Check the weights link (it must point to the M2CRL checkpoint file itself) and run the '
+                             f'same command again.')
+        raise
     # Remember where the checkpoint is, so a later invocation (e.g. the offline compute-node job,
     # which is not given --weights-path/--weights-url again) still finds it.
     write_json(p.weights_ref, dict(path=weights, random_init=bool(a.random_init)))
@@ -377,7 +587,15 @@ def _check_model(cfg_path):
     from project_config import config
     _apply_overrides(config, json.loads(Path(cfg_path).read_text()))
     from models import LocalizationFramework
-    LocalizationFramework(config, initialize_backbone=True)
+    try:
+        LocalizationFramework(config, initialize_backbone=True)
+    except RuntimeError as e:
+        # Only a checkpoint the loader actually rejects counts as a bad file; running out of memory,
+        # being killed, or a text-encoder problem must not get a good download thrown away.
+        if str(e).startswith('Found pretrained checkpoint') and not isinstance(e.__cause__, MemoryError):
+            print(f'CHECKPOINT REJECTED: {e}', flush=True)
+            sys.exit(CHECKPOINT_REJECTED)
+        raise
     print('model construction OK (backbone checkpoint and text encoder both load)')
 
 
@@ -417,7 +635,7 @@ def find_inventory(base, max_videos):
             out[key] = f
         return out
     phases, tools = collect('*-phase.txt', '-phase.txt'), collect('*-tool.txt', '-tool.txt')
-    videos = {f.stem: f for f in base.rglob('*.mp4') if not f.name.startswith('._') and '__MACOSX' not in f.parts}
+    videos = collect('*.mp4', '.mp4')                       # duplicates are an error, as for annotations
     if not (phases and tools and videos):
         raise StageError(f'Could not find the dataset under {base}: found {len(videos)} .mp4, {len(phases)} '
                          f'*-phase.txt, {len(tools)} *-tool.txt files.')
@@ -451,12 +669,22 @@ def stage_fetch_data(a, p):
                 download(a.data_url, zpath, a, p, 'fetch_data')
             log(f'verifying {zpath.name} ({gb(zpath.stat().st_size):.1f} GB) ...')
             if not zipfile.is_zipfile(zpath):
-                raise StageError(f'{zpath} is not a valid zip (download incomplete? re-run to resume).')
+                if not a.data_zip:
+                    zpath.with_name(zpath.name + '.complete').unlink(missing_ok=True)
+                    zpath.unlink(missing_ok=True)
+                    raise StageError('the downloaded file is not a zip archive (it was deleted). Check that the data '
+                                     'link downloads the zip itself, then run the same command again.')
+                raise StageError(f'{zpath} is not a valid zip archive.')
             if not a.skip_zip_check:
                 with zipfile.ZipFile(zpath) as z:
                     bad = z.testzip()
                 if bad:
-                    raise StageError(f'Corrupt member in zip: {bad}. Delete {zpath} and re-run.')
+                    if not a.data_zip:
+                        zpath.with_name(zpath.name + '.complete').unlink(missing_ok=True)
+                        zpath.unlink(missing_ok=True)
+                        raise StageError(f'the downloaded zip is corrupt ({bad}); it was deleted, run the same command '
+                                         f'again to download it again.')
+                    raise StageError(f'Corrupt member in zip: {bad}.')
             partial = p.raw / 'extracted.partial'
             shutil.rmtree(partial, ignore_errors=True)
             log(f'extracting to {p.extracted} ...')
@@ -491,6 +719,7 @@ def _extract_one(job):
     t0 = time.time()
     video_id = 'CHOLEC80__' + Path(src).stem
     dest = Path(frames_dir) / video_id
+    Path(shard).unlink(missing_ok=True)                          # the old frames are about to be replaced
     shutil.rmtree(dest, ignore_errors=True)                      # leftovers of an interrupted run
     tmp = Path(tempfile.mkdtemp(dir=tmp_root))
     try:
@@ -513,12 +742,25 @@ def stage_extract_frames(a, p):
     p.shards.mkdir(parents=True, exist_ok=True)
     p.tmp.mkdir(parents=True, exist_ok=True)
     p.frames.mkdir(parents=True, exist_ok=True)
-    todo = []
+    todo, missing_raw = [], []
     for v, files in inv.items():
         shard = p.shards / f'CHOLEC80__{v}.json'
         if shard.exists() and (p.frames / f'CHOLEC80__{v}').is_dir():
+            try:
+                done_fps = json.loads(shard.read_text())[f'CHOLEC80__{v}'].get('sample_fps')
+            except (OSError, ValueError, KeyError, AttributeError):
+                done_fps = None
+            if done_fps == a.sample_fps:
+                continue
+            log(f'  {v}: existing frames were sampled at {done_fps} fps, now {a.sample_fps} fps: extracting again')
+        if not Path(files['video']).exists():
+            missing_raw.append(v)
             continue
         todo.append((files['video'], str(p.frames), str(shard), a.sample_fps, str(p.tmp)))
+    if missing_raw:
+        raise StageError(f'the raw videos needed to (re)extract frames are gone: {missing_raw[:5]}'
+                         f'{" ..." if len(missing_raw) > 5 else ""} (deleted by --cleanup-raw?). Use a fresh --root, '
+                         f'or restore the videos.')
     log(f'frame extraction: {len(inv) - len(todo)} videos already done, {len(todo)} to do, '
         f'{min(a.workers, max(1, len(todo)))} parallel workers')
     failures = []
@@ -661,15 +903,64 @@ def train_config(a, p, workers, amp_dtype):
 
 
 def completed_epochs(p):
+    """Epochs finished = the epoch stored in latest_model.pth (written atomically by train.py).
+    The metrics journal is appended *after* that save, so it can lag behind by one row."""
+    latest = p.run / 'latest_model.pth'
+    if not latest.exists():
+        return 0
+    import torch
+    return int(torch.load(latest, map_location='cpu', weights_only=False)['epoch'])
+
+
+def repair_metrics_journal(p, done):
+    """Make training_metrics.jsonl consistent with the checkpoint after an interrupted job: drop a
+    half-written last line, rows beyond the saved epoch and replayed duplicates (the last one wins).
+    Returns the epochs <= done that have no row (job killed between checkpoint save and append)."""
     f = p.run / 'training_metrics.jsonl'
     if not f.exists():
-        return 0
-    lines = [l for l in f.read_text().splitlines() if l.strip()]
-    return json.loads(lines[-1])['epoch'] if lines else 0
+        return list(range(1, done + 1))
+    original = f.read_text()
+    rows = {}
+    for line in original.splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and isinstance(r.get('epoch'), int) and 1 <= r['epoch'] <= done:
+            rows[r['epoch']] = r
+    text = ''.join(json.dumps(rows[e]) + '\n' for e in sorted(rows))
+    if text != original:
+        backup = f.with_name(f'{f.name}.before-repair-{time.strftime("%Y%m%d-%H%M%S")}')
+        shutil.copy2(f, backup)
+        tmp = f.with_name(f'{f.name}.{os.getpid()}.tmp')
+        tmp.write_text(text)
+        os.replace(tmp, f)
+        log(f'repaired {f.name} after an interrupted job (original kept as {backup.name})')
+    missing = [e for e in range(1, done + 1) if e not in rows]
+    if missing:
+        log(f'note: no metrics row for epoch(s) {missing} (the job stopped between saving the checkpoint and '
+            f'logging); the checkpoints themselves are complete')
+    return missing
+
+
+def recover_unresumable_run(p):
+    """No latest_model.pth: the job died before the first epoch finished saving. Nothing can be
+    resumed, so the run starts again; a folder holding checkpoint files is kept aside, never deleted."""
+    if (p.run / 'latest_model.pth').exists() or not p.run.exists():
+        return None
+    if any(p.run.rglob('*.pth')):
+        aside = p.run.with_name(f'{p.run.name}.interrupted-{time.strftime("%Y%m%d-%H%M%S")}')
+        os.replace(p.run, aside)
+        log(f'{p.run.name} was interrupted during its first epoch; restarting it (partial files kept in {aside.name})')
+        return aside
+    shutil.rmtree(p.run)
+    return None
 
 
 def stage_train(a, p):
-    import torch
+    check_run_inputs(p, a.run_name)
     amp = a.amp_dtype
     if amp == 'auto':
         amp = 'bf16' if native_bf16() else 'fp16'
@@ -693,7 +984,9 @@ def stage_train(a, p):
             write_json(p.run_cfg, cfg)
     else:
         write_json(p.run_cfg, cfg)
+    recover_unresumable_run(p)
     done = completed_epochs(p)
+    repair_metrics_journal(p, done)
     if done >= cfg['TRAIN']['NUM_EPOCHS']:
         log(f'training already finished ({done} epochs)')
         return
@@ -702,17 +995,28 @@ def stage_train(a, p):
     if latest.exists():
         log(f'resuming from {latest} (epochs finished so far: {done}/{cfg["TRAIN"]["NUM_EPOCHS"]})')
         cmd += ['--resume_from', latest]
-    elif p.run.exists():                                         # crashed before the first checkpoint
-        if any(p.run.rglob('*.pth')):
-            raise StageError(f'{p.run} holds checkpoints but no latest_model.pth; inspect it manually.')
-        shutil.rmtree(p.run)
-    run(cmd, a, p, 'train')
-    if completed_epochs(p) < cfg['TRAIN']['NUM_EPOCHS']:
+    run(cmd, a, p, 'train', on_line=_epoch_progress(cfg['TRAIN']['NUM_EPOCHS']))
+    done = completed_epochs(p)
+    repair_metrics_journal(p, done)
+    if done < cfg['TRAIN']['NUM_EPOCHS']:
         raise StageError('train.py ended before the configured number of epochs.')
+
+
+def _epoch_progress(total):
+    def on_line(line):
+        if line.startswith('{"epoch"'):
+            try:
+                r = json.loads(line)
+                log(f'epoch {r["epoch"]}/{total} done: train {r.get("train_seconds", 0) / 60:.1f} min, validation '
+                    f'{r.get("val_seconds", 0) / 60:.1f} min, val NLL {r.get("val_frame_nll")}')
+            except (ValueError, KeyError, TypeError):
+                pass
+    return on_line
 
 
 # --------------------------------------------------------------------------- predict / evaluate
 def stage_predict(a, p):
+    check_run_inputs(p, a.run_name)
     ckpt = p.run / 'best_model.pth'
     if not ckpt.exists():
         raise StageError(f'{ckpt} not found; the train stage must finish first.')
@@ -733,6 +1037,7 @@ def stage_predict(a, p):
 
 
 def stage_evaluate(a, p):
+    check_run_inputs(p, a.run_name)
     calib, test = p.results / 'proposed_calibration.json', p.results / 'proposed_test_metrics.json'
     for f in (calib, test):
         f.unlink(missing_ok=True)
@@ -749,7 +1054,13 @@ def _fmt(x):
     return 'n/a' if x is None else f'{x:.4f}'
 
 
+def _duration(seconds):
+    return f'{seconds / 60:.0f} min' if seconds < 5400 else f'{seconds / 3600:.1f} h'
+
+
 def stage_summary(a, p):
+    if p.run_inputs.exists():
+        check_run_inputs(p, a.run_name)                       # never report old results next to new data
     p.results.mkdir(parents=True, exist_ok=True)
     lines = [f'# Run summary: {a.run_name}', '', f'Generated {time.ctime()} on {platform.node()}.', '']
     try:
@@ -769,14 +1080,35 @@ def stage_summary(a, p):
         lines.append('')
     tm = p.run / 'training_metrics.jsonl'
     if tm.exists():
-        rows = [json.loads(l) for l in tm.read_text().splitlines() if l.strip()]
+        rows = []
+        for l in tm.read_text().splitlines():
+            try:
+                rows.append(json.loads(l))
+            except ValueError:
+                pass
         summary['training'] = rows
         lines += ['## Training (validation = held-out videos)', '',
-                  '| epoch | train loss | val NLL | AUROC | AP | F1 @ val threshold |', '|---|---|---|---|---|---|']
+                  '| epoch | train loss | val NLL | AUROC | AP | F1 @ val threshold | train min | val min |',
+                  '|---|---|---|---|---|---|---|---|']
         for r in rows:
+            mins = [f'{r[k] / 60:.1f}' if isinstance(r.get(k), (int, float)) else 'n/a' for k in ('train_seconds', 'val_seconds')]
             lines.append(f'| {r["epoch"]} | {_fmt(r["train_loss"])} | {_fmt(r["val_frame_nll"])} | {_fmt(r["auroc"])} | '
-                         f'{_fmt(r["average_precision"])} | {_fmt(r["validation_f1"])} |')
+                         f'{_fmt(r["average_precision"])} | {_fmt(r["validation_f1"])} | {mins[0]} | {mins[1]} |')
         lines.append('')
+        timed = [r for r in rows if isinstance(r.get('train_seconds'), (int, float)) and isinstance(r.get('val_seconds'), (int, float))]
+        if timed and a.preset == 'pilot' and a.subset_ratio:
+            tr = sorted(r['train_seconds'] for r in timed)[len(timed) // 2]
+            va = sorted(r['val_seconds'] for r in timed)[len(timed) // 2]
+            full = PRESETS['full']
+            epoch_s = tr * full['subset_ratio'] / a.subset_ratio + va
+            summary['full_run_estimate_hours'] = round(full['epochs'] * epoch_s / 3600, 1)
+            lines += ['## Time estimate for the `full` preset', '',
+                      f'Pilot epoch (median): {tr / 60:.1f} min training on {a.subset_ratio:.0%} of the training windows + '
+                      f'{va / 60:.1f} min validation. Scaling the training part to all windows gives about '
+                      f'**{_duration(epoch_s)} per full epoch** and **{_duration(full["epochs"] * epoch_s)} for '
+                      f'{full["epochs"]} epochs**, plus prediction. Rough: it assumes the same GPU and file system, and '
+                      f'that training time grows linearly with the number of training windows. Each job must fit at '
+                      f'least one whole epoch, because training resumes from the last finished epoch.', '']
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -883,22 +1215,57 @@ def main(argv=None):
         a.root = str(REPO / 'lgel_run')
     a = resolve_settings(a)
     p = Paths(a.root, a.run_name)
-    for d in (p.root, p.state, p.logs, p.tmp):
-        d.mkdir(parents=True, exist_ok=True)
-    _LOGFILE = p.logs / 'main.log'
     selected = select_stages(a)
+    redo = []
     for f in filter(None, (a.force or '').split(',')):
         if f not in STAGES:
             raise SystemExit(f'--force: unknown stage {f!r}')
-        for later in STAGES[STAGES.index(f):]:
-            p.marker(later).unlink(missing_ok=True)
+        redo += [s for s in STAGES[STAGES.index(f):] if s not in redo]
 
+    if a.dry_run:                                       # describe only: nothing is created or deleted
+        print(f'preset={a.preset} run={a.run_name} root={p.root}')
+        print('stages: ' + ' -> '.join(selected))
+        for s in selected:
+            if s in ALWAYS_RUN:
+                what = 'run'
+            elif s in redo:
+                what = 'run (forced)'
+            elif s == 'train':
+                what = 'run (resumes, or confirms that training is finished)'
+            else:
+                what = 'skip (finished)' if p.marker(s).exists() else 'run'
+            print(f'  {s}: {what}')
+        if redo:
+            print('(--force would first discard the "finished" markers of: ' + ', '.join(redo) + ')')
+        return 0
+
+    for d in (p.root, p.state, p.logs, p.tmp):
+        d.mkdir(parents=True, exist_ok=True)
+    _LOGFILE = p.logs / 'main.log'
     log(f'preset={a.preset} run={a.run_name} root={p.root}')
     log('stages: ' + ' -> '.join(selected))
-    if a.dry_run:
-        for s in selected:
-            log(f'  {s}: {"skip (finished)" if p.marker(s).exists() and s not in ALWAYS_RUN else "run"}')
-        return 0
+    prep_lock, run_lock = FileLock(p.prep_lock), FileLock(p.run_lock)
+    if redo:
+        shared = [s for s in redo if s not in RUN_SCOPED and s not in ALWAYS_RUN]
+        if shared:
+            if not prep_lock.acquire(blocking=False):
+                log('!! another job is preparing data in this --root right now; --force of data stages has to wait '
+                    'until it has finished.')
+                return 1
+            busy = busy_runs(p)
+            if busy:
+                log(f'!! run(s) {busy} are using the data of this --root right now; --force of data stages would '
+                    f'change it under them. Wait until they have finished.')
+                return 1
+            log(f'--force: data stages {shared} will be redone. Runs trained on the previous data cannot be '
+                f'continued or evaluated afterwards (they are refused); start new runs instead.')
+        for s in redo:
+            p.marker(s).unlink(missing_ok=True)
+    if any(s in RUN_SCOPED for s in selected) and not run_lock.acquire(blocking=False):
+        # Refuse a duplicate submission at once, before it waits for or touches anything.
+        log(f'!! run "{a.run_name}" is already being processed by another job on this --root. Let that job '
+            f'finish (then resubmit if needed), or use a different --run-name.')
+        return 1
 
     # Preflight runs first, before anything expensive, and catches the avoidable failures.
     t_all = time.time()
@@ -917,6 +1284,14 @@ def main(argv=None):
             continue                                            # already run above
         marker = p.marker(stage)
         sig = stage_signature(stage, a)
+        if stage in RUN_SCOPED:
+            # Wait while another job is (re)building the shared data, then let other jobs use it.
+            prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
+            prep_lock.release()
+        elif stage not in ALWAYS_RUN and not marker.exists():
+            # One job prepares the shared data; a second job started at the same time waits here and
+            # then finds the stages finished.
+            prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
         if stage not in ALWAYS_RUN and marker.exists():
             old = json.loads(marker.read_text())
             if old.get('signature') != sig and stage != 'train':
@@ -944,7 +1319,6 @@ def main(argv=None):
         log(f'== {stage}: finished in {(time.time() - t0) / 60:.1f} min')
     log(f'ALL DONE in {(time.time() - t_all) / 3600:.2f} h. Results: {p.results}')
     return 0
-
 
 if __name__ == '__main__':
     sys.exit(main())

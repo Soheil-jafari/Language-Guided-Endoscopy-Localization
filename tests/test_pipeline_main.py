@@ -1,6 +1,7 @@
 """Orchestrator (main.py) logic that needs no GPU, no model download and no video decoding."""
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -143,6 +144,7 @@ def test_real_runs_require_an_explicit_root(monkeypatch):
         assert e.value.code == 2
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='run.sh is a Linux/HPC wrapper')
 def test_run_sh_keeps_relative_paths_relative_to_the_callers_directory(tmp_path):
     import os
     import subprocess
@@ -154,3 +156,191 @@ def test_run_sh_keeps_relative_paths_relative_to_the_callers_directory(tmp_path)
     assert out.returncode == 0, out.stderr
     assert f'root={tmp_path.resolve() / "rel_root"}' in out.stdout
     assert not (repo / 'rel_root').exists()
+
+
+# ----------------------------------------------------------------- review round 2 (Codex findings)
+def test_dry_run_creates_and_deletes_nothing(tmp_path, capsys):
+    root = tmp_path / 'root'
+    (root / 'state').mkdir(parents=True)
+    marker = root / 'state' / 'fetch_data.done.json'
+    marker.write_text('{"signature": {}}')
+    before = sorted(str(x) for x in root.rglob('*'))
+    assert pipeline.main(['--preset', 'smoke', '--root', str(root), '--force', 'fetch_data', '--dry-run']) == 0
+    assert marker.exists()                                            # --force must not act during a dry run
+    assert sorted(str(x) for x in root.rglob('*')) == before          # no logs/, tmp/ ... created
+    assert 'run (forced)' in capsys.readouterr().out
+    assert pipeline.main(['--preset', 'smoke', '--root', str(tmp_path / 'new'), '--dry-run']) == 0
+    assert not (tmp_path / 'new').exists()
+
+
+def _dl_args(**kw):
+    return argparse.Namespace(**{'offline': False, **kw})
+
+
+def test_download_continues_partial_files_reuses_complete_ones_and_respects_offline(tmp_path, monkeypatch):
+    calls = []
+    def fake_download(url, dest, a, p, name):
+        calls.append(url)
+        Path(dest).write_bytes(b'x' * 10)
+    monkeypatch.setattr(pipeline, '_download', fake_download)
+    p = pipeline.Paths(tmp_path, 'r')
+    dest = tmp_path / 'weights' / 'checkpoint.pth'
+    dest.parent.mkdir()
+    dest.write_bytes(b'x' * 3)                                        # partial file left by a killed job
+    with pytest.raises(pipeline.StageError, match='--offline'):
+        pipeline.download('https://example.invalid/w', dest, _dl_args(offline=True), p, 'w')
+    assert calls == []                                                # offline: no network attempt at all
+    pipeline.download('https://example.invalid/w', dest, _dl_args(), p, 'w')
+    assert calls == ['https://example.invalid/w']                     # partial file -> downloader runs (resumes)
+    pipeline.download(None, dest, _dl_args(offline=True), p, 'w')     # complete -> reused, even offline / no URL
+    assert calls == ['https://example.invalid/w']
+    dest.write_bytes(b'x' * 4)                                        # changed size -> not trusted any more
+    with pytest.raises(pipeline.StageError, match='no download link'):
+        pipeline.download(None, dest, _dl_args(), p, 'w')
+
+
+def test_find_inventory_rejects_duplicate_video_names(tmp_path):
+    for sub in ('a', 'b'):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / 'video01.mp4').write_bytes(sub.encode())
+    (tmp_path / 'video01-phase.txt').write_text('Frame\tPhase\n')
+    (tmp_path / 'video01-tool.txt').write_text('Frame\tGrasper\n')
+    with pytest.raises(pipeline.StageError, match='Duplicate'):
+        pipeline.find_inventory(tmp_path, None)
+
+
+def test_metrics_journal_is_repaired_to_match_the_checkpoint(tmp_path):
+    p = pipeline.Paths(tmp_path, 'r')
+    p.run.mkdir(parents=True)
+    f = p.run / 'training_metrics.jsonl'
+    rows = [dict(epoch=1, train_loss=1.0), dict(epoch=2, train_loss=0.9), dict(epoch=2, train_loss=0.8)]
+    f.write_text(''.join(json.dumps(r) + '\n' for r in rows) + '{"epoch": 3, "train_lo')   # replay + torn line
+    assert pipeline.repair_metrics_journal(p, 3) == [3]                 # epoch 3 saved, but its row never written
+    kept = [json.loads(l) for l in f.read_text().splitlines()]
+    assert kept == [dict(epoch=1, train_loss=1.0), dict(epoch=2, train_loss=0.8)]
+    assert f.read_text().endswith('\n')                               # train.py can append safely again
+    assert list(p.run.glob('training_metrics.jsonl.before-repair-*'))
+    assert pipeline.repair_metrics_journal(p, 1) == []                # rows beyond the checkpoint are dropped
+    assert [json.loads(l)['epoch'] for l in f.read_text().splitlines()] == [1]
+
+
+def test_completed_epochs_come_from_the_checkpoint_not_the_log(tmp_path):
+    import torch
+    p = pipeline.Paths(tmp_path, 'r')
+    assert pipeline.completed_epochs(p) == 0
+    p.run.mkdir(parents=True)
+    torch.save(dict(epoch=4), p.run / 'latest_model.pth')
+    (p.run / 'training_metrics.jsonl').write_text(json.dumps(dict(epoch=3)) + '\n')
+    assert pipeline.completed_epochs(p) == 4
+
+
+def test_a_run_killed_in_its_first_epoch_is_restarted_without_deleting_checkpoints(tmp_path):
+    p = pipeline.Paths(tmp_path, 'r')
+    p.run.mkdir(parents=True)
+    (p.run / 'best_model.pth').write_bytes(b'x')                     # best saved, latest not yet
+    aside = pipeline.recover_unresumable_run(p)
+    assert aside is not None and (aside / 'best_model.pth').exists() and not p.run.exists()
+    p.run.mkdir()
+    (p.run / 'run_config.json').write_text('{}')                     # died before any checkpoint
+    assert pipeline.recover_unresumable_run(p) is None and not p.run.exists()
+    p.run.mkdir()
+    (p.run / 'latest_model.pth').write_bytes(b'x')                   # resumable: untouched
+    assert pipeline.recover_unresumable_run(p) is None and (p.run / 'latest_model.pth').exists()
+
+
+def test_runs_refuse_data_that_changed_after_they_started(tmp_path):
+    p = pipeline.Paths(tmp_path, 'full_seed42')
+    with pytest.raises(pipeline.StageError, match='incomplete'):     # no data yet: refuse, record nothing
+        pipeline.check_run_inputs(p, 'full_seed42')
+    assert not p.run_inputs.exists()
+    p.triplets.mkdir(parents=True)
+    for f in (p.splits, p.metadata, p.parsed, *(p.triplet_csv(s) for s in ('train', 'val', 'test'))):
+        f.write_text('original')
+    pipeline.check_run_inputs(p, 'full_seed42')                       # first launch records the data
+    pipeline.check_run_inputs(p, 'full_seed42')                       # unchanged: fine
+    p.splits.write_text('{"test": ["video01"]}')
+    pipeline.check_run_inputs(p, 'full_seed42')                       # nothing produced yet: adopts the new data
+    p.run.mkdir(parents=True)
+    (p.run / 'latest_model.pth').write_bytes(b'x')                   # now the run has a checkpoint ...
+    p.splits.write_text('{"test": ["a video the model was trained on"]}')
+    with pytest.raises(pipeline.StageError, match='changed since run'):
+        pipeline.check_run_inputs(p, 'full_seed42')                   # ... so changed data is refused
+    other = pipeline.Paths(tmp_path, 'full_seed43')                   # a NEW run on the new data is fine
+    pipeline.check_run_inputs(other, 'full_seed43')
+
+
+def test_a_link_that_returns_a_web_page_is_rejected_and_not_remembered(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, '_download',
+                        lambda url, dest, a, p, name: Path(dest).write_bytes(b'\n  <!DOCTYPE html><html>share page'))
+    p = pipeline.Paths(tmp_path, 'r')
+    dest = tmp_path / 'weights' / 'checkpoint.pth'
+    with pytest.raises(pipeline.StageError, match='web page'):
+        pipeline.download('https://pan.example/s/abc', dest, _dl_args(), p, 'w')
+    assert not dest.exists() and not dest.with_name('checkpoint.pth.complete').exists()
+
+
+def test_reextraction_keeps_valid_frames_when_raw_videos_are_gone(tmp_path):
+    p = pipeline.Paths(tmp_path, 'r')
+    p.shards.mkdir(parents=True)
+    inv = {}
+    for v in ('video01', 'video02'):
+        (p.frames / f'CHOLEC80__{v}').mkdir(parents=True)
+        (p.shards / f'CHOLEC80__{v}.json').write_text(json.dumps({f'CHOLEC80__{v}': dict(sample_fps=1.0, frame_count=50)}))
+        inv[v] = dict(video=str(tmp_path / 'deleted' / f'{v}.mp4'), phase='x', tool='x')
+    pipeline.write_json(p.inventory, dict(base=str(tmp_path), videos=inv))
+    a = argparse.Namespace(sample_fps=2.0, workers=1, cleanup_raw=False, data_dir=None, data_zip=None)
+    with pytest.raises(pipeline.StageError, match='raw videos'):
+        pipeline.stage_extract_frames(a, p)
+    assert len(list(p.shards.glob('*.json'))) == 2                    # the 1 fps metadata is still usable
+
+
+@pytest.mark.skipif(pipeline.fcntl is None, reason='POSIX file locks only')
+def test_locks_detect_another_live_job(tmp_path):
+    import subprocess
+    import sys
+    p = pipeline.Paths(tmp_path, 'full_seed42')
+    p.state.mkdir(parents=True)
+    holder = subprocess.Popen([sys.executable, '-c',
+                               'import fcntl, sys, time; f = open(sys.argv[1], "a+"); fcntl.lockf(f, fcntl.LOCK_EX); '
+                               'print("locked", flush=True); time.sleep(60)', str(p.run_lock)],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == 'locked'
+        assert pipeline.FileLock(p.run_lock).acquire(blocking=False) is False
+        assert pipeline.busy_runs(p) == ['full_seed42']
+    finally:
+        holder.kill()
+        holder.wait()
+    lock = pipeline.FileLock(p.run_lock)
+    assert lock.acquire(blocking=False) is True                       # released when the holder died
+    lock.release()
+    assert pipeline.busy_runs(p) == []
+
+
+def test_only_one_gpu_is_exposed_when_a_job_sees_several(monkeypatch):
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '2,3')
+    assert pipeline.pin_single_gpu(2) == '2'
+    assert os.environ['CUDA_VISIBLE_DEVICES'] == '2'
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES')
+    assert pipeline.pin_single_gpu(4) == '0'
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES')
+    assert pipeline.pin_single_gpu(1) is None and 'CUDA_VISIBLE_DEVICES' not in os.environ
+
+
+@pytest.mark.parametrize('rc,discarded', [(pipeline.CHECKPOINT_REJECTED, True), (-9, False), (1, False)])
+def test_only_a_rejected_checkpoint_is_set_aside(tmp_path, monkeypatch, rc, discarded):
+    p = pipeline.Paths(tmp_path, 'r')
+    p.weights.parent.mkdir(parents=True)
+    p.weights.write_bytes(b'PK\x03\x04 checkpoint')
+    pipeline.write_json(p.weights.with_name('checkpoint.pth.complete'), dict(size=p.weights.stat().st_size))
+    def failing_run(cmd, a, p, name, **kw):
+        err = pipeline.StageError(f'exited with code {rc}')
+        err.rc = rc
+        raise err
+    monkeypatch.setattr(pipeline, 'run', failing_run)
+    a = argparse.Namespace(random_init=False, weights_path=None, weights_url='https://x.invalid/w', offline=False,
+                           text_model='m')
+    with pytest.raises(pipeline.StageError):
+        pipeline.stage_fetch_weights(a, p)
+    assert p.weights.exists() is (not discarded)                     # out of memory / killed: keep the good file
+    assert bool(list(p.weights_dir.glob('checkpoint.pth.rejected-*'))) is discarded

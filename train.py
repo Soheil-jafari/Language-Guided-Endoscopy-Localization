@@ -9,6 +9,7 @@ import csv
 import json
 import math
 import random
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -159,14 +160,18 @@ def main(args):
     (output/'parameter_counts.json').write_text(json.dumps(parameter_counts,indent=2))
     for epoch in range(start,config.TRAIN.NUM_EPOCHS):
         criterion.set_epoch(epoch)
+        started=time.time()
         loss=train_one_epoch(model,train_loader,optimizer,criterion,scheduler,config.TRAIN.DEVICE,scaler,dtype)
+        trained=time.time()
         val,auc,ap,acc,f1,threshold,chosen=validate_one_epoch(model,val_loader,criterion,config.TRAIN.DEVICE)
+        validated=time.time()
         improved=val<best
         if improved: best=val
         extra=dict(provenance=provenance,validation_threshold=threshold)
         if improved: save_checkpoint(model,optimizer,scheduler,scaler,epoch+1,best,output/'best_model.pth',extra)
         save_checkpoint(model,optimizer,scheduler,scaler,epoch+1,best,output/'latest_model.pth',extra)
-        row=dict(epoch=epoch+1,train_loss=loss,val_frame_nll=val,auroc=auc,average_precision=ap,accuracy=acc,validation_f1=f1,validation_threshold=threshold)
+        row=dict(epoch=epoch+1,train_loss=loss,val_frame_nll=val,auroc=auc,average_precision=ap,accuracy=acc,validation_f1=f1,validation_threshold=threshold,
+                 train_seconds=round(trained-started,1),val_seconds=round(validated-trained,1))  # wall time, for planning job lengths
         with (output/'training_metrics.jsonl').open('a') as f: f.write(json.dumps(row,allow_nan=False)+'\n')
         print(json.dumps(row))
 

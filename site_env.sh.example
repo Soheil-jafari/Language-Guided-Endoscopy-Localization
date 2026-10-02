@@ -1,10 +1,14 @@
-# Copy to site_env.sh and put whatever THIS cluster needs
-# before Python runs, e.g.:
+# Copy to site_env.sh and put whatever THIS cluster needs before Python runs.
+# run.sh and setup_env.sh both source it if it exists. For example:
 #
 #   module purge
 #   module load anaconda3        # or miniforge / miniconda - whatever provides `conda`
-#   module load cuda/12.4        # only if the cluster requires it for PyTorch wheels
 #
-# Keep large caches off the small home quota:
-#   export PIP_CACHE_DIR=/path/to/scratch/pip_cache
-#   export CONDA_PKGS_DIRS=/path/to/scratch/conda_pkgs
+# Keep the environment and the download caches off a small or purged home directory, on storage
+# that the compute nodes can read (ask the cluster admins which path to use):
+#   export CONDA_ENVS_PATH=/path/to/project/conda_envs
+#   export CONDA_PKGS_DIRS=/path/to/project/conda_pkgs
+#   export PIP_CACHE_DIR=/path/to/project/pip_cache
+#
+# Optional: a fixed default for --root
+#   export LGEL_ROOT=/path/to/scratch/lgel
