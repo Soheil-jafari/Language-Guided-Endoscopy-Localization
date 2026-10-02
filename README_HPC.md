@@ -21,7 +21,7 @@ steps are skipped and training continues from its last finished epoch.
 | GPU | **Exactly one** NVIDIA GPU with **>= 24 GB** memory, Volta to Hopper generation: V100-32GB, A100, A40, L40/L40S, H100, RTX 3090/4090, RTX A6000. The code is single-GPU by design, so request one GPU per job (if a job sees several, only the first is used). Ampere or newer train in bf16 automatically, older GPUs in fp16. **Not supported:** Blackwell GPUs (RTX 50xx, B100/B200), because the pinned PyTorch 2.5.1 + CUDA 12.4 has no kernels for them. Every GPU job first runs a short real GPU test and stops with a clear message if the GPU cannot be used. |
 | CPU | 8+ cores recommended (frame extraction runs in parallel, one video per process). |
 | RAM | 32 GB or more recommended. |
-| Disk | About **200 GB free** under `--root`. The peak is roughly 150-170 GB, while the ~70 GB zip and the ~80 GB of extracted videos coexist. The zip is deleted after extraction, and the videos can also be deleted with `--cleanup-raw`. |
+| Disk | About **200 GB free** under `--root`. The peak is roughly 150-170 GB, while the ~70 GB zip and the ~80 GB of extracted videos coexist. The zip is deleted after extraction, and the videos can also be deleted with `--cleanup-raw`. Later jobs only check for the space their remaining steps need. |
 | Files | About **200,000 files** under `--root` (one JPEG per second of video, about 180,000). Clusters often limit the number of files (inode quota) as well as bytes; check both, e.g. with `quota -s` or `df -ih`. The free-space check cannot see quotas. |
 | Internet | Needed for the **first** run only (dataset, weights, a small text model). If compute nodes have no internet see section 5. |
 | Software | `conda` (Miniforge/Anaconda), Python 3.12 (installed by `setup_env.sh`), an NVIDIA driver that supports CUDA 12.4 (driver 525.60 or newer; `nvidia-smi` shows the driver version), Linux with glibc >= 2.28 (RHEL/Rocky/Alma 8+, Ubuntu 20.04+; `ldd --version` shows it). |
@@ -114,6 +114,9 @@ each run has its own `runs/<run>/` and `results/<run>/` (run name `<preset>_seed
   prepared the data. It is still better to prepare the data once (step B) before starting
   parallel runs.
 * The same run submitted twice at the same time is refused; the second job stops immediately.
+* This uses file locks. On file systems without lock support, lock files with a heartbeat are used
+  instead; a lock left by a killed job then expires after 5 minutes. If the scratch file system is
+  Lustre mounted with node-local locks (`localflock`), set `export LGEL_LOCK_MODE=lease`.
 * Every run records which data it was trained on. If the shared data is later rebuilt differently
   (other split seed, other frame rate, `--force` of a data stage), that run's checkpoints and
   results are **refused** rather than reused, because they no longer match the data. That
@@ -249,7 +252,9 @@ Resubmitting is safe. On clusters with a per-job time limit the job can also be 
 | `--offline: ... has not been (completely) downloaded` | Run the section 5 download command on a node with internet, then resubmit. |
 | `the link for ... returned a web page, not the file` | The link is a share/login page or has expired. Supply a direct download link and resubmit. |
 | `The downloaded checkpoint does not load` | The weights link points to the wrong file. The bad file is set aside; fix the link and resubmit. |
-| `the downloaded file is not a zip archive` | The data link does not point to the zip itself. Fix the link and resubmit. |
+| `the downloaded dataset archive is corrupt or is not a zip` | The bad file was deleted; resubmit to download it again. If it repeats, the data link does not point to the zip itself. |
+| `the dataset archive uses a compression method Python cannot unpack` | The zip was made with e.g. Windows' Deflate64. Re-create it with standard zip compression, or unzip it and use `--data-dir`. |
+| `N frame file(s) are missing ... extracting again` | Frames were deleted (e.g. by a scratch purge); they are re-extracted automatically if the raw videos still exist. |
 | `the prepared data is incomplete` | Training was started before the data stages finished (e.g. with `--stages train`). Run the full command. |
 | Download stops or the zip is incomplete | Resubmit: downloads continue and the size is verified. Google-Drive links need `gdown` (installed by `setup_env.sh`) and may hit Google's daily quota. |
 | Everything is slow at the start | Frame extraction of ~80 videos is CPU-bound; it scales with `--workers` (default: up to 16). |
@@ -259,7 +264,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 74 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 85 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.
@@ -270,13 +275,18 @@ deliberately **tiny** model on CPU:
   * a partial weights download, which is continued over HTTP;
   * an "internet first, offline later" run;
   * `--offline` refusing to download;
-  * download links that return a web page or a wrong file, then corrected.
+  * download links that return a web page or a wrong file, then corrected;
+  * corrupt archives, and archives Python cannot unpack;
+  * SIGTERM from the scheduler during frame extraction.
 * **Several jobs on one `--root`:**
   * `pilot` followed by `full`;
   * two jobs started at the same moment (the data is prepared once);
   * the same run submitted twice (the duplicate is refused);
-  * a run refused after its split was changed.
-* **Re-extraction:** frames are extracted again after the frame rate changes.
+  * a run refused after its split was changed;
+  * all of the above again with the lock-file fallback for file systems without lock support,
+    including a killed job's lock being taken over.
+* **Re-extraction:** frames are extracted again after the frame rate changes, or when frame files go missing.
+* **Disk check:** an offline job after the download is not refused for the space the download already uses.
 * **Exact resume:** killing training after epoch 2 and resuming gives bit-identical weights, optimizer/scheduler state and metrics to an uninterrupted run.
 * **Pretrained checkpoint format:** checkpoints in the official M2CRL training format (`teacher`/`student`), and plain state dicts, load with strict checks of every encoder tensor.
 * **Environment scripts:** `run.sh` activates and checks the conda env in a non-interactive shell (Miniforge, conda 26.7), and `setup_env.sh` runs up to the PyTorch download.

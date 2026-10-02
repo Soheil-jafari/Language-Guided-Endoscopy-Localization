@@ -20,6 +20,7 @@ Stages (run `python main.py --list-stages`):
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures as cf
 import errno
 import hashlib
@@ -28,12 +29,15 @@ import os
 import platform
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 try:
@@ -201,6 +205,58 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
     return rc
 
 
+def disk_needed_gb(a, p, selected):
+    """Free space the stages that are still to run need: the preset's figure before the download, and
+    only what is left to write afterwards (frames, checkpoints), so a resubmitted or offline job is not
+    refused because of the space the earlier stages legitimately used. --min-free-gb caps all values."""
+    def tree_bytes(path):
+        total = 0
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        return total
+
+    def frames_need(video_bytes):                      # JPEGs at 1 fps: well under half the video size
+        return 0.5 * video_bytes / 1024 ** 3 + 10
+
+    todo = [s for s in selected if s not in ALWAYS_RUN and not p.marker(s).exists()]
+    if 'fetch_data' in todo and (a.synthetic or a.data_dir):
+        videos = 0
+        for f in (Path(a.data_dir).rglob('*.mp4') if a.data_dir else ()):
+            try:
+                videos += f.stat().st_size
+            except OSError:                                  # broken link etc.: find_inventory reports it
+                pass
+        need, what = frames_need(videos), 'frame extraction'
+    elif 'fetch_data' in todo:
+        present = tree_bytes(p.raw / 'extracted.partial')   # a partial unpack is replaced, not added to
+        if p.zip.exists():                                   # a (partial) download is continued
+            present += p.zip.stat().st_size
+        if a.data_zip:                                       # the archive lives elsewhere: no download needed
+            try:
+                present += Path(a.data_zip).stat().st_size
+            except OSError:
+                pass
+        need, what = max(frames_need(0), a.min_free_gb - present / 1024 ** 3), 'downloading and unpacking the dataset'
+    elif 'extract_frames' in todo:
+        video_bytes = 0
+        if p.inventory.exists():
+            for files in json.loads(p.inventory.read_text())['videos'].values():
+                try:
+                    video_bytes += Path(files['video']).stat().st_size
+                except OSError:
+                    pass
+        need, what = frames_need(video_bytes), 'frame extraction'
+    elif any(s in RUN_SCOPED for s in selected):
+        need, what = 10, 'checkpoints and results'
+    else:
+        return 0, ''
+    return min(need, a.min_free_gb), what
+
+
 def native_bf16():
     """True only on GPUs with bf16 tensor cores (compute capability >= 8: A100, L40, RTX 30xx+).
     torch.cuda.is_bf16_supported() also counts *emulated* bf16 on V100/T4, which is much slower."""
@@ -208,35 +264,145 @@ def native_bf16():
     return bool(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8)
 
 
+# A lock whose holder stopped refreshing it for this long belongs to a job that was killed.
+LEASE_STALE = float(os.environ.get('LGEL_LOCK_STALE_SECONDS', 300))
+LEASE_BEAT = max(1.0, LEASE_STALE / 10)
+
+
 class FileLock:
-    """Advisory lock on a file under <root>/state. The operating system releases it automatically
-    when the process ends, so a job killed by the scheduler can never leave a stale lock behind."""
+    """Exclusive lock on a file under <root>/state, used so that concurrent jobs on one --root take turns.
+
+    Normally an OS advisory lock (fcntl), which the system releases by itself when a job ends or is
+    killed. On file systems without lock support (or with LGEL_LOCK_MODE=lease, e.g. for Lustre
+    mounted with node-local `localflock`), a lease file is used instead: created atomically, kept
+    fresh by a heartbeat, and considered abandoned when its heartbeat is older than LEASE_STALE."""
+
+    mode = None                                   # 'fcntl' or 'lease', decided once per process
+    _held_leases = []
 
     def __init__(self, path):
-        self.path, self.fh = Path(path), None
+        self.path, self.fh, self.lease, self._stop = Path(path), None, None, None
+
+    @property
+    def held(self):
+        return self.fh is not None or self.lease is not None
+
+    @property
+    def lease_path(self):
+        return self.path.with_name(self.path.name + '.lease')
 
     def acquire(self, blocking, waiting_for=''):
-        if fcntl is None or self.fh is not None:
+        if self.held:
             return True
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fh = open(self.path, 'a+')
+        if FileLock.mode is None:
+            FileLock.mode = 'lease' if (fcntl is None or os.environ.get('LGEL_LOCK_MODE') == 'lease') else 'fcntl'
+        if FileLock.mode == 'fcntl':
+            got = self._fcntl_acquire(blocking, waiting_for)
+            if got is not None:
+                return got
+            FileLock.mode = 'lease'
+            log('NOTE: this file system does not support file locks; using lock files with a heartbeat instead '
+                f'(a lock left behind by a killed job expires after {LEASE_STALE / 60:.0f} min).')
+        return self._lease_acquire(blocking, waiting_for)
+
+    def _fcntl_acquire(self, blocking, waiting_for):
+        """True / False, or None if the file system cannot lock."""
+        fh = open(self.path, 'a+')
         try:
-            fcntl.lockf(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
+            fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
-            if e.errno in (errno.EACCES, errno.EAGAIN):
-                if not blocking:
-                    self.fh.close()
-                    self.fh = None
+            if e.errno not in (errno.EACCES, errno.EAGAIN):
+                fh.close()
+                return None
+            if not blocking:
+                fh.close()
+                return False
+            log(f'waiting: another job is {waiting_for} in this --root; continuing as soon as it is done ...')
+            fcntl.lockf(fh, fcntl.LOCK_EX)
+        self.fh = fh
+        return True
+
+    def _lease_age(self, path=None):
+        """Seconds since the lease was refreshed, measured with the file system's own clock."""
+        probe = self.path.with_name(f'.clock.{socket.gethostname()}.{os.getpid()}')
+        try:
+            probe.write_text('')
+            now = probe.stat().st_mtime
+            probe.unlink()
+            return now - (path or self.lease_path).stat().st_mtime
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _token(path):
+        try:
+            return json.loads(Path(path).read_text()).get('token')
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def _lease_acquire(self, blocking, waiting_for):
+        lease, told = self.lease_path, False
+        give_up = time.time() + LEASE_STALE + 2 * LEASE_BEAT     # non-blocking: long enough to tell live from dead
+        while True:
+            try:
+                fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                stale_token = self._token(lease)
+                age = self._lease_age()
+                if age is None:
+                    continue                                  # it was just released: try again
+                if age > LEASE_STALE:                         # holder stopped refreshing: it was killed
+                    grave = lease.with_name(f'{lease.name}.stale.{os.getpid()}.{time.time_ns()}')
+                    try:
+                        os.rename(lease, grave)
+                    except FileNotFoundError:
+                        continue
+                    if self._token(grave) != stale_token or (self._lease_age(grave) or 0) <= LEASE_STALE:
+                        # Another job replaced the stale lease in the meantime: put its lease back.
+                        try:
+                            os.link(grave, lease)
+                        except OSError:
+                            pass
+                    grave.unlink(missing_ok=True)
+                    continue
+                if not blocking and time.time() > give_up:
                     return False
-                log(f'waiting: another job is {waiting_for} in this --root; continuing as soon as it is done ...')
-                fcntl.lockf(self.fh, fcntl.LOCK_EX)
-                return True
-            log(f'WARNING: this filesystem does not support file locks ({e}). Never run two jobs on the same '
-                f'--root at the same time.')
-            self.fh.close()
-            self.fh = None
+                if not told:
+                    log(f'waiting: another job is {waiting_for or "using this lock"} in this --root '
+                        f'(or one was killed less than {LEASE_STALE / 60:.0f} min ago); checking again regularly ...')
+                    told = True
+                time.sleep(min(15.0, LEASE_BEAT))
+                continue
+            with os.fdopen(fd, 'w') as f:
+                f.write(json.dumps(dict(host=socket.gethostname(), pid=os.getpid(), since=time.ctime(),
+                                        token=f'{socket.gethostname()}.{os.getpid()}.{time.time_ns()}')))
+            self.lease, self._stop = lease, threading.Event()
+            threading.Thread(target=self._heartbeat, args=(lease, self._stop, self._token(lease)), daemon=True).start()
+            if not FileLock._held_leases:
+                # A scheduler stops a job with SIGTERM: turn it into a normal exit so leases are removed.
+                try:
+                    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+                except ValueError:                            # not in the main thread
+                    pass
+            FileLock._held_leases.append(self)
             return True
+
+    @staticmethod
+    def _heartbeat(lease, stop, token):
+        warned = False
+        while not stop.wait(LEASE_BEAT):
+            if FileLock._token(lease) != token:
+                # Missing for a moment (another job checking a stale lease puts it back) or, in the
+                # worst case, taken over: keep trying, never refresh someone else's lease.
+                if not warned and lease.exists():
+                    log(f'WARNING: lock {lease.name} is now held by another job; do not run two jobs on this --root.')
+                    warned = True
+                continue
+            try:
+                os.utime(lease, None)
+            except FileNotFoundError:
+                continue
 
     def release(self):
         if self.fh is not None:
@@ -245,23 +411,51 @@ class FileLock:
             finally:
                 self.fh.close()
                 self.fh = None
+        if self.lease is not None:
+            self._stop.set()
+            try:
+                if json.loads(self.lease.read_text()).get('pid') == os.getpid():
+                    self.lease.unlink()
+            except (OSError, ValueError):
+                pass
+            if self in FileLock._held_leases:
+                FileLock._held_leases.remove(self)
+            self.lease = None
+
+    @staticmethod
+    def busy(path):
+        """Is this lock held by a live job right now? (Does not wait.)"""
+        path = Path(path)
+        if FileLock.mode == 'lease' or (FileLock.mode is None and (fcntl is None or os.environ.get('LGEL_LOCK_MODE') == 'lease')):
+            probe = FileLock(path)
+            age = probe._lease_age() if probe.lease_path.exists() else None
+            return age is not None and age <= LEASE_STALE
+        if not path.exists():
+            return False
+        with open(path, 'a+') as fh:              # never called on a lock this process holds
+            try:
+                fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.lockf(fh, fcntl.LOCK_UN)
+                return False
+            except OSError as e:
+                return e.errno in (errno.EACCES, errno.EAGAIN)
+
+
+def _release_leases():
+    for lock in list(FileLock._held_leases):
+        lock.release()
+
+
+atexit.register(_release_leases)
 
 
 def busy_runs(p):
     """Names of runs whose lock is held by a live job right now."""
-    busy = []
-    if fcntl is None or not p.state.exists():
-        return busy
-    for f in sorted(p.state.glob('run.*.lock')):
-        lock = FileLock(f)
-        try:
-            if lock.acquire(blocking=False):
-                lock.release()
-            else:
-                busy.append(f.name[len('run.'):-len('.lock')])
-        except OSError:
-            pass
-    return busy
+    if not p.state.exists():
+        return []
+    names = {f.name[len('run.'):].removesuffix('.lease').removesuffix('.lock')
+             for f in p.state.glob('run.*.lock*') if '.stale.' not in f.name}
+    return sorted(n for n in names if FileLock.busy(p.state / f'run.{n}.lock'))
 
 
 def input_fingerprint(p):
@@ -414,9 +608,9 @@ def stage_preflight(a, p, selected):
     problems = []
     if 'train' in selected and not info['cuda'] and not a.allow_cpu:
         problems.append('no CUDA GPU is visible (request one from the scheduler, or pass --allow-cpu for a toy run)')
-    need_data = any(s in selected for s in ('fetch_data', 'extract_frames')) and not p.marker('extract_frames').exists()
-    if need_data and free < a.min_free_gb:
-        problems.append(f'only {free:.0f} GB free under {p.root}; this preset wants >= {a.min_free_gb} GB '
+    need, what = disk_needed_gb(a, p, selected)
+    if need and free < need:
+        problems.append(f'only {free:.0f} GB free under {p.root}, but {what} needs about {need:.0f} GB '
                         f'(override with --min-free-gb if you are sure)')
     if any(s in selected for s in ('fetch_data',)) and not (a.data_url or a.data_zip or a.data_dir or a.synthetic) \
             and not p.marker('fetch_data').exists():
@@ -502,10 +696,14 @@ def download(url, dest, a, p, name):
     write_json(complete, dict(size=dest.stat().st_size, finished=time.ctime()))
 
 
-def discard_download(path):
-    """Forget a downloaded file that turned out to be unusable, so the next run downloads it again."""
+def discard_download(path, keep=True):
+    """Forget a downloaded file that turned out to be unusable, so the next run downloads it again.
+    Small files are kept aside for inspection; huge ones (keep=False) are deleted to free the space."""
     path = Path(path)
     path.with_name(path.name + '.complete').unlink(missing_ok=True)
+    if path.exists() and not keep:
+        path.unlink()
+        return None
     if path.exists():
         aside = path.with_name(f'{path.name}.rejected-{time.strftime("%Y%m%d-%H%M%S")}')
         os.replace(path, aside)
@@ -668,35 +866,44 @@ def stage_fetch_data(a, p):
             if not a.data_zip:
                 download(a.data_url, zpath, a, p, 'fetch_data')
             log(f'verifying {zpath.name} ({gb(zpath.stat().st_size):.1f} GB) ...')
-            if not zipfile.is_zipfile(zpath):
-                if not a.data_zip:
-                    zpath.with_name(zpath.name + '.complete').unlink(missing_ok=True)
-                    zpath.unlink(missing_ok=True)
-                    raise StageError('the downloaded file is not a zip archive (it was deleted). Check that the data '
-                                     'link downloads the zip itself, then run the same command again.')
-                raise StageError(f'{zpath} is not a valid zip archive.')
-            if not a.skip_zip_check:
-                with zipfile.ZipFile(zpath) as z:
-                    bad = z.testzip()
-                if bad:
-                    if not a.data_zip:
-                        zpath.with_name(zpath.name + '.complete').unlink(missing_ok=True)
-                        zpath.unlink(missing_ok=True)
-                        raise StageError(f'the downloaded zip is corrupt ({bad}); it was deleted, run the same command '
-                                         f'again to download it again.')
-                    raise StageError(f'Corrupt member in zip: {bad}.')
             partial = p.raw / 'extracted.partial'
             shutil.rmtree(partial, ignore_errors=True)
-            log(f'extracting to {p.extracted} ...')
-            with zipfile.ZipFile(zpath) as z:
-                names = z.namelist()
-                for i, n in enumerate(names, 1):
-                    z.extract(n, partial)
-                    if i % 20 == 0 or i == len(names):
-                        log(f'  extracted {i}/{len(names)} files')
+            try:
+                if not zipfile.is_zipfile(zpath):
+                    raise zipfile.BadZipFile('not a zip archive')
+                if not a.skip_zip_check:
+                    with zipfile.ZipFile(zpath) as z:
+                        bad = z.testzip()
+                    if bad:
+                        raise zipfile.BadZipFile(f'CRC error in {bad}')
+                log(f'extracting to {p.extracted} ...')
+                with zipfile.ZipFile(zpath) as z:
+                    names = z.namelist()
+                    for i, n in enumerate(names, 1):
+                        z.extract(n, partial)
+                        if i % 20 == 0 or i == len(names):
+                            log(f'  extracted {i}/{len(names)} files')
+            except NotImplementedError as e:                  # valid archive, method Python cannot read
+                shutil.rmtree(partial, ignore_errors=True)
+                kept = ''
+                if not a.data_zip:                            # keep it for manual unzipping, but fetch a new one next time
+                    aside = discard_download(zpath)
+                    kept = f' The downloaded file was kept as {aside}.' if aside else ''
+                raise StageError(f'the dataset archive uses a compression method Python cannot unpack ({e}), e.g. '
+                                 f'Deflate64 from Windows "compressed folders". Re-create the zip with standard '
+                                 f'compression, or unzip it (e.g. with 7-Zip) and pass the folder with --data-dir.{kept}')
+            except (zipfile.BadZipFile, zlib.error, EOFError) as e:
+                shutil.rmtree(partial, ignore_errors=True)
+                if a.data_zip:
+                    raise StageError(f'{zpath} is not a usable zip archive ({e}).')
+                discard_download(zpath, keep=False)            # 70 GB: make room for the new download
+                raise StageError(f'the downloaded dataset archive is corrupt or is not a zip ({e}); it was discarded. '
+                                 f'Run the same command again to download it again; if this repeats, check that the '
+                                 f'data link points to the zip file itself.')
             os.replace(partial, p.extracted)
             if not a.data_zip and not a.keep_zip:
                 zpath.unlink(missing_ok=True)
+                zpath.with_name(zpath.name + '.complete').unlink(missing_ok=True)
                 log('deleted the downloaded zip to save space (use --keep-zip to keep it)')
     inv = find_inventory(base, a.max_videos)
     write_json(p.inventory, dict(base=str(base), videos=inv))
@@ -710,6 +917,11 @@ def load_inventory(p):
 
 
 # --------------------------------------------------------------------------- stage: extract_frames
+def _worker_init():
+    """Extraction workers stop on SIGTERM like any process (the parent's handler is not for them)."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
 def _extract_one(job):
     """Top-level (picklable) worker: reuse build_dataset.extract on a one-video folder."""
     src, frames_dir, shard, fps, tmp_root = job
@@ -737,6 +949,17 @@ def _extract_one(job):
     return video_id, time.time() - t0
 
 
+def missing_frames(meta, folder):
+    """How many of the frames a video's metadata promises are not on disk (one directory listing)."""
+    from data_contract import sample_indices
+    try:
+        wanted = {f'frame_{int(i):07d}.jpg' for i in sample_indices(meta['frame_count'], meta['source_fps'], meta['sample_fps'])}
+        present = {e.name for e in os.scandir(folder)}
+    except (KeyError, ValueError, OSError):
+        return -1                                         # unreadable metadata or folder: redo the video
+    return len(wanted - present)
+
+
 def stage_extract_frames(a, p):
     inv = load_inventory(p)
     p.shards.mkdir(parents=True, exist_ok=True)
@@ -751,8 +974,12 @@ def stage_extract_frames(a, p):
             except (OSError, ValueError, KeyError, AttributeError):
                 done_fps = None
             if done_fps == a.sample_fps:
-                continue
-            log(f'  {v}: existing frames were sampled at {done_fps} fps, now {a.sample_fps} fps: extracting again')
+                missing = missing_frames(json.loads(shard.read_text())[f'CHOLEC80__{v}'], p.frames / f'CHOLEC80__{v}')
+                if not missing:
+                    continue
+                log(f'  {v}: {missing} frame file(s) are missing (deleted or purged?): extracting again')
+            else:
+                log(f'  {v}: existing frames were sampled at {done_fps} fps, now {a.sample_fps} fps: extracting again')
         if not Path(files['video']).exists():
             missing_raw.append(v)
             continue
@@ -765,7 +992,8 @@ def stage_extract_frames(a, p):
         f'{min(a.workers, max(1, len(todo)))} parallel workers')
     failures = []
     if todo:
-        with cf.ProcessPoolExecutor(max_workers=min(a.workers, len(todo))) as pool:
+        pool = cf.ProcessPoolExecutor(max_workers=min(a.workers, len(todo)), initializer=_worker_init)
+        try:
             futures = {pool.submit(_extract_one, j): j for j in todo}
             for n, fut in enumerate(cf.as_completed(futures), 1):
                 job = futures[fut]
@@ -775,6 +1003,10 @@ def stage_extract_frames(a, p):
                 except Exception as e:                          # noqa: BLE001
                     failures.append((Path(job[0]).name, repr(e)))
                     log(f'  [{n}/{len(todo)}] FAILED {Path(job[0]).name}: {e!r}')
+        except BaseException:                                   # e.g. SIGTERM from the scheduler: stop now
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
     if failures:
         raise StageError('frame extraction failed for: ' + '; '.join(f'{n}: {e}' for n, e in failures)
                          + '. Re-run the same command to retry only these videos.')
