@@ -203,3 +203,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Language-Guided-Endoscopy-Localization: local run outputs and site settings
+lgel_run/
+site_env.sh
