@@ -114,9 +114,12 @@ each run has its own `runs/<run>/` and `results/<run>/` (run name `<preset>_seed
   prepared the data. It is still better to prepare the data once (step B) before starting
   parallel runs.
 * The same run submitted twice at the same time is refused; the second job stops immediately.
-* This uses file locks. On file systems without lock support, lock files with a heartbeat are used
-  instead; a lock left by a killed job then expires after 5 minutes. If the scratch file system is
-  Lustre mounted with node-local locks (`localflock`), set `export LGEL_LOCK_MODE=lease`.
+* This protection uses the file system's locks, which the system releases automatically when a
+  job ends or is killed. **The safe default is still one job at a time per `--root`.** Locks only
+  protect jobs on different nodes if the file system shares them between nodes (e.g. Lustre mounted
+  with `flock`, not `localflock`; ask the admins if you plan to run jobs in parallel).
+* If the file system has no lock support at all, a job stops at once with a message. Then make sure
+  only one job at a time uses that `--root`, and add `--single-job` (or `export LGEL_SINGLE_JOB=1`).
 * Every run records which data it was trained on. If the shared data is later rebuilt differently
   (other split seed, other frame rate, `--force` of a data stage), that run's checkpoints and
   results are **refused** rather than reused, because they no longer match the data. That
@@ -228,6 +231,7 @@ Resubmitting is safe. On clusters with a per-job time limit the job can also be 
 | `--cleanup-raw` | Delete the raw videos after frame extraction to save ~80 GB (frames cannot then be re-extracted without downloading again). |
 | `--keep-zip` | Keep the downloaded zip. |
 | `--offline` | Never touch the network, never install software. |
+| `--single-job` | Only for file systems without file locks: confirms that one job at a time uses the `--root`. |
 | `--from-stage S`, `--to-stage S`, `--stages a,b` | Run only part of the pipeline. `python main.py --list-stages` prints the order. |
 | `--force S` | Redo stage `S` and everything after it. Refused while another job is using the `--root`. |
 | `--dry-run` | Print what would run; nothing is created, changed or deleted. |
@@ -255,6 +259,7 @@ Resubmitting is safe. On clusters with a per-job time limit the job can also be 
 | `the downloaded dataset archive is corrupt or is not a zip` | The bad file was deleted; resubmit to download it again. If it repeats, the data link does not point to the zip itself. |
 | `the dataset archive uses a compression method Python cannot unpack` | The zip was made with e.g. Windows' Deflate64. Re-create it with standard zip compression, or unzip it and use `--data-dir`. |
 | `N frame file(s) are missing ... extracting again` | Frames were deleted (e.g. by a scratch purge); they are re-extracted automatically if the raw videos still exist. |
+| `does not support file locks ... add --single-job` | The scratch file system cannot lock files. Run one job at a time on this `--root` and add `--single-job`. |
 | `the prepared data is incomplete` | Training was started before the data stages finished (e.g. with `--stages train`). Run the full command. |
 | Download stops or the zip is incomplete | Resubmit: downloads continue and the size is verified. Google-Drive links need `gdown` (installed by `setup_env.sh`) and may hit Google's daily quota. |
 | Everything is slow at the start | Frame extraction of ~80 videos is CPU-bound; it scales with `--workers` (default: up to 16). |
@@ -264,7 +269,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 85 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 83 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.
@@ -283,8 +288,8 @@ deliberately **tiny** model on CPU:
   * two jobs started at the same moment (the data is prepared once);
   * the same run submitted twice (the duplicate is refused);
   * a run refused after its split was changed;
-  * all of the above again with the lock-file fallback for file systems without lock support,
-    including a killed job's lock being taken over.
+  * a job killed during data preparation and resubmitted at once;
+  * a file system without lock support (the job stops unless `--single-job` is given).
 * **Re-extraction:** frames are extracted again after the frame rate changes, or when frame files go missing.
 * **Disk check:** an offline job after the download is not refused for the space the download already uses.
 * **Exact resume:** killing training after epoch 2 and resuming gives bit-identical weights, optimizer/scheduler state and metrics to an uninterrupted run.

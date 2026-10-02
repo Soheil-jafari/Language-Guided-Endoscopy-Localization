@@ -296,7 +296,6 @@ def test_reextraction_keeps_valid_frames_when_raw_videos_are_gone(tmp_path):
 
 @pytest.mark.skipif(pipeline.fcntl is None, reason='POSIX file locks only')
 def test_locks_detect_another_live_job(tmp_path, monkeypatch):
-    monkeypatch.setattr(pipeline.FileLock, 'mode', 'fcntl')
     import subprocess
     import sys
     p = pipeline.Paths(tmp_path, 'full_seed42')
@@ -369,42 +368,6 @@ def test_disk_check_asks_only_for_what_the_remaining_stages_need(tmp_path):
     assert pipeline.disk_needed_gb(a, p, ['preflight', 'summary']) == (0, '')
 
 
-@pytest.fixture
-def lease_mode(monkeypatch):
-    monkeypatch.setattr(pipeline.FileLock, 'mode', 'lease')
-    monkeypatch.setattr(pipeline.FileLock, '_held_leases', [])
-    monkeypatch.setattr(pipeline, 'LEASE_STALE', 1.0)
-    monkeypatch.setattr(pipeline, 'LEASE_BEAT', 0.1)
-    import signal
-    monkeypatch.setattr(signal, 'signal', lambda *a, **k: None)
-
-
-def test_lease_locks_exclude_each_other_and_expire_when_the_holder_dies(tmp_path, lease_mode):
-    holder, other = pipeline.FileLock(tmp_path / 'prepare.lock'), pipeline.FileLock(tmp_path / 'prepare.lock')
-    assert holder.acquire(blocking=False)
-    assert pipeline.FileLock.busy(tmp_path / 'prepare.lock')
-    assert other.acquire(blocking=False) is False                     # a live holder keeps its heartbeat going
-    holder._stop.set()                                                # holder "killed": heartbeat stops, file stays
-    import time
-    time.sleep(1.5)
-    assert not pipeline.FileLock.busy(tmp_path / 'prepare.lock')
-    assert other.acquire(blocking=True)                               # abandoned lease is taken over
-    other.release()
-    assert not (tmp_path / 'prepare.lock.lease').exists()
-
-
-def test_unsupported_locks_switch_to_leases_instead_of_being_ignored(tmp_path, monkeypatch, lease_mode):
-    import errno
-    monkeypatch.setattr(pipeline.FileLock, 'mode', None)
-    def no_locks(*a, **k):
-        raise OSError(errno.ENOLCK, 'No locks available')
-    monkeypatch.setattr(pipeline.fcntl, 'lockf', no_locks)
-    first, second = pipeline.FileLock(tmp_path / 'l'), pipeline.FileLock(tmp_path / 'l')
-    assert first.acquire(blocking=False) and pipeline.FileLock.mode == 'lease'
-    assert second.acquire(blocking=False) is False                    # previously both "acquired"
-    first.release()
-
-
 def test_a_corrupt_downloaded_archive_is_discarded_not_reused(tmp_path):
     import io
     import zipfile
@@ -474,10 +437,11 @@ def test_disk_check_counts_a_partial_download_and_local_inputs(tmp_path):
     p = pipeline.Paths(tmp_path, 'r')
     p.raw.mkdir(parents=True)
     a = argparse.Namespace(min_free_gb=200, synthetic=None, data_dir=None, data_zip=None)
-    with open(p.zip, 'wb') as f:                                      # 60 GB partial download (sparse file)
-        f.truncate(60 * 1024 ** 3)
+    p.zip.write_bytes(b'z' * 4 * 1024 ** 2)                            # a partial download already on disk
+    a.min_free_gb = 50
     need, _ = pipeline.disk_needed_gb(a, p, list(pipeline.STAGES))
-    assert 139 < need < 141
+    assert need == pytest.approx(50 - 4 / 1024)                       # counted against the requirement
+    a.min_free_gb = 200
     p.zip.unlink()
     videos = tmp_path / 'local'
     videos.mkdir()
@@ -487,50 +451,12 @@ def test_disk_check_counts_a_partial_download_and_local_inputs(tmp_path):
     assert what == 'frame extraction' and need < 11                   # --data-dir downloads nothing
 
 
-def test_breaking_a_stale_lease_never_removes_a_fresh_one(tmp_path, monkeypatch, lease_mode):
-    lock = tmp_path / 'prepare.lock'
-    lease = tmp_path / 'prepare.lock.lease'
-    lease.write_text(json.dumps(dict(pid=1, token='old')))
-    os.utime(lease, (1, 1))                                           # abandoned long ago
-    me, other = pipeline.FileLock(lock), pipeline.FileLock(lock)
-    real_age, calls = pipeline.FileLock._lease_age, []
-    def racing_age(self, path=None):
-        if not calls:                                                 # between our check and our rename,
-            calls.append(1)                                           # another job breaks it and takes it
-            lease.unlink()
-            assert other.acquire(blocking=False)
-            return 10_000.0
-        return real_age(self, path)
-    monkeypatch.setattr(pipeline.FileLock, '_lease_age', racing_age)
-    assert me.acquire(blocking=False) is False                        # we must not take the other job's lock
-    assert json.loads(lease.read_text())['token'] == pipeline.FileLock._token(lease) != 'old'
-    assert other.lease is not None
-    other.release()
-
-
 def test_busy_runs_handles_dots_in_run_names(tmp_path, monkeypatch):
-    monkeypatch.setattr(pipeline.FileLock, 'mode', 'fcntl')
     p = pipeline.Paths(tmp_path, 'x')
     p.state.mkdir(parents=True)
     (p.state / 'run.exp.lock.v2.lock').write_text('')
     monkeypatch.setattr(pipeline.FileLock, 'busy', staticmethod(lambda path: Path(path).name == 'run.exp.lock.v2.lock'))
     assert pipeline.busy_runs(p) == ['exp.lock.v2']
-
-
-def test_heartbeat_survives_a_lease_that_is_briefly_missing(tmp_path, lease_mode):
-    import time
-    holder = pipeline.FileLock(tmp_path / 'l')
-    assert holder.acquire(blocking=False)
-    lease = tmp_path / 'l.lease'
-    moved = tmp_path / 'moved'
-    os.rename(lease, moved)                                           # another job checking it, for a moment
-    time.sleep(0.3)                                                   # heartbeat fires while it is absent
-    os.link(moved, lease)
-    moved.unlink()
-    os.utime(lease, (1, 1))
-    time.sleep(0.3)
-    assert pipeline.FileLock.busy(tmp_path / 'l')                     # refreshed again: still alive
-    holder.release()
 
 
 def test_a_corrected_link_is_downloaded_after_an_unpackable_archive(tmp_path):
@@ -555,3 +481,33 @@ def test_a_corrected_link_is_downloaded_after_an_unpackable_archive(tmp_path):
     assert list(p.raw.glob('dataset.zip.rejected-*'))                 # kept for manual unzipping
     with pytest.raises(pipeline.StageError, match='--offline'):      # ... and a fresh download is required next
         pipeline.stage_fetch_data(a, p)
+
+
+
+@pytest.mark.skipif(pipeline.fcntl is None, reason='POSIX file locks only')
+def test_without_file_locks_a_job_stops_unless_told_it_runs_alone(tmp_path, monkeypatch, capsys):
+    import errno
+    def no_locks(*a, **k):
+        raise OSError(errno.ENOLCK, 'No locks available')
+    monkeypatch.setattr(pipeline.fcntl, 'lockf', no_locks)
+    monkeypatch.setattr(pipeline.FileLock, 'disabled', False)
+    monkeypatch.delenv('LGEL_SINGLE_JOB', raising=False)
+    args = ['--preset', 'smoke', '--root', str(tmp_path / 'root'), '--stages', 'summary', '--allow-cpu']
+    assert pipeline.main(args) == 1
+    assert '--single-job' in capsys.readouterr().out
+    assert pipeline.main(args + ['--single-job']) == 0                # explicitly one job at a time: runs
+    assert pipeline.FileLock.disabled
+
+
+def test_training_never_starts_on_unfinished_data(tmp_path, capsys):
+    root = tmp_path / 'root'
+    p = pipeline.Paths(root, 'smoke_seed42')
+    p.state.mkdir(parents=True)
+    for s in pipeline.STAGES[1:pipeline.STAGES.index('train')]:
+        if s != 'extract_frames':                                     # e.g. a job killed during extraction
+            pipeline.write_json(p.marker(s), {})
+    args = ['--preset', 'smoke', '--root', str(root), '--stages', 'train', '--allow-cpu', '--min-free-gb', '0']
+    assert pipeline.main(args) == 1
+    out = capsys.readouterr().out
+    assert 'prepared data is incomplete' in out and 'extract_frames' in out
+    assert not p.run.exists()                                         # nothing was started

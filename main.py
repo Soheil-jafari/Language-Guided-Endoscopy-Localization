@@ -20,7 +20,6 @@ Stages (run `python main.py --list-stages`):
 from __future__ import annotations
 
 import argparse
-import atexit
 import concurrent.futures as cf
 import errno
 import hashlib
@@ -30,7 +29,6 @@ import platform
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -264,57 +262,33 @@ def native_bf16():
     return bool(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8)
 
 
-# A lock whose holder stopped refreshing it for this long belongs to a job that was killed.
-LEASE_STALE = float(os.environ.get('LGEL_LOCK_STALE_SECONDS', 300))
-LEASE_BEAT = max(1.0, LEASE_STALE / 10)
-
-
 class FileLock:
-    """Exclusive lock on a file under <root>/state, used so that concurrent jobs on one --root take turns.
+    """Exclusive POSIX advisory lock on a file under <root>/state, so that concurrent jobs on one --root
+    take turns. The operating system releases it by itself when a job ends or is killed, so a lock can
+    never be left behind. On a file system without lock support the pipeline refuses to start unless
+    it is told that only one job at a time uses the --root (--single-job); then locking is disabled.
+    There is deliberately no home-made fallback (heartbeat files): it could let two jobs run at once."""
 
-    Normally an OS advisory lock (fcntl), which the system releases by itself when a job ends or is
-    killed. On file systems without lock support (or with LGEL_LOCK_MODE=lease, e.g. for Lustre
-    mounted with node-local `localflock`), a lease file is used instead: created atomically, kept
-    fresh by a heartbeat, and considered abandoned when its heartbeat is older than LEASE_STALE."""
-
-    mode = None                                   # 'fcntl' or 'lease', decided once per process
-    _held_leases = []
+    disabled = False                               # --single-job
 
     def __init__(self, path):
-        self.path, self.fh, self.lease, self._stop = Path(path), None, None, None
+        self.path, self.fh = Path(path), None
 
     @property
     def held(self):
-        return self.fh is not None or self.lease is not None
-
-    @property
-    def lease_path(self):
-        return self.path.with_name(self.path.name + '.lease')
+        return FileLock.disabled or self.fh is not None
 
     def acquire(self, blocking, waiting_for=''):
         if self.held:
             return True
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if FileLock.mode is None:
-            FileLock.mode = 'lease' if (fcntl is None or os.environ.get('LGEL_LOCK_MODE') == 'lease') else 'fcntl'
-        if FileLock.mode == 'fcntl':
-            got = self._fcntl_acquire(blocking, waiting_for)
-            if got is not None:
-                return got
-            FileLock.mode = 'lease'
-            log('NOTE: this file system does not support file locks; using lock files with a heartbeat instead '
-                f'(a lock left behind by a killed job expires after {LEASE_STALE / 60:.0f} min).')
-        return self._lease_acquire(blocking, waiting_for)
-
-    def _fcntl_acquire(self, blocking, waiting_for):
-        """True / False, or None if the file system cannot lock."""
         fh = open(self.path, 'a+')
         try:
             fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
             if e.errno not in (errno.EACCES, errno.EAGAIN):
                 fh.close()
-                return None
+                raise
             if not blocking:
                 fh.close()
                 return False
@@ -323,87 +297,6 @@ class FileLock:
         self.fh = fh
         return True
 
-    def _lease_age(self, path=None):
-        """Seconds since the lease was refreshed, measured with the file system's own clock."""
-        probe = self.path.with_name(f'.clock.{socket.gethostname()}.{os.getpid()}')
-        try:
-            probe.write_text('')
-            now = probe.stat().st_mtime
-            probe.unlink()
-            return now - (path or self.lease_path).stat().st_mtime
-        except FileNotFoundError:
-            return None
-
-    @staticmethod
-    def _token(path):
-        try:
-            return json.loads(Path(path).read_text()).get('token')
-        except (OSError, ValueError, AttributeError):
-            return None
-
-    def _lease_acquire(self, blocking, waiting_for):
-        lease, told = self.lease_path, False
-        give_up = time.time() + LEASE_STALE + 2 * LEASE_BEAT     # non-blocking: long enough to tell live from dead
-        while True:
-            try:
-                fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            except FileExistsError:
-                stale_token = self._token(lease)
-                age = self._lease_age()
-                if age is None:
-                    continue                                  # it was just released: try again
-                if age > LEASE_STALE:                         # holder stopped refreshing: it was killed
-                    grave = lease.with_name(f'{lease.name}.stale.{os.getpid()}.{time.time_ns()}')
-                    try:
-                        os.rename(lease, grave)
-                    except FileNotFoundError:
-                        continue
-                    if self._token(grave) != stale_token or (self._lease_age(grave) or 0) <= LEASE_STALE:
-                        # Another job replaced the stale lease in the meantime: put its lease back.
-                        try:
-                            os.link(grave, lease)
-                        except OSError:
-                            pass
-                    grave.unlink(missing_ok=True)
-                    continue
-                if not blocking and time.time() > give_up:
-                    return False
-                if not told:
-                    log(f'waiting: another job is {waiting_for or "using this lock"} in this --root '
-                        f'(or one was killed less than {LEASE_STALE / 60:.0f} min ago); checking again regularly ...')
-                    told = True
-                time.sleep(min(15.0, LEASE_BEAT))
-                continue
-            with os.fdopen(fd, 'w') as f:
-                f.write(json.dumps(dict(host=socket.gethostname(), pid=os.getpid(), since=time.ctime(),
-                                        token=f'{socket.gethostname()}.{os.getpid()}.{time.time_ns()}')))
-            self.lease, self._stop = lease, threading.Event()
-            threading.Thread(target=self._heartbeat, args=(lease, self._stop, self._token(lease)), daemon=True).start()
-            if not FileLock._held_leases:
-                # A scheduler stops a job with SIGTERM: turn it into a normal exit so leases are removed.
-                try:
-                    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-                except ValueError:                            # not in the main thread
-                    pass
-            FileLock._held_leases.append(self)
-            return True
-
-    @staticmethod
-    def _heartbeat(lease, stop, token):
-        warned = False
-        while not stop.wait(LEASE_BEAT):
-            if FileLock._token(lease) != token:
-                # Missing for a moment (another job checking a stale lease puts it back) or, in the
-                # worst case, taken over: keep trying, never refresh someone else's lease.
-                if not warned and lease.exists():
-                    log(f'WARNING: lock {lease.name} is now held by another job; do not run two jobs on this --root.')
-                    warned = True
-                continue
-            try:
-                os.utime(lease, None)
-            except FileNotFoundError:
-                continue
-
     def release(self):
         if self.fh is not None:
             try:
@@ -411,50 +304,43 @@ class FileLock:
             finally:
                 self.fh.close()
                 self.fh = None
-        if self.lease is not None:
-            self._stop.set()
-            try:
-                if json.loads(self.lease.read_text()).get('pid') == os.getpid():
-                    self.lease.unlink()
-            except (OSError, ValueError):
-                pass
-            if self in FileLock._held_leases:
-                FileLock._held_leases.remove(self)
-            self.lease = None
 
     @staticmethod
     def busy(path):
-        """Is this lock held by a live job right now? (Does not wait.)"""
+        """Is this lock held by a live job right now? (Does not wait; never used on a lock this process holds.)"""
         path = Path(path)
-        if FileLock.mode == 'lease' or (FileLock.mode is None and (fcntl is None or os.environ.get('LGEL_LOCK_MODE') == 'lease')):
-            probe = FileLock(path)
-            age = probe._lease_age() if probe.lease_path.exists() else None
-            return age is not None and age <= LEASE_STALE
-        if not path.exists():
+        if FileLock.disabled or not path.exists():
             return False
-        with open(path, 'a+') as fh:              # never called on a lock this process holds
+        with open(path, 'a+') as fh:
             try:
                 fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.lockf(fh, fcntl.LOCK_UN)
                 return False
-            except OSError as e:
-                return e.errno in (errno.EACCES, errno.EAGAIN)
+            except OSError:
+                return True                            # held by another job, or cannot tell: assume busy
 
 
-def _release_leases():
-    for lock in list(FileLock._held_leases):
-        lock.release()
-
-
-atexit.register(_release_leases)
+def locks_work(state_dir):
+    """Can this file system take POSIX locks? (None = yes; otherwise the reason it cannot.)"""
+    if fcntl is None:
+        return 'POSIX file locks are not available on this operating system'
+    probe = Path(state_dir) / '.lock-probe'
+    try:
+        with open(probe, 'a+') as fh:
+            fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.lockf(fh, fcntl.LOCK_UN)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN):         # held by another job: locks do work
+            return None
+        return f'the file system under {state_dir} does not support file locks ({e})'
+    return None
 
 
 def busy_runs(p):
     """Names of runs whose lock is held by a live job right now."""
     if not p.state.exists():
         return []
-    names = {f.name[len('run.'):].removesuffix('.lease').removesuffix('.lock')
-             for f in p.state.glob('run.*.lock*') if '.stale.' not in f.name}
+    names = {f.name[len('run.'):].removesuffix('.lock') for f in p.state.glob('run.*.lock')}
     return sorted(n for n in names if FileLock.busy(p.state / f'run.{n}.lock'))
 
 
@@ -1427,6 +1313,9 @@ def main(argv=None):
     g.add_argument('--pred-batch-size', type=int, default=8)
     g.add_argument('--allow-cpu', action='store_true'); g.add_argument('--offline', action='store_true',
                    help='never touch the network (needs fetch stages done earlier)')
+    g.add_argument('--single-job', action='store_true', default=os.environ.get('LGEL_SINGLE_JOB') == '1',
+                   help='only needed on file systems without file locks: confirms that only one job at a time '
+                        'uses this --root (or env LGEL_SINGLE_JOB=1)')
     g = ap.add_argument_group('stage control')
     g.add_argument('--stages', help='comma-separated subset, e.g. train,predict,evaluate')
     g.add_argument('--from-stage', choices=STAGES); g.add_argument('--to-stage', choices=STAGES)
@@ -1476,11 +1365,25 @@ def main(argv=None):
     _LOGFILE = p.logs / 'main.log'
     log(f'preset={a.preset} run={a.run_name} root={p.root}')
     log('stages: ' + ' -> '.join(selected))
+    why_not = locks_work(p.state)
+    if why_not and not a.single_job:
+        log(f'!! {why_not}, so the pipeline cannot stop two jobs from using this --root at the same time.\n'
+            f'   Run only one job at a time on this --root (the normal way to use it) and add --single-job\n'
+            f'   (or export LGEL_SINGLE_JOB=1) to the command, then submit it again.')
+        return 1
+    FileLock.disabled = bool(why_not)
+    if why_not:
+        log(f'--single-job: {why_not}; job locking is off. Never run two jobs on this --root at the same time.')
     prep_lock, run_lock = FileLock(p.prep_lock), FileLock(p.run_lock)
     if redo:
         shared = [s for s in redo if s not in RUN_SCOPED and s not in ALWAYS_RUN]
         if shared:
-            if not prep_lock.acquire(blocking=False):
+            try:
+                got = prep_lock.acquire(blocking=False)
+            except OSError as e:
+                log(f'!! could not lock {p.prep_lock} ({e}); resubmit the job.')
+                return 1
+            if not got:
                 log('!! another job is preparing data in this --root right now; --force of data stages has to wait '
                     'until it has finished.')
                 return 1
@@ -1493,7 +1396,12 @@ def main(argv=None):
                 f'continued or evaluated afterwards (they are refused); start new runs instead.')
         for s in redo:
             p.marker(s).unlink(missing_ok=True)
-    if any(s in RUN_SCOPED for s in selected) and not run_lock.acquire(blocking=False):
+    try:
+        duplicate = any(s in RUN_SCOPED for s in selected) and not run_lock.acquire(blocking=False)
+    except OSError as e:
+        log(f'!! could not lock {p.run_lock} ({e}); resubmit the job, or use --single-job if this keeps happening.')
+        return 1
+    if duplicate:
         # Refuse a duplicate submission at once, before it waits for or touches anything.
         log(f'!! run "{a.run_name}" is already being processed by another job on this --root. Let that job '
             f'finish (then resubmit if needed), or use a different --run-name.')
@@ -1517,13 +1425,27 @@ def main(argv=None):
         marker = p.marker(stage)
         sig = stage_signature(stage, a)
         if stage in RUN_SCOPED:
-            # Wait while another job is (re)building the shared data, then let other jobs use it.
-            prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
+            # Wait while another job is (re)building the shared data. Training may only start on
+            # finished data: otherwise a later job would rebuild the missing stages underneath it.
+            try:
+                prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
+            except OSError as e:
+                log(f'!! could not lock {p.prep_lock} ({e}); resubmit the job, or use --single-job if this keeps happening.')
+                return 1
+            unfinished = [s for s in STAGES[1:STAGES.index('train')] if not p.marker(s).exists()]
             prep_lock.release()
+            if unfinished:
+                log(f'!! the prepared data is incomplete: data stage(s) {unfinished} have not finished. Run the full '
+                    f'command (without --stages / --from-stage) so the data is prepared first.')
+                return 1
         elif stage not in ALWAYS_RUN and not marker.exists():
             # One job prepares the shared data; a second job started at the same time waits here and
             # then finds the stages finished.
-            prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
+            try:
+                prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
+            except OSError as e:
+                log(f'!! could not lock {p.prep_lock} ({e}); resubmit the job, or use --single-job if this keeps happening.')
+                return 1
         if stage not in ALWAYS_RUN and marker.exists():
             old = json.loads(marker.read_text())
             if old.get('signature') != sig and stage != 'train':
