@@ -14,6 +14,48 @@ steps are skipped and training continues from its last finished epoch.
 
 ---
 
+## 0. Quick start on the project cluster (Slurm, A100, `/mnt/scratch/users/daiz1/soheil`)
+
+Everything below is already set up for this cluster in `hpc/`: the Slurm job (`hpc/lgel.sbatch`:
+partition `gpu`, 1 GPU, 32 CPUs, 64 GB RAM, the `libs/nvidia-cuda/12.4.0/bin` and
+`apps/miniconda3` modules) and a submit helper (`hpc/submit.sh`). The conda environment is created
+automatically by the first job and kept under the project folder, not in the home directory.
+
+**Once, on the login node:**
+
+```bash
+cd /mnt/scratch/users/daiz1/soheil
+git clone https://github.com/Soheil-jafari/Language-Guided-Endoscopy-Localization.git code
+cp code/hpc/links.env.example links.env      # then paste the two private links (sent by email) into it
+```
+
+**Then three jobs, one after the other** (each command returns immediately; the job runs in the queue):
+
+```bash
+bash code/hpc/submit.sh smoke     # ~30 min: creates the environment, tests the GPU and the weights link on fake data
+bash code/hpc/submit.sh pilot     # a few hours: downloads and prepares the real data, short training, time estimate
+bash code/hpc/submit.sh full      # about a day: the real experiment (20 epochs)
+```
+
+* `squeue -u $USER` shows the job; its live log is `lgel_smoke/logs/slurm-<jobid>.out` (smoke) or
+  `lgel/logs/slurm-<jobid>.out` (pilot, full).
+* **After each job, send back one file:** the newest `.tar.gz` in `lgel_smoke/outbox/` or
+  `lgel/outbox/` (its name is in `outbox/LATEST.txt`). It holds all logs, metrics, settings and
+  results, but no checkpoints or data, so it is small. It is written even when a job fails or is
+  stopped by the time limit.
+* The trained model is `lgel/results/full_seed42/model_weights.pth` (best checkpoint without
+  optimizer state); the full checkpoints stay in `lgel/runs/full_seed42/`.
+* `submit.sh` refuses to start a second job while one is queued or running, so two jobs can never
+  use the same folder at once.
+* If the full run ever needs more than the 72 h limit, submit it again (it continues from the last
+  finished epoch), or use `bash code/hpc/submit.sh full --repeat 2` to queue a follow-up job.
+* Options after the preset are passed on, e.g. `bash code/hpc/submit.sh full --batch-size 4 --accum 48`
+  if the GPU runs out of memory.
+
+The rest of this guide explains the pipeline in general and applies to any cluster.
+
+---
+
 ## 1. What is needed
 
 | Resource | Requirement |
@@ -190,10 +232,10 @@ The one command produces the frame-level results of the proposed model. The temp
 evaluation and the baseline models described in `README.md` are separate tools and are not run
 automatically.
 
-## 7. Example Slurm job (TEMPLATE - adapt it)
+## 7. Example Slurm job for other clusters (TEMPLATE)
 
-The scheduler on the target cluster has not been checked. The partition, account, module and time
-names below are placeholders that must be replaced with the cluster's real ones.
+For the project cluster use `hpc/submit.sh` (section 0). On another Slurm cluster, adapt `hpc/lgel.sbatch`
+or this template; the partition, account, module and time names below are placeholders.
 
 ```bash
 #!/bin/bash
@@ -269,7 +311,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 83 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 90 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.
@@ -294,6 +336,10 @@ deliberately **tiny** model on CPU:
 * **Disk check:** an offline job after the download is not refused for the space the download already uses.
 * **Exact resume:** killing training after epoch 2 and resuming gives bit-identical weights, optimizer/scheduler state and metrics to an uninterrupted run.
 * **Pretrained checkpoint format:** checkpoints in the official M2CRL training format (`teacher`/`student`), and plain state dicts, load with strict checks of every encoder tensor.
+* **Project-cluster scripts:** `hpc/submit.sh` and `hpc/lgel.sbatch` were run with stand-ins for Slurm
+  and the module system: a smoke job using the real weights link, a pilot downloading through
+  `links.env`, the exported weights used by `predict.py`, and a job stopped the way Slurm stops it at
+  the time limit (the report is still written) and then resubmitted.
 * **Environment scripts:** `run.sh` activates and checks the conda env in a non-interactive shell (Miniforge, conda 26.7), and `setup_env.sh` runs up to the PyTorch download.
 
 **Not verified** (could not be tested where this was written):
@@ -301,7 +347,7 @@ deliberately **tiny** model on CPU:
 * The real-size model, real GPU training, mixed precision and memory use on actual hardware.
 * Creating the environment from scratch (conda-forge + PyTorch CUDA 12.4 wheels): the build
   machine could not reach those servers.
-* Slurm or any other scheduler.
+* The real cluster itself (Slurm, modules, conda, GPU): the smoke job checks it in about 30 minutes.
 * The real dataset archive, the real M2CRL checkpoint file, and the final download links.
 * Training time and the quality of the final results. Run the `pilot` preset first.
 

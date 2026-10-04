@@ -105,10 +105,15 @@ def natural_key(s):
 
 
 def cpu_count():
+    """CPUs this job may use: the Slurm allocation if there is one, else the CPU affinity mask."""
     try:
-        return len(os.sched_getaffinity(0))      # respects scheduler/cgroup limits
+        n = len(os.sched_getaffinity(0))         # respects scheduler/cgroup limits
     except AttributeError:
-        return os.cpu_count() or 1
+        n = os.cpu_count() or 1
+    slurm = os.environ.get('SLURM_CPUS_PER_TASK', '')
+    if slurm.isdigit() and int(slurm) > 0:         # some clusters do not pin CPUs: never exceed the request
+        n = min(n, int(slurm))
+    return max(1, n)
 
 
 def write_json(path, value):
@@ -141,6 +146,7 @@ class Paths:
         self.run, self.run_cfg = r / 'runs' / run, r / 'runs' / f'{run}.config.json'
         self.run_inputs = r / 'runs' / f'{run}.inputs.json'
         self.prep_lock, self.run_lock = self.state / 'prepare.lock', self.state / f'run.{run}.lock'
+        self.outbox = r / 'outbox'
         self.results = r / 'results' / run
 
     def triplet_csv(self, split):
@@ -518,10 +524,26 @@ def stage_preflight(a, p, selected):
                              f'with CUDA 12.8; this environment pins 2.5.1 + CUDA 12.4), or an NVIDIA driver too old '
                              f'for CUDA 12.4. See logs/gpu_check.log.')
     write_json(p.logs / 'preflight.json', info)
+    record_environment(p)
     return info
 
 
 # --------------------------------------------------------------------------- stage: fetch_models
+def record_environment(p):
+    """Exact package versions and GPU/driver state of this job, for reproducibility and debugging."""
+    parts = []
+    for title, cmd in (('pip freeze', [sys.executable, '-m', 'pip', 'freeze']), ('nvidia-smi', ['nvidia-smi']),
+                       ('modules', ['bash', '-lc', 'module list 2>&1'])):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            parts.append(f'===== {title}\n{out.stdout}{out.stderr}')
+        except Exception as e:                              # noqa: BLE001
+            parts.append(f'===== {title}\n(unavailable: {e})')
+    keys = sorted(k for k in os.environ if k.startswith(('SLURM_', 'CUDA_', 'CONDA_', 'LGEL_')) and 'URL' not in k)
+    parts.append('===== environment variables\n' + '\n'.join(f'{k}={os.environ[k]}' for k in keys))
+    (p.logs / 'environment.txt').write_text('\n'.join(parts) + '\n')
+
+
 def stage_fetch_models(a, p):
     code = ('import sys; from transformers import AutoTokenizer, CLIPTextModel; n=sys.argv[1]; '
             'AutoTokenizer.from_pretrained(n); m=CLIPTextModel.from_pretrained(n); '
@@ -1082,7 +1104,8 @@ def stage_train(a, p):
     amp = a.amp_dtype
     if amp == 'auto':
         amp = 'bf16' if native_bf16() else 'fp16'
-    workers = a.train_workers if a.train_workers is not None else min(8, max(0, cpu_count() - 1))
+    # 16 frames are decoded per sample; with enough CPUs, more loader processes keep the GPU busy.
+    workers = a.train_workers if a.train_workers is not None else min(16, max(0, cpu_count() - 2))
     cfg = train_config(a, p, workers, amp)
     if p.run_cfg.exists():
         saved = json.loads(p.run_cfg.read_text())
@@ -1210,8 +1233,9 @@ def stage_summary(a, p):
                   '|---|---|---|---|---|---|---|---|']
         for r in rows:
             mins = [f'{r[k] / 60:.1f}' if isinstance(r.get(k), (int, float)) else 'n/a' for k in ('train_seconds', 'val_seconds')]
-            lines.append(f'| {r["epoch"]} | {_fmt(r["train_loss"])} | {_fmt(r["val_frame_nll"])} | {_fmt(r["auroc"])} | '
-                         f'{_fmt(r["average_precision"])} | {_fmt(r["validation_f1"])} | {mins[0]} | {mins[1]} |')
+            lines.append(f'| {r.get("epoch")} | {_fmt(r.get("train_loss"))} | {_fmt(r.get("val_frame_nll"))} | '
+                         f'{_fmt(r.get("auroc"))} | {_fmt(r.get("average_precision"))} | {_fmt(r.get("validation_f1"))} | '
+                         f'{mins[0]} | {mins[1]} |')
         lines.append('')
         timed = [r for r in rows if isinstance(r.get('train_seconds'), (int, float)) and isinstance(r.get('val_seconds'), (int, float))]
         if timed and a.preset == 'pilot' and a.subset_ratio:
@@ -1232,6 +1256,7 @@ def stage_summary(a, p):
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
             fig, ax = plt.subplots(1, 2, figsize=(9, 3.2))
+            rows = [r for r in rows if all(k in r for k in ('epoch', 'train_loss', 'val_frame_nll', 'auroc', 'average_precision'))]
             ep = [r['epoch'] for r in rows]
             ax[0].plot(ep, [r['train_loss'] for r in rows], marker='o', label='train loss')
             ax[0].plot(ep, [r['val_frame_nll'] for r in rows], marker='o', label='val NLL')
@@ -1257,9 +1282,65 @@ def stage_summary(a, p):
                 for q, d in sorted(m['per_query'].items()):
                     lines.append(f'| {q} | {_fmt(d["average_precision"])} | {_fmt(d["auroc"])} | {_fmt(d["f1"])} |')
                 lines.append('')
+    export_model_weights(p)
     write_json(p.results / 'summary.json', summary)
     (p.results / 'SUMMARY.md').write_text('\n'.join(lines))
     log(f'summary written: {p.results / "SUMMARY.md"}')
+
+
+# --------------------------------------------------------------------------- report bundle
+BUNDLE_MAX_FILE = 200 * 1024 ** 2                  # never put huge files (checkpoints, frames) in the bundle
+
+
+def write_report_bundle(a, p, rc):
+    """After every job (finished, failed or stopped by the scheduler) pack everything needed to see what
+    happened - logs, results, metrics, settings, data reports - into one small file in <root>/outbox,
+    so it can be sent back. Checkpoints and data are not included (they stay under <root>)."""
+    try:
+        import tarfile
+        p.outbox.mkdir(parents=True, exist_ok=True)
+        job = os.environ.get('SLURM_JOB_ID')
+        status = 'OK' if rc == 0 else ('STOPPED' if rc == 143 else 'FAILED')
+        name = f'{a.run_name}-{time.strftime("%Y%m%d-%H%M%S")}{f"-job{job}" if job else ""}-{status}.tar.gz'
+        items = [p.logs, p.results, p.run_cfg, p.run_inputs, p.run / 'training_metrics.jsonl',
+                 p.run / 'run_config.json', p.run / 'parameter_counts.json', p.audit, p.splits,
+                 p.splits.with_suffix('.provenance.json'), p.metadata, p.data / 'annotations_sanitized.json',
+                 p.inventory, *sorted(p.state.glob('*.json'))]
+
+        def small(info):
+            if info.isfile() and (info.name.endswith('.pth') or info.size > BUNDLE_MAX_FILE):
+                return None
+            return info
+
+        tmp = p.outbox / f'.{name}.{os.getpid()}.tmp'
+        with tarfile.open(tmp, 'w:gz') as tar:
+            for item in items:
+                if item.exists():
+                    tar.add(item, arcname=str(item.relative_to(p.root)), filter=small)
+        os.replace(tmp, p.outbox / name)
+        (p.outbox / 'LATEST.txt').write_text(name + '\n')
+        log(f'REPORT: everything needed to see what happened is in {p.outbox / name} '
+            f'({(p.outbox / name).stat().st_size / 1024 ** 2:.1f} MB) - send this file to Soheil.')
+    except Exception as e:                                  # noqa: BLE001 - must never hide the real outcome
+        log(f'(could not write the report bundle: {e!r})')
+
+
+def export_model_weights(p):
+    """A copy of the best checkpoint without optimizer/scheduler state (about a third of the size), for
+    sharing and inference; predict.py and inference.py accept it."""
+    best, out = p.run / 'best_model.pth', p.results / 'model_weights.pth'
+    if not best.exists() or (out.exists() and out.stat().st_mtime >= best.stat().st_mtime):
+        return
+    try:
+        import torch
+        ck = torch.load(best, map_location='cpu', weights_only=False)
+        slim = {k: v for k, v in ck.items() if k not in ('optimizer', 'scheduler', 'scaler', 'rng')}
+        tmp = out.with_name(f'{out.name}.{os.getpid()}.tmp')
+        torch.save(slim, tmp)
+        os.replace(tmp, out)
+        log(f'best model weights (no optimizer state) exported to {out} ({out.stat().st_size / 1024 ** 2:.0f} MB)')
+    except Exception as e:                                  # noqa: BLE001
+        log(f'(model weights export skipped: {e!r})')
 
 
 # --------------------------------------------------------------------------- driver
@@ -1309,7 +1390,7 @@ def main(argv=None):
     g.add_argument('--max-phantom-rows', type=int, default=3)
     g = ap.add_argument_group('resources')
     g.add_argument('--workers', type=int, help='parallel frame-extraction processes (default: min(16, cpus))')
-    g.add_argument('--train-workers', type=int, help='DataLoader workers (default: min(8, cpus-1))')
+    g.add_argument('--train-workers', type=int, help='DataLoader workers (default: min(16, cpus-2))')
     g.add_argument('--pred-batch-size', type=int, default=8)
     g.add_argument('--allow-cpu', action='store_true'); g.add_argument('--offline', action='store_true',
                    help='never touch the network (needs fetch stages done earlier)')
@@ -1363,6 +1444,33 @@ def main(argv=None):
     for d in (p.root, p.state, p.logs, p.tmp):
         d.mkdir(parents=True, exist_ok=True)
     _LOGFILE = p.logs / 'main.log'
+    # The scheduler stops a job (time limit, scancel) with SIGTERM: exit through the normal path so
+    # that the report bundle is still written. (Exec'd children restore the default handler.)
+    try:
+        previous = signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:                                    # not the main thread (tests)
+        previous = None
+    rc = 1
+    try:
+        rc = _drive(a, p, selected, redo)
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+        log(f'!! stopped (exit code {rc}); resubmit the same command to continue')
+        raise
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a second SIGTERM must not cut the report short
+        write_report_bundle(a, p, rc)
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+    return rc
+
+
+def _on_sigterm(signum, frame):
+    raise SystemExit(143)
+
+
+def _drive(a, p, selected, redo):
     log(f'preset={a.preset} run={a.run_name} root={p.root}')
     log('stages: ' + ' -> '.join(selected))
     why_not = locks_work(p.state)
