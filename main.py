@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import errno
 import hashlib
 import json
@@ -34,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import zipfile
 import zlib
 from pathlib import Path
@@ -80,12 +82,75 @@ CHECKPOINT_REJECTED = 3            # exit code of `main.py _check_model` when th
 _LOGFILE = None
 
 
+# The two download links are private (they may carry access tokens). They are replaced by placeholders,
+# and every other URL is cut down to its host, in everything printed, logged or put in a report.
+_SECRETS = {}
+_URL = re.compile(r'(?i)\b((?:https?|ftp)://)(?:[^\s/@\'"<>]*@)?([^\s/?#@\'"<>]+)([^\s\'"<>]*)')
+
+
+def register_secret(value, label):
+    """Hide a private link everywhere - and the parts of it that identify the file on their own, because
+    tools sometimes print only those (e.g. '/uc?id=<file id>' in a Google Drive connection error)."""
+    if not value or len(str(value)) < 8:
+        return
+    value = str(value)
+    _SECRETS[value] = f'<{label}>'
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except ValueError:
+        return
+    found = re.findall(r'(?:/d/|[?&]id=)([-\w]{10,})', value)                  # Google Drive file ids
+    for piece, is_query in [(s, False) for s in parts.path.split('/')] + \
+                           [(q.partition('=')[2], True) for q in parts.query.split('&')]:
+        for token in {piece, urllib.parse.unquote(piece)}:
+            random_looking = bool(re.search(r'\d', token) and re.search(r'[A-Za-z]', token)) and '.' not in token
+            if (len(token) >= 10 and random_looking) or (is_query and len(token) >= 16):
+                found.append(token)
+    if parts.netloc and (parts.query or found):          # path?query as written (not a bare /dataset.zip)
+        found.append(value.split(parts.netloc, 1)[1])
+    for token in found:
+        if len(token) >= 10 and token not in _SECRETS:
+            _SECRETS[token] = f'<{label} part>'
+
+
+def redact(text):
+    if not text:
+        return text
+    for value, label in sorted(_SECRETS.items(), key=lambda kv: -len(kv[0])):    # whole links first
+        if value in text:
+            text = text.replace(value, label)
+    return _URL.sub(lambda m: m.group(1) + m.group(2) + ('/...' if m.group(3) or '@' in m.group(0) else ''), text)
+
+
+_CONSOLE_LOST = False
+
+
+def console(text):
+    """Echo to the terminal or the Slurm job log. If that output is lost (a closed terminal, a broken
+    pipe), the pipeline carries on: everything still goes to logs/main.log and the stage logs."""
+    global _CONSOLE_LOST
+    if _CONSOLE_LOST:
+        return
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except (OSError, ValueError, AttributeError):
+        _CONSOLE_LOST = True
+        try:                            # nothing left to flush at exit (a failed exit flush changes the exit code)
+            sys.stdout = open(os.devnull, 'w')
+        except OSError:
+            pass
+
+
 def log(msg=''):
-    line = f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}'
-    print(line, flush=True)
+    line = redact(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}')
+    console(line + '\n')
     if _LOGFILE is not None:
-        with open(_LOGFILE, 'a') as f:
-            f.write(line + '\n')
+        try:
+            with open(_LOGFILE, 'a') as f:
+                f.write(line + '\n')
+        except OSError:                 # logging is never what stops the pipeline (or a clean stop)
+            pass
 
 
 def sha(text):
@@ -172,28 +237,47 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
     p.logs.mkdir(parents=True, exist_ok=True)
     logfile = p.logs / f'{name}.log'
     cmd = [str(c) for c in cmd]
-    log(f'$ {" ".join(cmd)}')
+    shown = redact(' '.join(cmd))
+    log(f'$ {shown}')
     start, stop = time.time(), threading.Event()
 
     def beat():
         while not stop.wait(heartbeat):
             extra = ''
-            if progress_path is not None and Path(progress_path).exists():
-                extra = f', {gb(Path(progress_path).stat().st_size):.1f} GB so far'
+            if progress_path is not None:
+                target = Path(progress_path)                    # (gdown writes to <name>*.part until done)
+                try:
+                    files = [target] if target.exists() else list(target.parent.glob(target.name + '*.part'))
+                    if files:
+                        extra = f', {gb(sum(f.stat().st_size for f in files)):.1f} GB so far'
+                except OSError:
+                    pass
             log(f'... {name} still running ({(time.time() - start) / 60:.0f} min{extra})')
 
     threading.Thread(target=beat, daemon=True).start()
+    proc = None
     try:
         with open(logfile, 'a') as lf:
-            lf.write(f'\n===== {time.ctime()} :: {" ".join(cmd)}\n')
+            lf.write(f'\n===== {time.ctime()} :: {shown}\n')
+            # Own process group: on a stop (time limit, scancel, Ctrl-C) the whole step - including any
+            # processes it started - is ended before this job writes its report and exits.
             proc = subprocess.Popen(cmd, cwd=REPO, env=env or stage_env(a, p), stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                    stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
+                                    bufsize=1, start_new_session=hasattr(os, 'killpg'))
             for line in proc.stdout:
-                sys.stdout.write(line)
+                line = redact(line)
+                console(line)
                 lf.write(line)
                 if on_line is not None:
                     on_line(line)
             rc = proc.wait()
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            try:
+                log(f'stopping {name} ...')
+            finally:
+                stop_process_group(proc)
+        raise
     finally:
         stop.set()
     if rc != 0:
@@ -207,6 +291,29 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
         err.rc = rc
         raise err
     return rc
+
+
+def stop_process_group(proc, grace=15):
+    """SIGTERM a step's whole process group, then SIGKILL whatever is left after `grace` seconds."""
+    def send(sig):
+        try:
+            if hasattr(os, 'killpg'):
+                os.killpg(proc.pid, sig)
+            elif sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+    send(signal.SIGTERM)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        send(getattr(signal, 'SIGKILL', signal.SIGTERM))
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def disk_needed_gb(a, p, selected):
@@ -237,8 +344,11 @@ def disk_needed_gb(a, p, selected):
         need, what = frames_need(videos), 'frame extraction'
     elif 'fetch_data' in todo:
         present = tree_bytes(p.raw / 'extracted.partial')   # a partial unpack is replaced, not added to
-        if p.zip.exists():                                   # a (partial) download is continued
-            present += p.zip.stat().st_size
+        for part in [p.zip] + sorted(p.raw.glob(p.zip.name + '*.part')):   # a (partial) download is continued
+            try:
+                present += part.stat().st_size
+            except OSError:
+                pass
         if a.data_zip:                                       # the archive lives elsewhere: no download needed
             try:
                 present += Path(a.data_zip).stat().st_size
@@ -440,6 +550,8 @@ def resolve_settings(a):
         a.text_model = str(Path(a.text_model).expanduser().resolve())
     a.data_url = a.data_url or os.environ.get('LGEL_DATA_URL')
     a.weights_url = a.weights_url or os.environ.get('LGEL_WEIGHTS_URL')
+    register_secret(a.data_url, 'LGEL_DATA_URL')
+    register_secret(a.weights_url, 'LGEL_WEIGHTS_URL')
     return a
 
 
@@ -539,9 +651,12 @@ def record_environment(p):
             parts.append(f'===== {title}\n{out.stdout}{out.stderr}')
         except Exception as e:                              # noqa: BLE001
             parts.append(f'===== {title}\n(unavailable: {e})')
-    keys = sorted(k for k in os.environ if k.startswith(('SLURM_', 'CUDA_', 'CONDA_', 'LGEL_')) and 'URL' not in k)
-    parts.append('===== environment variables\n' + '\n'.join(f'{k}={os.environ[k]}' for k in keys))
-    (p.logs / 'environment.txt').write_text('\n'.join(parts) + '\n')
+    keys = ('SLURM_JOB_ID', 'SLURM_JOB_NAME', 'SLURM_JOB_PARTITION', 'SLURM_JOB_NODELIST', 'SLURM_CPUS_PER_TASK',
+            'SLURM_MEM_PER_NODE', 'SLURM_GPUS', 'SLURM_GPUS_ON_NODE', 'SLURM_JOB_GPUS', 'SLURM_RESTART_COUNT',
+            'CUDA_VISIBLE_DEVICES', 'CONDA_PREFIX', 'CONDA_ENVS_PATH', 'CONDA_PKGS_DIRS', 'LGEL_BASE', 'LGEL_ROOT',
+            'LGEL_PRESET', 'LGEL_ENV_PREFIX', 'LGEL_SINGLE_JOB')
+    parts.append('===== environment variables\n' + '\n'.join(f'{k}={os.environ[k]}' for k in keys if k in os.environ))
+    (p.logs / 'environment.txt').write_text(redact('\n'.join(parts)) + '\n')
 
 
 def stage_fetch_models(a, p):
@@ -563,14 +678,78 @@ def _curl_supports(flag):
         return False
 
 
-def remote_size(url):
-    """Content-Length of the final (post-redirect) response, or None if the server does not say."""
+@contextlib.contextmanager
+def url_file(url, p, curl=True):
+    """The link in a private (0600) temporary file, so it never appears in a process list:
+    a curl config file (`curl -K`) or a plain list for `wget -i`."""
+    p.tmp.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix='.link-', suffix='.txt', dir=p.tmp)
     try:
-        out = subprocess.run(['curl', '-sIL', '--max-time', '60', url], capture_output=True, text=True).stdout
+        with os.fdopen(fd, 'w') as f:
+            if curl:
+                f.write('url = "' + url.replace('\\', '\\\\').replace('"', '\\"') + '"\n')
+            else:
+                f.write(url + '\n')
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+DOWNLOAD_ATTEMPTS, DOWNLOAD_PAUSE, STALL_SECONDS = 20, 15, 600
+
+
+def remote_size(url, p):
+    """Size of the file behind the link: the Content-Length of the final (post-redirect) response, only if
+    that response is a success and not a web page (an expired link's error page, a refused HEAD request
+    or a redirect must never be mistaken for the file). None when unknown: then nothing is decided by size."""
+    try:
+        with url_file(url, p) as conf:
+            done = subprocess.run(['curl', '-sIL', '--max-time', '60', '-K', conf], capture_output=True, text=True)
     except Exception:                                           # noqa: BLE001
         return None
-    sizes = re.findall(r'(?im)^content-length:\s*(\d+)', out)
+    if done.returncode != 0:                                    # e.g. a proxy tunnel that failed after its "200"
+        return None
+    blocks = [b for b in re.split(r'(?im)^(?=HTTP/)', done.stdout) if b.strip()]
+    final = blocks[-1] if blocks else ''
+    status = re.match(r'(?i)HTTP/\S+\s+(\d{3})', final)
+    if not status or not status.group(1).startswith('2') or re.search(r'(?im)^content-type:\s*text/html', final):
+        return None
+    sizes = re.findall(r'(?im)^content-length:\s*(\d+)', final)
     return int(sizes[-1]) if sizes else None
+
+
+def same_start(url, path, p):
+    """Whether the file behind the link begins with the same bytes as `path` (its first KB)."""
+    with open(path, 'rb') as f:
+        mine = f.read(1024)
+    if not mine:
+        return False
+    try:
+        with url_file(url, p) as conf:
+            proc = subprocess.Popen(['curl', '-fsSL', '--max-time', '120', '-r', f'0-{len(mine) - 1}', '-K', conf],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                theirs = proc.stdout.read(len(mine))            # (a server that ignores -r sends more: not read)
+            finally:
+                proc.kill()
+                proc.wait()
+    except Exception:                                           # noqa: BLE001
+        return False
+    return theirs == mine
+
+
+def is_web_page(path):
+    with open(path, 'rb') as f:
+        head = f.read(1024).lstrip().lower()
+    return head.startswith((b'<!doctype html', b'<html', b'<?xml', b'<head', b'<body'))
+
+
+def web_page_error(name):
+    return StageError(f'the link for {name} returned a web page, not the file (a share page, a login page or an '
+                      f'expired link). Give a direct download link and run the same command again.')
 
 
 def download(url, dest, a, p, name):
@@ -595,12 +774,9 @@ def download(url, dest, a, p, name):
     if not url:
         raise StageError(f'{dest.name} is missing and no download link was given.')
     _download(url, dest, a, p, name)
-    with open(dest, 'rb') as f:
-        head = f.read(1024).lstrip().lower()
-    if head.startswith((b'<!doctype html', b'<html', b'<?xml', b'<head', b'<body')):
+    if is_web_page(dest):
         dest.unlink()
-        raise StageError(f'the link for {dest.name} returned a web page, not the file (a share page, a login page or an '
-                         f'expired link). Give a direct download link and run the same command again.')
+        raise web_page_error(dest.name)
     write_json(complete, dict(size=dest.stat().st_size, finished=time.ctime()))
 
 
@@ -623,34 +799,92 @@ def _download(url, dest, a, p, name):
     if any(h in url for h in ('drive.google.com', 'docs.google.com')):
         if shutil.which('gdown') is None and subprocess.run([sys.executable, '-m', 'gdown', '--version'],
                                                             capture_output=True).returncode != 0:
-            raise StageError('This is a Google Drive link and needs `gdown` (pip install gdown).')
-        run([sys.executable, '-m', 'gdown', '--fuzzy', url, '-O', dest], a, p, name, progress_path=dest)
+            raise StageError('This is a Google Drive link and needs `gdown` (pip install "gdown>=6,<7").')
+        if dest.exists():
+            # gdown keeps its partial data in <name>*.part and treats an existing file as finished, but this
+            # one was never verified (e.g. left by a direct-link download before the link was changed).
+            log(f'{dest.name}: discarding an unverified earlier file before the Google Drive download')
+            dest.unlink()
+        env = stage_env(a, p)
+        env['LGEL_GDOWN_URL'] = url                             # not on the command line
+        # gdown 6 dropped `fuzzy` (share links are always understood) and added timeouts/retries; gdown 4
+        # could resume from the wrong file, so it is refused. Only the arguments this gdown accepts are passed.
+        # quiet: no progress bar flooding the logs (the heartbeat reports the size); errors still show.
+        code = ('import gdown, inspect, os, sys\n'
+                'version = getattr(gdown, "__version__", "5")\n'
+                'if int(version.split(".")[0]) < 5:\n'
+                '    sys.exit("gdown " + version + " is too old for this pipeline: pip install \'gdown>=6,<7\'")\n'
+                'wanted = dict(quiet=True, fuzzy=True, resume=True, timeout=(60, 600), retries=20)\n'
+                'accepted = inspect.signature(gdown.download).parameters\n'
+                'kw = {k: v for k, v in wanted.items() if k in accepted}\n'
+                'sys.exit(0 if gdown.download(os.environ["LGEL_GDOWN_URL"], sys.argv[1], **kw) else 1)\n')
+        run([sys.executable, '-c', code, dest], a, p, name, progress_path=dest, env=env)
         return
     if shutil.which('curl'):
-        total = remote_size(url)
-        if dest.exists() and total is not None and dest.stat().st_size == total:
-            log(f'{dest.name} already fully downloaded ({gb(total):.2f} GB)')
-            return
+        total = remote_size(url, p)
+        if dest.exists() and total is not None:
+            if dest.stat().st_size == total:
+                log(f'{dest.name} already fully downloaded ({gb(total):.2f} GB)')
+                return
+            if dest.stat().st_size > total:                 # cannot be the start of the file behind the link
+                raise StageError(
+                    f'{dest} ({dest.stat().st_size} bytes so far) is larger than what the link returns now ({total} '
+                    f'bytes): the link has probably expired (it returns an error message) or points to another file. '
+                    f'The partial download is kept. Check the link; only if it really is a different file, delete '
+                    f'{dest} and run the same command again.')
         if total is not None:
             log(f'downloading {gb(total):.2f} GB -> {dest}')
-        base = ['curl', '-fL', '--retry', '20', '--retry-delay', '15', '--connect-timeout', '60']
-        if _curl_supports('--retry-all-errors'):
-            base += ['--retry-all-errors']
-        try:
-            run(base + ['-C', '-', '-o', dest, url], a, p, name, progress_path=dest)
-        except StageError:
-            # A server without byte-range support cannot resume: start over rather than trust a partial file.
-            if dest.exists() and (total is None or dest.stat().st_size != total):
-                log('resume failed (server without range support?); restarting the download from zero')
-                dest.unlink()
-                run(base + ['-o', dest, url], a, p, name, progress_path=dest)
-            elif not dest.exists():
-                raise
+        # Every attempt continues from the bytes already on disk (curl's own --retry would cut the file back
+        # to where that curl process started). Slower than 1 KB/s for STALL_SECONDS counts as broken.
+        base = ['curl', '-fsSL', '--connect-timeout', '60', '--speed-limit', '1024', '--speed-time', str(STALL_SECONDS)]
+        # If the server cannot continue a partial file (curl exit 33; also what an expired link that answers
+        # with a web page looks like), a complete new copy is fetched next to it and replaces it only if usable.
+        fresh = dest.with_name(dest.name + '.restart')
+        fresh.unlink(missing_ok=True)                       # an unfinished copy of that kind cannot be continued
+        resumable = True
+        with url_file(url, p) as conf:
+            for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+                target = dest if resumable else fresh
+                if not resumable:
+                    fresh.unlink(missing_ok=True)
+                before = dest.stat().st_size if (resumable and dest.exists()) else None
+                try:
+                    run(base + (['-C', '-'] if resumable else []) + ['-o', target, '-K', conf], a, p, name,
+                        progress_path=target)
+                except StageError as e:
+                    code = getattr(e, 'rc', None)
+                    if attempt == DOWNLOAD_ATTEMPTS:
+                        fresh.unlink(missing_ok=True)
+                        raise
+                    if code == 33 and resumable:
+                        log('the server does not continue a partial download: fetching a complete new copy')
+                        resumable = False
+                        continue
+                    log(f'download interrupted (curl exit code {code}); continuing in {DOWNLOAD_PAUSE} s '
+                        f'(attempt {attempt + 1} of {DOWNLOAD_ATTEMPTS})')
+                    time.sleep(DOWNLOAD_PAUSE)
+                    continue
+                if not resumable:
+                    if not fresh.exists() or is_web_page(fresh):
+                        fresh.unlink(missing_ok=True)
+                        raise web_page_error(dest.name)    # the partial download is kept for a corrected link
+                    os.replace(fresh, dest)
+                elif total is None and before and dest.stat().st_size == before and not same_start(url, dest, p):
+                    # curl adds nothing and reports success when the link now returns something shorter than the
+                    # partial file (e.g. an error page): that is not the end of the file
+                    raise StageError(f'the link for {dest.name} no longer returns the file that was being downloaded '
+                                     f'(expired?). The partial download is kept. Check the link and run the same '
+                                     f'command again.')
+                break
+        if not dest.exists():
+            raise StageError(f'the download of {dest.name} produced no file. Run the same command again.')
         if total is not None and dest.stat().st_size != total:
             raise StageError(f'Downloaded {dest.stat().st_size} bytes but the server announced {total}. '
                              f'Run the same command again to continue.')
     elif shutil.which('wget'):
-        run(['wget', '-c', '--tries=20', '--waitretry=15', '-O', dest, url], a, p, name, progress_path=dest)
+        with url_file(url, p, curl=False) as listing:
+            run(['wget', '-nv', '-c', '--tries=20', '--waitretry=15', '-O', dest, '-i', listing], a, p, name,
+                progress_path=dest)
     else:
         raise StageError('Neither curl, wget nor gdown is available to download files.')
 
@@ -826,8 +1060,11 @@ def load_inventory(p):
 
 # --------------------------------------------------------------------------- stage: extract_frames
 def _worker_init():
-    """Extraction workers stop on SIGTERM like any process (the parent's handler is not for them)."""
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    """Extraction workers stop on SIGTERM/SIGHUP like any process (the parent's handler is not for them);
+    a signal that is deliberately ignored (SIGHUP under nohup) stays ignored."""
+    for s in STOP_SIGNALS:
+        if signal.getsignal(s) != signal.SIG_IGN:
+            signal.signal(s, signal.SIG_DFL)
 
 
 def _extract_one(job):
@@ -912,7 +1149,18 @@ def stage_extract_frames(a, p):
                     failures.append((Path(job[0]).name, repr(e)))
                     log(f'  [{n}/{len(todo)}] FAILED {Path(job[0]).name}: {e!r}')
         except BaseException:                                   # e.g. SIGTERM from the scheduler: stop now
+            workers = list(getattr(pool, '_processes', {}).values())
+            for w in workers:
+                try:
+                    w.terminate()                               # their SIGTERM handler is the default one
+                except Exception:                               # noqa: BLE001
+                    pass
             pool.shutdown(wait=False, cancel_futures=True)
+            for w in workers:
+                try:
+                    w.join(timeout=10)
+                except Exception:                               # noqa: BLE001
+                    pass
             raise
         pool.shutdown(wait=True)
     if failures:
@@ -1289,36 +1537,92 @@ def stage_summary(a, p):
 
 
 # --------------------------------------------------------------------------- report bundle
-BUNDLE_MAX_FILE = 200 * 1024 ** 2                  # never put huge files (checkpoints, frames) in the bundle
+BUNDLE_TOTAL = 80 * 1024 ** 2        # uncompressed payload of one report (about 15-20 MB as .tar.gz)
+BUNDLE_FILE = 25 * 1024 ** 2         # largest single file taken whole
+BUNDLE_TAIL = 5 * 1024 ** 2          # larger logs: only their last part
+BUNDLE_TEXT = {'.json', '.jsonl', '.csv', '.md', '.txt', '.log', '.out'}
+BUNDLE_IMAGES = {'training_curves.png'}
+
+
+def _bundle_candidates(p):
+    """Report files in priority order: results and metrics first, bulky predictions last."""
+    first = [p.results / n for n in ('SUMMARY.md', 'summary.json', 'proposed_calibration.json',
+                                       'proposed_test_metrics.json', 'training_curves.png')]
+    first += [p.run / 'training_metrics.jsonl', p.run / 'run_config.json', p.run / 'parameter_counts.json',
+              p.run_cfg, p.run_inputs, p.audit, p.splits, p.splits.with_suffix('.provenance.json'),
+              p.data / 'annotations_sanitized.json', p.metadata, p.inventory, *sorted(p.state.glob('*.json'))]
+    logs = sorted(p.logs.glob('*')) if p.logs.exists() else []
+    logs.sort(key=lambda f: (f.name != 'main.log', not f.name.startswith('slurm-'), f.name))
+    rest = sorted(p.results.glob('*')) if p.results.exists() else []
+    seen, out = set(), []
+    for f in first + logs + rest:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
 
 
 def write_report_bundle(a, p, rc):
-    """After every job (finished, failed or stopped by the scheduler) pack everything needed to see what
-    happened - logs, results, metrics, settings, data reports - into one small file in <root>/outbox,
-    so it can be sent back. Checkpoints and data are not included (they stay under <root>)."""
+    """After every job (finished, failed or stopped by the scheduler) pack what is needed to see what
+    happened - results, metrics, settings, data reports, logs - into one small file in <root>/outbox
+    that can be sent back. Checkpoints, data and unknown files never go in; private links are
+    redacted; the size is bounded; MANIFEST.txt lists anything left out or shortened."""
     try:
+        import io
         import tarfile
         p.outbox.mkdir(parents=True, exist_ok=True)
         job = os.environ.get('SLURM_JOB_ID')
-        status = 'OK' if rc == 0 else ('STOPPED' if rc == 143 else 'FAILED')
+        status = 'OK' if rc == 0 else ('STOPPED' if rc in (129, 143) else 'FAILED')
         name = f'{a.run_name}-{time.strftime("%Y%m%d-%H%M%S")}{f"-job{job}" if job else ""}-{status}.tar.gz'
-        items = [p.logs, p.results, p.run_cfg, p.run_inputs, p.run / 'training_metrics.jsonl',
-                 p.run / 'run_config.json', p.run / 'parameter_counts.json', p.audit, p.splits,
-                 p.splits.with_suffix('.provenance.json'), p.metadata, p.data / 'annotations_sanitized.json',
-                 p.inventory, *sorted(p.state.glob('*.json'))]
-
-        def small(info):
-            if info.isfile() and (info.name.endswith('.pth') or info.size > BUNDLE_MAX_FILE):
-                return None
-            return info
-
+        included, shortened, omitted, total = [], [], [], 0
+        payload = []
+        for f in _bundle_candidates(p):
+            try:
+                if f.is_symlink() or not f.is_file() or p.root not in f.resolve().parents:
+                    continue
+                rel = str(f.relative_to(p.root))
+                suffix = f.suffix.lower()
+                if suffix not in BUNDLE_TEXT and f.name not in BUNDLE_IMAGES:
+                    continue                                    # checkpoints, temporary files, data ...
+                size = f.stat().st_size
+                if f.name in BUNDLE_IMAGES:
+                    data = f.read_bytes() if size <= BUNDLE_FILE else None
+                elif size > BUNDLE_FILE and suffix in ('.log', '.out', '.txt'):
+                    with open(f, 'rb') as fh:
+                        fh.seek(size - BUNDLE_TAIL)
+                        data = fh.read()
+                    shortened.append(f'{rel} (last {BUNDLE_TAIL // 1024 ** 2} MB of {size / 1024 ** 2:.0f} MB)')
+                elif size > BUNDLE_FILE:
+                    data = None
+                else:
+                    data = f.read_bytes()
+                if data is None or total + len(data) > BUNDLE_TOTAL:
+                    omitted.append(f'{rel} ({size / 1024 ** 2:.1f} MB)')
+                    continue
+                if f.name not in BUNDLE_IMAGES:
+                    data = redact(data.decode('utf-8', errors='replace')).encode('utf-8')
+                total += len(data)
+                payload.append((rel, data))
+                included.append(rel)
+            except OSError as e:
+                omitted.append(f'{f} (unreadable: {e})')
+        manifest = [f'report: {name}', f'outcome: {status} (exit code {rc})', f'run: {a.run_name}  preset: {a.preset}',
+                    f'job: {job or "-"}  host: {platform.node()}  written: {time.ctime()}',
+                    'checkpoints and data are never included; they stay under the run folder.',
+                    '', f'included ({len(included)}):', *included,
+                    '', f'shortened ({len(shortened)}):', *shortened,
+                    '', f'left out because of the size limit ({len(omitted)}):', *omitted]
+        payload.insert(0, ('MANIFEST.txt', ('\n'.join(manifest) + '\n').encode('utf-8')))
         tmp = p.outbox / f'.{name}.{os.getpid()}.tmp'
         with tarfile.open(tmp, 'w:gz') as tar:
-            for item in items:
-                if item.exists():
-                    tar.add(item, arcname=str(item.relative_to(p.root)), filter=small)
+            for rel, data in payload:
+                info = tarfile.TarInfo(rel)
+                info.size, info.mtime, info.mode = len(data), time.time(), 0o644
+                tar.addfile(info, io.BytesIO(data))
         os.replace(tmp, p.outbox / name)
-        (p.outbox / 'LATEST.txt').write_text(name + '\n')
+        latest = p.outbox / f'.LATEST.{os.getpid()}.tmp'
+        latest.write_text(name + '\n')
+        os.replace(latest, p.outbox / 'LATEST.txt')
         log(f'REPORT: everything needed to see what happened is in {p.outbox / name} '
             f'({(p.outbox / name).stat().st_size / 1024 ** 2:.1f} MB) - send this file to Soheil.')
     except Exception as e:                                  # noqa: BLE001 - must never hide the real outcome
@@ -1340,7 +1644,13 @@ def export_model_weights(p):
         os.replace(tmp, out)
         log(f'best model weights (no optimizer state) exported to {out} ({out.stat().st_size / 1024 ** 2:.0f} MB)')
     except Exception as e:                                  # noqa: BLE001
-        log(f'(model weights export skipped: {e!r})')
+        try:
+            tmp.unlink()
+        except (NameError, OSError):
+            pass
+        raise StageError(f'could not export the best model weights to {out} ({e!r}). The training checkpoints '
+                         f'are intact; fix the cause (e.g. disk space) and run the same command again - it only '
+                         f'redoes the summary.')
 
 
 # --------------------------------------------------------------------------- driver
@@ -1358,7 +1668,8 @@ def select_stages(a):
 
 def main(argv=None):
     global _LOGFILE
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     ap.add_argument('--preset', choices=sorted(PRESETS), default='full')
     ap.add_argument('--root', default=os.environ.get('LGEL_ROOT'),
                     help='working directory for ALL data/checkpoints/results (put it on scratch; needs ~200 GB). '
@@ -1446,10 +1757,15 @@ def main(argv=None):
     _LOGFILE = p.logs / 'main.log'
     # The scheduler stops a job (time limit, scancel) with SIGTERM: exit through the normal path so
     # that the report bundle is still written. (Exec'd children restore the default handler.)
-    try:
-        previous = signal.signal(signal.SIGTERM, _on_sigterm)
-    except ValueError:                                    # not the main thread (tests)
-        previous = None
+    # A dropped terminal (SIGHUP) is handled the same way, unless it is deliberately ignored (nohup).
+    previous = {}
+    for s in STOP_SIGNALS:
+        try:
+            if s == getattr(signal, 'SIGHUP', None) and signal.getsignal(s) == signal.SIG_IGN:
+                continue
+            previous[s] = signal.signal(s, _on_sigterm)
+        except ValueError:                                # not the main thread (tests)
+            pass
     rc = 1
     try:
         rc = _drive(a, p, selected, redo)
@@ -1458,16 +1774,21 @@ def main(argv=None):
         log(f'!! stopped (exit code {rc}); resubmit the same command to continue')
         raise
     finally:
-        if previous is not None:
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a second SIGTERM must not cut the report short
+        for s in previous:
+            signal.signal(s, signal.SIG_IGN)                # a second stop signal must not cut the report short
         write_report_bundle(a, p, rc)
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        for s, handler in previous.items():
+            signal.signal(s, handler)
     return rc
 
 
+STOP_SIGNALS = tuple(s for s in (getattr(signal, 'SIGTERM', None), getattr(signal, 'SIGHUP', None)) if s)
+
+
 def _on_sigterm(signum, frame):
-    raise SystemExit(143)
+    for s in STOP_SIGNALS:                                  # one stop is enough; let the clean-up finish
+        signal.signal(s, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
 
 
 def _drive(a, p, selected, redo):

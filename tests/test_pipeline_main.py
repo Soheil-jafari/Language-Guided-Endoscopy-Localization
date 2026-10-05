@@ -499,14 +499,16 @@ def test_without_file_locks_a_job_stops_unless_told_it_runs_alone(tmp_path, monk
     assert pipeline.FileLock.disabled
 
 
-def test_training_never_starts_on_unfinished_data(tmp_path, capsys):
+def test_training_never_starts_on_unfinished_data(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(pipeline.FileLock, 'disabled', False)          # restored after the test
     root = tmp_path / 'root'
     p = pipeline.Paths(root, 'smoke_seed42')
     p.state.mkdir(parents=True)
     for s in pipeline.STAGES[1:pipeline.STAGES.index('train')]:
         if s != 'extract_frames':                                     # e.g. a job killed during extraction
             pipeline.write_json(p.marker(s), {})
-    args = ['--preset', 'smoke', '--root', str(root), '--stages', 'train', '--allow-cpu', '--min-free-gb', '0']
+    args = ['--preset', 'smoke', '--root', str(root), '--stages', 'train', '--allow-cpu', '--min-free-gb', '0',
+            '--single-job']                                         # (Windows has no POSIX locks)
     assert pipeline.main(args) == 1
     out = capsys.readouterr().out
     assert 'prepared data is incomplete' in out and 'extract_frames' in out

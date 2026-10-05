@@ -29,22 +29,34 @@ needs_setup() {   # $1 = why; never installs anything in an --offline job
 
 if [ "${LGEL_SKIP_ENV:-0}" != "1" ]; then
   ENV_NAME="${LGEL_ENV:-lgel}"
+  ENV_PREFIX="${LGEL_ENV_PREFIX:-}"            # an exact location (set by the cluster job), else by name
   if command -v conda >/dev/null 2>&1; then
     set +u                                     # conda's shell scripts are not all 'set -u' safe
     # shellcheck disable=SC1091
     source "$(conda info --base)/etc/profile.d/conda.sh"
-    if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
-      needs_setup "conda env '$ENV_NAME' does not exist"
+    if [ -n "$ENV_PREFIX" ]; then
+      TARGET="$ENV_PREFIX"
+      [ -x "$ENV_PREFIX/bin/python" ] || needs_setup "conda env $ENV_PREFIX does not exist"
+    else
+      TARGET="$ENV_NAME"
+      if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+        needs_setup "conda env '$ENV_NAME' does not exist"
+      fi
     fi
-    conda activate "$ENV_NAME"
+    conda activate "$TARGET"
+    if [ -n "$ENV_PREFIX" ] && [ "$(cd "$CONDA_PREFIX" 2>/dev/null && pwd -P)" != "$(cd "$ENV_PREFIX" 2>/dev/null && pwd -P)" ]; then
+      echo "ERROR: conda activated $CONDA_PREFIX instead of $ENV_PREFIX" >&2
+      exit 1
+    fi
     # setup_env.sh writes this marker only after every package installed and imported correctly,
     # so an environment left half-installed by an interrupted setup is detected and completed.
-    WANT="$("$CONDA_PREFIX/bin/python" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$REPO/requirements.txt" 2>/dev/null || true)"
+    # (the same fingerprint of requirements.txt + setup_env.sh that setup_env.sh writes)
+    WANT="$("$CONDA_PREFIX/bin/python" -c 'import hashlib,sys; h=hashlib.sha256(); [h.update(open(f,"rb").read()) for f in sys.argv[1:]]; print(h.hexdigest())' "$REPO/requirements.txt" "$REPO/setup_env.sh" 2>/dev/null || true)"
     if [ ! -x "$CONDA_PREFIX/bin/python" ] || [ -z "$WANT" ] || \
        [ "$(cat "$CONDA_PREFIX/.lgel_env_ready" 2>/dev/null || true)" != "$WANT" ]; then
       conda deactivate                         # let setup_env.sh start from a clean shell
-      needs_setup "conda env '$ENV_NAME' is incomplete or out of date"
-      conda activate "$ENV_NAME"
+      needs_setup "conda env '$TARGET' is incomplete or out of date"
+      conda activate "$TARGET"
     fi
     set -u
   else

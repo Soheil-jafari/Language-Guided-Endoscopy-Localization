@@ -2,7 +2,6 @@
 import json
 import os
 import subprocess
-import sys
 import tarfile
 from pathlib import Path
 
@@ -23,7 +22,8 @@ def test_cpu_count_never_exceeds_the_slurm_allocation(monkeypatch):
     assert pipeline.cpu_count() >= 1
 
 
-def test_every_job_leaves_a_small_report_bundle_without_checkpoints(tmp_path):
+def test_every_job_leaves_a_small_report_bundle_without_checkpoints(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline.FileLock, 'disabled', False)          # restored after the test
     root = tmp_path / 'root'
     p = pipeline.Paths(root, 'smoke_seed42')
     p.run.mkdir(parents=True)
@@ -100,7 +100,8 @@ def test_submit_script_refuses_a_second_job_and_missing_links(tmp_path):
 @posix_only
 def test_submit_script_chains_follow_up_jobs_and_passes_options(tmp_path):
     (tmp_path / 'base').mkdir()
-    (tmp_path / 'base' / 'links.env').write_text("LGEL_DATA_URL='x'\n")
+    (tmp_path / 'base' / 'links.env').write_text("LGEL_DATA_URL='https://data.invalid/d.zip'\n"
+                                                 "LGEL_WEIGHTS_URL='https://weights.invalid/w.pth'\n")
     out, calls = _submit(tmp_path, 'full', '--repeat', '2', '--batch-size', '4', '--accum', '48')
     assert out.returncode == 0, out.stderr
     assert len(calls) == 2

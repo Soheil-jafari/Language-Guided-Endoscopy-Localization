@@ -16,41 +16,62 @@ steps are skipped and training continues from its last finished epoch.
 
 ## 0. Quick start on the project cluster (Slurm, A100, `/mnt/scratch/users/daiz1/soheil`)
 
-Everything below is already set up for this cluster in `hpc/`: the Slurm job (`hpc/lgel.sbatch`:
-partition `gpu`, 1 GPU, 32 CPUs, 64 GB RAM, the `libs/nvidia-cuda/12.4.0/bin` and
-`apps/miniconda3` modules) and a submit helper (`hpc/submit.sh`). The conda environment is created
-automatically by the first job and kept under the project folder, not in the home directory.
+Everything below is already set up for this cluster in `hpc/`:
+
+* `hpc/lgel.sbatch` is the Slurm job: partition `gpu`, 1 node, 1 GPU, 16 CPUs, 64 GB RAM, and the
+  `libs/nvidia-cuda/12.4.0/bin` and `apps/miniconda3` modules.
+* `hpc/submit.sh` is the only command to run. It submits that job and lets only one job run at a time
+  (always submit through it, never `sbatch` directly: that guarantee relies on it).
+* The conda environment is created automatically by the first job, at
+  `/mnt/scratch/users/daiz1/soheil/conda/envs/lgel`, not in the home directory.
 
 **Once, on the login node:**
 
 ```bash
 cd /mnt/scratch/users/daiz1/soheil
 git clone https://github.com/Soheil-jafari/Language-Guided-Endoscopy-Localization.git code
-cp code/hpc/links.env.example links.env      # then paste the two private links (sent by email) into it
+( umask 077 && cat > links.env )   # paste the two lines from Soheil's email, press Enter, then Ctrl-D
 ```
 
-**Then three jobs, one after the other** (each command returns immediately; the job runs in the queue):
+The two lines look like `LGEL_DATA_URL='https://...'` and `LGEL_WEIGHTS_URL='https://...'`. The
+file can only be read by you and is never copied into the repository. The links are never printed
+in logs or reports, and never passed on a command line (where other users could see them).
+
+**Then three jobs, strictly one after the other.** Each command returns at once and the job waits
+in the queue. Before starting the next step, wait until the job has finished (`squeue -u $USER`
+shows nothing), send back its report, and wait for Soheil's OK.
 
 ```bash
 bash code/hpc/submit.sh smoke     # ~30 min: creates the environment, tests the GPU and the weights link on fake data
 bash code/hpc/submit.sh pilot     # a few hours: downloads and prepares the real data, short training, time estimate
-bash code/hpc/submit.sh full      # about a day: the real experiment (20 epochs)
+bash code/hpc/submit.sh full      # estimated 15-25 h: the real experiment (20 epochs); the pilot measures it
 ```
 
-* `squeue -u $USER` shows the job; its live log is `lgel_smoke/logs/slurm-<jobid>.out` (smoke) or
-  `lgel/logs/slurm-<jobid>.out` (pilot, full).
-* **After each job, send back one file:** the newest `.tar.gz` in `lgel_smoke/outbox/` or
-  `lgel/outbox/` (its name is in `outbox/LATEST.txt`). It holds all logs, metrics, settings and
-  results, but no checkpoints or data, so it is small. It is written even when a job fails or is
-  stopped by the time limit.
-* The trained model is `lgel/results/full_seed42/model_weights.pth` (best checkpoint without
-  optimizer state); the full checkpoints stay in `lgel/runs/full_seed42/`.
-* `submit.sh` refuses to start a second job while one is queued or running, so two jobs can never
-  use the same folder at once.
-* If the full run ever needs more than the 72 h limit, submit it again (it continues from the last
-  finished epoch), or use `bash code/hpc/submit.sh full --repeat 2` to queue a follow-up job.
-* Options after the preset are passed on, e.g. `bash code/hpc/submit.sh full --batch-size 4 --accum 48`
-  if the GPU runs out of memory.
+* **The report to send back** after each job is the newest `.tar.gz` in `lgel_smoke/outbox/` (smoke)
+  or `lgel/outbox/` (pilot, full). Its name is also in `outbox/LATEST.txt` and at the end of the job
+  log.
+  * It holds results, metrics, settings, data checks and logs, at most about 80 MB unpacked
+    (typically 5-20 MB as `.tar.gz`). Checkpoints and data are never included.
+  * If something large had to be left out or shortened, its `MANIFEST.txt` says so.
+  * A report is written whether the job finishes, fails, or is stopped. If the pipeline could not
+    write its own (e.g. the environment could not be set up), a smaller one holds the end of the job
+    log. Only a node crash or a hard kill of the whole job can prevent it; then send the job log
+    `lgel_smoke/logs/slurm-<jobid>.out` (smoke) or `lgel/logs/slurm-<jobid>.out` (pilot, full).
+* **Time limit:** about 5 minutes before a job's time limit, the job stops itself cleanly and writes
+  its report. Submitting the same command again continues from the last finished epoch.
+  * `bash code/hpc/submit.sh full --repeat 2` queues a follow-up job up front. It starts when the
+    first one ends, whatever the outcome: if the first job failed for a reason that is still there,
+    the follow-up fails the same way within minutes.
+* **The trained model** is `lgel/results/full_seed42/model_weights.pth` (the best checkpoint without
+  optimizer state). The full checkpoints stay in `lgel/runs/full_seed42/`.
+* **Out of GPU memory:** pass options after the preset, e.g.
+  `bash code/hpc/submit.sh full --batch-size 4 --accum 48`. The folder, the preset and the links
+  cannot be changed this way.
+* **If `sbatch` refuses the job** (for example it asks for an account or QoS, or says the requested
+  node configuration is not available), give the site's value like this:
+  `LGEL_SBATCH_OPTS="--account=NAME" bash code/hpc/submit.sh ...` (or e.g. `--cpus-per-task=8`).
+* **Space:** a full run needs about 200 GB at its peak and about 200,000 files, well within the
+  1 TB. Files in this scratch space must not be deleted automatically while the project runs.
 
 The rest of this guide explains the pipeline in general and applies to any cluster.
 
@@ -88,7 +109,8 @@ bash setup_env.sh                    # creates the conda env "lgel" (roughly 10 
 
 The two download links are **not stored in the repository**. The student supplies them privately
 as environment variables. They must be **direct** links that download the file itself without a
-login: a share *page* (for example a Baidu Pan page) does not work. If the files are already on
+login: a share *page* (for example a Baidu Pan page) does not work. A Google Drive link to a file
+shared as "Anyone with the link" also works (it is fetched with `gdown`). If the files are already on
 the cluster, use `--data-zip` (the zip) or `--data-dir` (the unzipped folder), and
 `--weights-path` (the checkpoint) instead.
 
@@ -175,7 +197,7 @@ Schedulers kill jobs at their wall-clock limit. Every step is resumable:
 * Submit the **same command again** (same `--root`, same flags). Finished steps are skipped;
   training resumes from `runs/<run>/latest_model.pth`, the last finished epoch.
 * A step that is killed half-way is redone from its own start. Downloads continue where they
-  stopped, except for Google-Drive links, which start again.
+  stopped (Google-Drive links too), and a transfer that stalls is retried automatically.
 * A job killed while saving is handled: the checkpoint is written atomically, and the metrics log
   is repaired to match it on the next start.
 * Request the **same GPU type and one GPU** for every resubmission of a run.
@@ -216,6 +238,7 @@ Everything lives under `--root`:
                         proposed_calibration.json, proposed_test_metrics.json
   logs/ ............... one log file per step (train.log, extract_frames.log, gpu_check.log, ...)
   state/ .............. "step finished" markers and job locks
+  outbox/ ............. one small report (.tar.gz) per job, to send back; newest name in LATEST.txt
 ```
 
 `SUMMARY.md` contains:
@@ -311,7 +334,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 90 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 146 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.
@@ -320,6 +343,14 @@ deliberately **tiny** model on CPU:
   * a job killed between saving a checkpoint and logging its metrics;
   * a half-written log line;
   * a partial weights download, which is continued over HTTP;
+  * downloads that stall or break repeatedly: each new attempt continues from the bytes already on
+    disk (real curl against a test server), and only a server that cannot continue a file is
+    downloaded from the start again (into a separate file, which replaces the partial one only
+    when it is complete and not a web page);
+  * a link that expires half-way (an error status, an error page, a short error message, a refused
+    size request): the partial download is kept and the job says what is wrong with the link;
+  * Google-Drive downloads with gdown 5 and 6 (`setup_env.sh` installs 6), against a local server:
+    an interrupted transfer is continued; gdown 4 is refused;
   * an "internet first, offline later" run;
   * `--offline` refusing to download;
   * download links that return a web page or a wrong file, then corrected;
@@ -337,10 +368,23 @@ deliberately **tiny** model on CPU:
 * **Exact resume:** killing training after epoch 2 and resuming gives bit-identical weights, optimizer/scheduler state and metrics to an uninterrupted run.
 * **Pretrained checkpoint format:** checkpoints in the official M2CRL training format (`teacher`/`student`), and plain state dicts, load with strict checks of every encoder tensor.
 * **Project-cluster scripts:** `hpc/submit.sh` and `hpc/lgel.sbatch` were run with stand-ins for Slurm
-  and the module system: a smoke job using the real weights link, a pilot downloading through
-  `links.env`, the exported weights used by `predict.py`, and a job stopped the way Slurm stops it at
-  the time limit (the report is still written) and then resubmitted.
-* **Environment scripts:** `run.sh` activates and checks the conda env in a non-interactive shell (Miniforge, conda 26.7), and `setup_env.sh` runs up to the PyTorch download.
+  and the module system:
+  * a smoke job using the weights link, and a pilot downloading through `links.env`;
+  * the exported weights used by `predict.py`;
+  * the early time-limit warning stopping training cleanly (the report is written and `train.py` is
+    stopped first), followed by a resubmission that resumes;
+  * a hard stop the way Slurm does it at the limit, and a job whose conda module cannot be loaded
+    (both still leave a report);
+  * a dropped terminal (for someone running `run.sh` by hand): the step is stopped and the report
+    written, even though the terminal can no longer be written to;
+  * no private link in any log, result or report, and none on a command line (downloads read the
+    link from a private temporary file); parts of a link that identify the file on their own (such
+    as a Google Drive file id in an error message) are hidden too;
+  * `submit.sh` refusing bad options, links on the command line, empty links, a second
+    submission, and an unreadable queue.
+* **Environment scripts:** with a real conda (Miniforge, conda 26.7), `run.sh` activates and checks
+  exactly the environment folder the job specifies (never another environment with the same name),
+  and `setup_env.sh` creates it there up to the PyTorch download.
 
 **Not verified** (could not be tested where this was written):
 
