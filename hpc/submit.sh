@@ -56,7 +56,7 @@ if ! take_lock; then
   if [ "${OWNER%% *}" = "$(hostname)" ] && [ -n "${OWNER##* }" ] && ! kill -0 "${OWNER##* }" 2>/dev/null \
      && mkdir "$LOCK.reclaim" 2>/dev/null; then
     if [ "$(cat "$LOCK/owner" 2>/dev/null || true)" = "$OWNER" ]; then rm -rf "$LOCK"; fi
-    take_lock; GOT=$?
+    GOT=0; take_lock || GOT=$?                     # (set -e must not skip removing .reclaim)
     rmdir "$LOCK.reclaim"
     [ "$GOT" -eq 0 ] || die "$BUSY"
   else

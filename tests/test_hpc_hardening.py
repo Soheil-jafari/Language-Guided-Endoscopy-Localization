@@ -987,3 +987,22 @@ def test_submit_takes_over_a_dead_lock_only_one_at_a_time(tmp_path):
     out, calls = _submit(tmp_path, 'smoke')
     assert out.returncode == 0 and len(calls) == 1, out.stderr
     assert not lock.exists() and not (base / '.submit.lock.reclaim').exists()
+
+
+@posix_only
+def test_losing_the_lock_race_after_a_takeover_still_removes_the_reclaim_guard(tmp_path):
+    base = tmp_path / 'base'
+    _links(base)
+    lock = base / '.submit.lock'
+    lock.mkdir()
+    dead = subprocess.Popen(['true'])
+    dead.wait()
+    (lock / 'owner').write_text(f'{os.uname().nodename} {dead.pid}\n')
+    # another submit.sh takes the lock in the moment between the stale lock's removal and our own mkdir
+    stub = _fake_slurm(tmp_path)
+    racer = stub / 'rm'
+    racer.write_text(f'#!/bin/bash\n/bin/rm "$@"\n[ -d "{lock}" ] || {{ mkdir "{lock}"; echo "other 1" > "{lock}/owner"; }}\n')
+    racer.chmod(0o755)
+    out, calls = _submit(tmp_path, 'smoke')
+    assert out.returncode == 1 and 'another submit.sh is running' in out.stderr and not calls
+    assert not (base / '.submit.lock.reclaim').exists()                  # later takeovers stay possible
