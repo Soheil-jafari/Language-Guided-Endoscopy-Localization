@@ -11,7 +11,8 @@ OUT="$ROOT/outbox"
 mkdir -p "$OUT" 2>/dev/null || exit 0
 
 # The pipeline already reported this job (a report newer than the job's start marker exists).
-if [ -f "$START" ] && [ -n "$(find "$OUT" -maxdepth 1 -name '*.tar.gz' -newer "$START" -print -quit 2>/dev/null)" ]; then
+PATTERN='*.tar.gz'; [ "$JOB" = local ] || PATTERN="*-job${JOB}-*.tar.gz"      # this job's own report
+if [ -f "$START" ] && [ -n "$(find "$OUT" -maxdepth 1 -name "$PATTERN" -newer "$START" -print -quit 2>/dev/null)" ]; then
   exit 0
 fi
 

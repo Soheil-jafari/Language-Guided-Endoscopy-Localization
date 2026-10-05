@@ -272,9 +272,10 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
                     on_line(line)
             rc = proc.wait()
     except BaseException:
-        if proc is not None and proc.poll() is None:
+        if proc is not None:                         # even if its first process has already ended
             try:
-                log(f'stopping {name} ...')
+                if proc.poll() is None:
+                    log(f'stopping {name} ...')
             finally:
                 stop_process_group(proc)
         raise
@@ -305,15 +306,30 @@ def stop_process_group(proc, grace=15):
                 proc.kill()
         except (ProcessLookupError, PermissionError):
             pass
-    send(signal.SIGTERM)
-    try:
-        proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        send(getattr(signal, 'SIGKILL', signal.SIGTERM))
+    def settled():                                   # the step's first process AND everything it started
+        proc.poll()                                  # (reaped, so a zombie does not count as running)
+        if not hasattr(os, 'killpg'):
+            return proc.returncode is not None
         try:
-            proc.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            pass
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
+
+    def wait(seconds):
+        deadline = time.time() + seconds
+        while not settled() and time.time() < deadline:
+            time.sleep(0.2)
+        return settled()
+
+    if settled():
+        return
+    send(signal.SIGTERM)
+    if not wait(grace):
+        send(getattr(signal, 'SIGKILL', signal.SIGTERM))
+        wait(grace)
 
 
 def disk_needed_gb(a, p, selected):
@@ -868,6 +884,15 @@ def _download(url, dest, a, p, name):
                     if not fresh.exists() or is_web_page(fresh):
                         fresh.unlink(missing_ok=True)
                         raise web_page_error(dest.name)    # the partial download is kept for a corrected link
+                    if total is not None and fresh.stat().st_size != total:
+                        got = fresh.stat().st_size         # incomplete or not the announced file: never replace
+                        fresh.unlink()
+                        if attempt == DOWNLOAD_ATTEMPTS:
+                            raise StageError(f'the new copy of {dest.name} has {got} bytes, but the server announced '
+                                             f'{total}. The partial download is kept. Run the same command again.')
+                        log(f'the new copy has {got} of {total} bytes; trying again in {DOWNLOAD_PAUSE} s')
+                        time.sleep(DOWNLOAD_PAUSE)
+                        continue
                     os.replace(fresh, dest)
                 elif total is None and before and dest.stat().st_size == before and not same_start(url, dest, p):
                     # curl adds nothing and reports success when the link now returns something shorter than the
@@ -1580,7 +1605,7 @@ def write_report_bundle(a, p, rc):
             try:
                 if f.is_symlink() or not f.is_file() or p.root not in f.resolve().parents:
                     continue
-                rel = str(f.relative_to(p.root))
+                rel = f.relative_to(p.root).as_posix()
                 suffix = f.suffix.lower()
                 if suffix not in BUNDLE_TEXT and f.name not in BUNDLE_IMAGES:
                     continue                                    # checkpoints, temporary files, data ...

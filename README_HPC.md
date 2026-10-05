@@ -334,7 +334,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 146 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 150 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.

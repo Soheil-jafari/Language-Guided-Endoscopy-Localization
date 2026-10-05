@@ -76,7 +76,10 @@ def test_report_is_bounded_prioritised_and_skips_binaries(tmp_path, monkeypatch)
     (p.logs / 'main.log').write_text('start\n' + 'y' * 4000 + '\nTHE END\n')      # long log: tail kept
     for i in range(6):
         (p.logs / f'stage{i}.log').write_text('z' * 1500)                       # fill the total budget
-    (p.logs / 'link.log').symlink_to('/etc/hostname') if hasattr(os, 'symlink') else None
+    try:
+        (p.logs / 'link.log').symlink_to(p.results / 'SUMMARY.md')       # never followed into a report
+    except (OSError, NotImplementedError):                            # Windows without symlink rights
+        pass
     a = argparse.Namespace(run_name='full_seed42', preset='full')
     pipeline.write_report_bundle(a, p, 1)
     name = (p.outbox / 'LATEST.txt').read_text().strip()
@@ -90,7 +93,7 @@ def test_report_is_bounded_prioritised_and_skips_binaries(tmp_path, monkeypatch)
     assert not [n for n in names if '.pth' in n or n.endswith('.tmp')]
     assert 'logs/link.log' not in names
     assert 'results/full_seed42/proposed_test.csv' not in names and 'proposed_test.csv' in manifest
-    assert main_log.endswith('THE END\n') and 'start' not in main_log and 'logs/main.log (last' in manifest
+    assert main_log.rstrip().endswith('THE END') and 'start' not in main_log and 'logs/main.log (last' in manifest
     assert payload <= 6000 and 'left out because of the size limit' in manifest
 
 
@@ -933,3 +936,54 @@ def test_when_curl_adds_nothing_the_first_bytes_decide(tmp_path, monkeypatch, mo
             assert dest.read_bytes() == blob and dest.with_name('dataset.zip.complete').exists()
     finally:
         server.shutdown()
+
+
+# ------------------------------------------------------------------ round 14 (ChatGPT's final review)
+def test_a_new_copy_that_is_not_the_announced_size_never_replaces_the_partial(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, 'DOWNLOAD_ATTEMPTS', 3)
+    dest = tmp_path / 'dataset.zip'
+    dest.write_bytes(b'p' * 500)
+    calls = _fake_curl(tmp_path, monkeypatch, [(0, 33), (100, 0), (100, 0)], total=1000)
+    with pytest.raises(pipeline.StageError, match='partial download is kept'):
+        pipeline._download(SECRET, dest, argparse.Namespace(offline=False), pipeline.Paths(tmp_path, 'r'), 'x')
+    assert len(calls) == 3 and dest.read_bytes() == b'p' * 500
+    assert not dest.with_name('dataset.zip.restart').exists()
+
+
+@posix_only
+def test_stopping_a_step_also_ends_what_survives_its_first_process(tmp_path):
+    pidfile = tmp_path / 'pid'
+    proc = subprocess.Popen(['bash', '-c', f'(trap "" TERM; exec sleep 60) & echo $! > {pidfile}'],
+                            start_new_session=True)
+    proc.wait(timeout=10)                                   # the first process has already ended
+    survivor = int(pidfile.read_text())
+    assert _alive(survivor)
+    started = time.time()
+    pipeline.stop_process_group(proc, grace=1)               # TERM is ignored, so KILL must follow
+    time.sleep(0.3)
+    assert not _alive(survivor) and time.time() - started < 10
+
+
+@posix_only
+def test_submit_never_echoes_a_rejected_link(tmp_path):
+    _links(tmp_path / 'base')
+    out, calls = _submit(tmp_path, 'full', '--weights-url=https://private.invalid/SECRET12345')
+    assert out.returncode == 1 and 'SECRET12345' not in out.stderr + out.stdout and not calls
+
+
+@posix_only
+def test_submit_takes_over_a_dead_lock_only_one_at_a_time(tmp_path):
+    base = tmp_path / 'base'
+    _links(base)
+    lock = base / '.submit.lock'
+    lock.mkdir()
+    dead = subprocess.Popen(['true'])
+    dead.wait()
+    (lock / 'owner').write_text(f'{os.uname().nodename} {dead.pid}\n')
+    (base / '.submit.lock.reclaim').mkdir()                  # another submit.sh is taking it over right now
+    out, calls = _submit(tmp_path, 'smoke')
+    assert out.returncode == 1 and 'another submit.sh is running' in out.stderr and not calls
+    (base / '.submit.lock.reclaim').rmdir()
+    out, calls = _submit(tmp_path, 'smoke')
+    assert out.returncode == 0 and len(calls) == 1, out.stderr
+    assert not lock.exists() and not (base / '.submit.lock.reclaim').exists()

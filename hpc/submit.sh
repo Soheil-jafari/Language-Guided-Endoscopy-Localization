@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
     --root|--root=*|--preset|--preset=*)
       die "$1: the folder and the preset are set by this script (use smoke, pilot or full)" ;;
     --data-url|--data-url=*|--weights-url|--weights-url=*)
-      die "$1: put the download links in $BASE/links.env, never on the command line (it is visible to other users)" ;;
+      die "${1%%=*}: put the download links in $BASE/links.env, never on the command line (it is visible to other users)" ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
@@ -47,15 +47,22 @@ mkdir -p "$BASE"
 
 # Only one submission at a time (an atomic lock directory), and only one job at a time (the queue).
 LOCK="$BASE/.submit.lock"
-if ! mkdir "$LOCK" 2>/dev/null; then
+BUSY="another submit.sh is running. If none is, remove the folder $LOCK (and $LOCK.reclaim if it exists) and try again."
+take_lock() { mkdir "$LOCK" 2>/dev/null && echo "$(hostname) $$" > "$LOCK/owner"; }
+if ! take_lock; then
+  # A lock left by a submit.sh on this host that no longer runs is taken over - by one submit.sh at a time
+  # (the .reclaim folder), and only if the owner is still that dead process, so a live lock is never removed.
   OWNER="$(cat "$LOCK/owner" 2>/dev/null || true)"
-  if [ "${OWNER%% *}" = "$(hostname)" ] && ! kill -0 "${OWNER##* }" 2>/dev/null; then
-    rm -rf "$LOCK"; mkdir "$LOCK" || die "could not take $LOCK"      # left by an interrupted submit.sh here
+  if [ "${OWNER%% *}" = "$(hostname)" ] && [ -n "${OWNER##* }" ] && ! kill -0 "${OWNER##* }" 2>/dev/null \
+     && mkdir "$LOCK.reclaim" 2>/dev/null; then
+    if [ "$(cat "$LOCK/owner" 2>/dev/null || true)" = "$OWNER" ]; then rm -rf "$LOCK"; fi
+    take_lock; GOT=$?
+    rmdir "$LOCK.reclaim"
+    [ "$GOT" -eq 0 ] || die "$BUSY"
   else
-    die "another submit.sh is running ($OWNER). If none is, remove the folder $LOCK and try again."
+    die "$BUSY"
   fi
 fi
-echo "$(hostname) $$" > "$LOCK/owner"
 trap 'rm -rf "$LOCK"' EXIT
 trap 'exit 130' INT TERM
 
