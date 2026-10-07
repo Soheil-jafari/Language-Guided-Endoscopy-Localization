@@ -3,7 +3,7 @@
 #
 #   bash hpc/submit.sh smoke          # ~30 min: creates the conda env, tests GPU + software on fake data
 #   bash hpc/submit.sh pilot          # a few hours: real data prepared once, short training, time estimate
-#   bash hpc/submit.sh full           # estimated about a day: the real experiment
+#   bash hpc/submit.sh full           # the real experiment: baseline, then advanced model (use --repeat 2)
 #   bash hpc/submit.sh full --repeat 2    # same, plus one follow-up job in case 72 h are not enough
 #
 # Anything after the preset is passed on to main.py, e.g.  bash hpc/submit.sh full --batch-size 4 --accum 48

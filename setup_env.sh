@@ -66,12 +66,21 @@ rm -f "$CONDA_PREFIX/.lgel_env_ready"
 "$PY" -m pip install -r "$REPO/requirements.txt"  # pinned versions; torch lines are already satisfied
 "$PY" -m pip install "gdown>=6,<7" matplotlib      # helpers: Google-Drive links, training-curve plot
 
+# Mamba, the advanced model's temporal head (its own script, so that run.sh can retry just this part).
+# A failure here does not stop the setup: the baseline model does not need Mamba.
+bash "$REPO/install_mamba.sh" "$PY" || true
+
 "$PY" - <<'EOF'
 import torch, torchvision, transformers, cv2, pandas, sklearn, einops, PIL
-print("torch", torch.__version__, "| CUDA available on THIS node:", torch.cuda.is_available())
+try:
+    import mamba_ssm, selective_scan_cuda
+    mamba = mamba_ssm.__version__
+except Exception as e:
+    mamba = f"NOT AVAILABLE ({type(e).__name__})"
+print("torch", torch.__version__, "| mamba_ssm", mamba, "| CUDA available on THIS node:", torch.cuda.is_available())
 print("(on a login node without a GPU 'False' is normal; it must be True inside the GPU job)")
 EOF
 # Written last: run.sh treats an environment without this stamp (or with a stale one) as incomplete.
 # It covers requirements.txt AND this script, so a later fix to either updates the environment.
-"$PY" -c 'import hashlib,sys; h=hashlib.sha256(); [h.update(open(f,"rb").read()) for f in sys.argv[1:]]; print(h.hexdigest())' "$REPO/requirements.txt" "$REPO/setup_env.sh" > "$CONDA_PREFIX/.lgel_env_ready"
+"$PY" -c 'import hashlib,sys; h=hashlib.sha256(); [h.update(open(f,"rb").read()) for f in sys.argv[1:]]; print(h.hexdigest())' "$REPO/requirements.txt" "$REPO/setup_env.sh" "$REPO/install_mamba.sh" > "$CONDA_PREFIX/.lgel_env_ready"
 echo "OK: environment '$TARGET' is ready.  Next (see README_HPC.md): bash run.sh --preset smoke --root <scratch>/lgel_smoke --synthetic 6 --random-init"

@@ -10,5 +10,5 @@ scikit-learn==1.5.2
 Pillow==12.3.0
 opencv-python-headless==4.10.0.84
 pytest==8.3.3
-# Optional official Mamba: install separately for the server CUDA/toolchain.
-# No fallback is performed if that selected backend is unavailable.
+# Official Mamba (mamba-ssm 2.2.4, the advanced model's temporal head) is installed by setup_env.sh,
+# which matches it to the installed torch/CUDA. No fallback is performed if it is unavailable.

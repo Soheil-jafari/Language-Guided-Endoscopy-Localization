@@ -621,7 +621,8 @@ def test_environment_stamp_is_one_fingerprint_of_requirements_and_setup_script()
     assert stamp('run.sh') == stamp('setup_env.sh')
     out = subprocess.run(['bash', '-c', f'REPO="{REPO}"; "{sys.executable}" {stamp("run.sh")}'],
                          capture_output=True, text=True, check=True).stdout.strip()
-    expected = hashlib.sha256((REPO / 'requirements.txt').read_bytes() + (REPO / 'setup_env.sh').read_bytes())
+    expected = hashlib.sha256((REPO / 'requirements.txt').read_bytes() + (REPO / 'setup_env.sh').read_bytes()
+                              + (REPO / 'install_mamba.sh').read_bytes())
     assert out == expected.hexdigest()
 
 

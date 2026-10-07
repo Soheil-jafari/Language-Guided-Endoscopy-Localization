@@ -51,12 +51,18 @@ if [ "${LGEL_SKIP_ENV:-0}" != "1" ]; then
     # setup_env.sh writes this marker only after every package installed and imported correctly,
     # so an environment left half-installed by an interrupted setup is detected and completed.
     # (the same fingerprint of requirements.txt + setup_env.sh that setup_env.sh writes)
-    WANT="$("$CONDA_PREFIX/bin/python" -c 'import hashlib,sys; h=hashlib.sha256(); [h.update(open(f,"rb").read()) for f in sys.argv[1:]]; print(h.hexdigest())' "$REPO/requirements.txt" "$REPO/setup_env.sh" 2>/dev/null || true)"
+    WANT="$("$CONDA_PREFIX/bin/python" -c 'import hashlib,sys; h=hashlib.sha256(); [h.update(open(f,"rb").read()) for f in sys.argv[1:]]; print(h.hexdigest())' "$REPO/requirements.txt" "$REPO/setup_env.sh" "$REPO/install_mamba.sh" 2>/dev/null || true)"
     if [ ! -x "$CONDA_PREFIX/bin/python" ] || [ -z "$WANT" ] || \
        [ "$(cat "$CONDA_PREFIX/.lgel_env_ready" 2>/dev/null || true)" != "$WANT" ]; then
       conda deactivate                         # let setup_env.sh start from a clean shell
       needs_setup "conda env '$TARGET' is incomplete or out of date"
       conda activate "$TARGET"
+    elif [ "$OFFLINE" != "1" ] && [ -e "$CONDA_PREFIX/.lgel_mamba_missing" ]; then
+      # An earlier Mamba installation failed (e.g. a network hiccup): retry only that download. Never fatal:
+      # the baseline model does not need Mamba, and the advanced model's check reports it if still missing.
+      echo "the Mamba package is missing from conda env '$TARGET' - retrying its installation"
+      LGEL_MAMBA_NO_COMPILE=1 bash "$REPO/install_mamba.sh" "$CONDA_PREFIX/bin/python" \
+        || echo "WARNING: Mamba is still missing; the baseline model can run, the advanced model cannot"
     fi
     set -u
   else

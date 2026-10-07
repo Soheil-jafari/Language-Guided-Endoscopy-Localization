@@ -42,10 +42,16 @@ in the queue. Before starting the next step, wait until the job has finished (`s
 shows nothing), send back its report, and wait for Soheil's OK.
 
 ```bash
-bash code/hpc/submit.sh smoke     # ~30 min: creates the environment, tests the GPU and the weights link on fake data
-bash code/hpc/submit.sh pilot     # a few hours: downloads and prepares the real data, short training, time estimate
-bash code/hpc/submit.sh full      # estimated 15-25 h: the real experiment (20 epochs); the pilot measures it
+bash code/hpc/submit.sh smoke            # ~30 min: creates the environment, tests the GPU, the weights link and Mamba
+bash code/hpc/submit.sh pilot            # a few hours: downloads and prepares the real data, short training, time estimate
+bash code/hpc/submit.sh full --repeat 2  # the real experiment: baseline model, then advanced model (20 epochs each)
 ```
+
+`full` trains two models one after the other on the same data and splits: first the **baseline**,
+then the **advanced** model (the baseline plus the Mamba temporal head, the bi-level consistency
+loss, evidential uncertainty and confidence fusion). Together they are likely to take longer than
+one 72-hour job; `--repeat 2` queues a second job that simply continues where the first stopped
+(the pilot's report says how long one model takes).
 
 * **The report to send back** after each job is the newest `.tar.gz` in `lgel_smoke/outbox/` (smoke)
   or `lgel/outbox/` (pilot, full). Its name is also in `outbox/LATEST.txt` and at the end of the job
@@ -62,11 +68,14 @@ bash code/hpc/submit.sh full      # estimated 15-25 h: the real experiment (20 e
   * `bash code/hpc/submit.sh full --repeat 2` queues a follow-up job up front. It starts when the
     first one ends, whatever the outcome: if the first job failed for a reason that is still there,
     the follow-up fails the same way within minutes.
-* **The trained model** is `lgel/results/full_seed42/model_weights.pth` (the best checkpoint without
-  optimizer state). The full checkpoints stay in `lgel/runs/full_seed42/`.
+* **The trained models** are `lgel/results/full_baseline_seed42/model_weights.pth` and
+  `lgel/results/full_advanced_seed42/model_weights.pth` (each the best checkpoint without optimizer
+  state); `lgel/results/full_seed42_COMPARISON.md` puts their test results side by side. The full
+  checkpoints stay in `lgel/runs/`.
 * **Out of GPU memory:** pass options after the preset, e.g.
-  `bash code/hpc/submit.sh full --batch-size 4 --accum 48`. The folder, the preset and the links
-  cannot be changed this way.
+  `bash code/hpc/submit.sh full --batch-size 4 --accum 48` (same effective batch). They apply to the
+  model still being trained: a baseline that has already finished is left exactly as it is. The
+  folder, the preset and the links cannot be changed this way.
 * **If `sbatch` refuses the job** (for example it asks for an account or QoS, or says the requested
   node configuration is not available), give the site's value like this:
   `LGEL_SBATCH_OPTS="--account=NAME" bash code/hpc/submit.sh ...` (or e.g. `--cpus-per-task=8`).
@@ -86,7 +95,7 @@ The rest of this guide explains the pipeline in general and applies to any clust
 | RAM | 32 GB or more recommended. |
 | Disk | About **200 GB free** under `--root`. The peak is roughly 150-170 GB, while the ~70 GB zip and the ~80 GB of extracted videos coexist. The zip is deleted after extraction, and the videos can also be deleted with `--cleanup-raw`. Later jobs only check for the space their remaining steps need. |
 | Files | About **200,000 files** under `--root` (one JPEG per second of video, about 180,000). Clusters often limit the number of files (inode quota) as well as bytes; check both, e.g. with `quota -s` or `df -ih`. The free-space check cannot see quotas. |
-| Internet | Needed for the **first** run only (dataset, weights, a small text model). If compute nodes have no internet see section 5. |
+| Internet | Needed for the **first** run only (dataset, weights, a small text model, the optical-flow network used by the advanced model's loss, and the packages: conda-forge, PyPI, download.pytorch.org, and github.com for the ready-made Mamba build). If compute nodes have no internet see section 5. |
 | Software | `conda` (Miniforge/Anaconda), Python 3.12 (installed by `setup_env.sh`), an NVIDIA driver that supports CUDA 12.4 (driver 525.60 or newer; `nvidia-smi` shows the driver version), Linux with glibc >= 2.28 (RHEL/Rocky/Alma 8+, Ubuntu 20.04+; `ldd --version` shows it). |
 
 ## 2. Install (once)
@@ -96,6 +105,12 @@ git clone https://github.com/Soheil-jafari/Language-Guided-Endoscopy-Localizatio
 cp site_env.sh.example site_env.sh   # optional: add the cluster's `module load` lines and cache locations
 bash setup_env.sh                    # creates the conda env "lgel" (roughly 10 minutes, needs internet)
 ```
+
+`setup_env.sh` also installs `mamba-ssm` 2.2.4 for the advanced model: a ready-made build matching
+PyTorch 2.5 / CUDA 12 / Python 3.12 is downloaded from its GitHub releases, so no CUDA compiler is
+needed. Only if that download fails is it compiled from source, which needs `nvcc` (e.g. the cluster's
+CUDA module) and 20-60 minutes. This step lives in `install_mamba.sh`; if it fails, the environment still
+works for the baseline model, and `run.sh` retries the download at the start of every later job.
 
 * The environment is built from the conda-forge channel only, so no Anaconda Terms-of-Service
   prompt can stall it.
@@ -152,7 +167,12 @@ bash run.sh --preset full --root $SCRATCH/lgel
 |---|---|---|
 | `smoke` | 6 videos, 1 epoch, small batch | checking that everything is wired up |
 | `pilot` | all videos, 3 epochs on 10 % of the training windows | a first "is it learning?" result and a time estimate |
-| `full` | all videos, 20 epochs, all training windows, effective batch size 192 | the final numbers |
+| `full` | all videos, 20 epochs, all training windows, effective batch size 192 - the baseline model, then the advanced model | the final numbers |
+
+`--variant baseline|advanced|both` overrides which model(s) a preset trains (`full`: both; `smoke`,
+`pilot`: baseline). The smoke test does not train the advanced model, but it runs one training step
+of it on the GPU (`check_advanced`), so a problem with Mamba or the other add-ons shows up in the
+first 30 minutes, not after the baseline's 20 epochs.
 
 Note: `full` uses **all** training windows (`--subset-ratio 1.0`), whereas the repository's
 default configuration samples 20 %. Pass `--subset-ratio 0.2` to reproduce that.
@@ -171,7 +191,8 @@ bash run.sh --preset pilot --root $SCRATCH/lgel --to-stage audit    # CPU job, n
 ### Several runs in one `--root`
 
 `pilot`, `full` and extra seeds (`--seed N`) share one `--root`: the data is prepared once, and
-each run has its own `runs/<run>/` and `results/<run>/` (run name `<preset>_seed<seed>` unless
+each run has its own `runs/<run>/` and `results/<run>/` (run name `<preset>_seed<seed>`, or
+`full_baseline_seed<seed>` / `full_advanced_seed<seed>` for the two models of `full`, unless
 `--run-name` is given).
 
 * If two jobs start on a fresh `--root` at the same time, the second waits until the first has
@@ -251,9 +272,10 @@ Everything lives under `--root`:
 
 Test videos are never used for training, model selection or threshold selection.
 
-The one command produces the frame-level results of the proposed model. The temporal-segment
-evaluation and the baseline models described in `README.md` are separate tools and are not run
-automatically.
+The one command produces the frame-level results of the baseline and the advanced model (`full`),
+and `results/<run>_COMPARISON.md` with both side by side. The temporal-segment evaluation and the
+external comparison models described in `README.md` (CLIP, X-CLIP, Moment-DETR) are separate tools
+and are not run automatically.
 
 ## 7. Example Slurm job for other clusters (TEMPLATE)
 
@@ -285,7 +307,8 @@ Resubmitting is safe. On clusters with a per-job time limit the job can also be 
 | Flag | Meaning |
 |---|---|
 | `--root DIR` | Where everything is stored. Put it on scratch / a large filesystem. |
-| `--run-name NAME` | Name of this training run (default `<preset>_seed<seed>`). |
+| `--run-name NAME` | Name of this training run (default `<preset>_seed<seed>`; for `full` `full_baseline_seed<seed>` and `full_advanced_seed<seed>`, or `NAME_baseline` / `NAME_advanced`). |
+| `--variant baseline\|advanced\|both` | Which model(s) to train (default: both for `full`, baseline otherwise). |
 | `--seed N` | Training seed (default 42). Different seeds can share one `--root`. |
 | `--synthetic N` | Use N generated fake videos instead of real data (plumbing test only). |
 | `--epochs N`, `--subset-ratio X` | Override the preset. |
@@ -334,7 +357,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 151 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 174 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.
@@ -381,14 +404,24 @@ deliberately **tiny** model on CPU:
     link from a private temporary file); parts of a link that identify the file on their own (such
     as a Google Drive file id in an error message) are hidden too;
   * `submit.sh` refusing bad options, links on the command line, empty links, a second
-    submission, and an unreadable queue.
+    submission, and an unreadable queue;
+  * the `full` preset training the baseline, then the advanced model (Mamba head, bi-level loss,
+    uncertainty, confidence fusion) on the same data, a stop during the advanced training and a
+    resubmission that skips the finished baseline and resumes the advanced model, one report and
+    a comparison table with both. (On CPU, with a stand-in for the GPU-only Mamba layer.)
+* **Mamba installation:** `setup_env.sh`'s Mamba step, run against PyTorch 2.5.1 + CUDA 12.4,
+  downloaded the ready-made `mamba-ssm` 2.2.4 build without any compiler, and the real advanced
+  model (4 official Mamba layers, uncertainty output, confidence fusion) was built with it. The
+  Python 3.12 build the cluster needs exists on GitHub. If Mamba cannot be installed, the
+  environment still works for the baseline and the advanced model is refused with a clear message.
 * **Environment scripts:** with a real conda (Miniforge, conda 26.7), `run.sh` activates and checks
   exactly the environment folder the job specifies (never another environment with the same name),
   and `setup_env.sh` creates it there up to the PyTorch download.
 
 **Not verified** (could not be tested where this was written):
 
-* The real-size model, real GPU training, mixed precision and memory use on actual hardware.
+* The real-size model, real GPU training, mixed precision and memory use on actual hardware,
+  including the Mamba kernels running on a GPU (the smoke test's `check_advanced` step does this).
 * Creating the environment from scratch (conda-forge + PyTorch CUDA 12.4 wheels): the build
   machine could not reach those servers.
 * The real cluster itself (Slurm, modules, conda, GPU): the smoke job checks it in about 30 minutes.

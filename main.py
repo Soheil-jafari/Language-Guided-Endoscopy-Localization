@@ -14,8 +14,12 @@ frame extraction in parallel and repairs the known trailing-row defect in two Ch
 phase-annotation files.
 
 Stages (run `python main.py --list-stages`):
-  preflight fetch_models fetch_weights fetch_data extract_frames sanitize_annotations
+  preflight fetch_models fetch_weights check_advanced fetch_data extract_frames sanitize_annotations
   parse_annotations splits triplets audit train predict evaluate summary
+
+The `full` preset trains two models, each a separate run on the same prepared data: the baseline,
+then the advanced model (Mamba temporal head, bi-level consistency loss, evidential uncertainty,
+confidence fusion). `--variant` selects baseline, advanced or both.
 """
 from __future__ import annotations
 
@@ -48,26 +52,36 @@ except ImportError:                              # pragma: no cover
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
-STAGES = ['preflight', 'fetch_models', 'fetch_weights', 'fetch_data', 'extract_frames',
+STAGES = ['preflight', 'fetch_models', 'fetch_weights', 'check_advanced', 'fetch_data', 'extract_frames',
           'sanitize_annotations', 'parse_annotations', 'splits', 'triplets', 'audit',
           'train', 'predict', 'evaluate', 'summary']
-ALWAYS_RUN = {'preflight', 'summary'}          # cheap, never skipped
+ALWAYS_RUN = {'preflight', 'check_advanced', 'summary'}          # cheap, never skipped
 # Stages whose output belongs to one training run (<root>/runs/<run>, <root>/results/<run>): their
 # 'finished' markers are kept per run, so several runs (pilot, full, other seeds) can share one --root
 # and reuse its data stages.
 RUN_SCOPED = {'train', 'predict', 'evaluate'}
 
+# The advanced model is the baseline with these add-ons switched on (names as in project_config.py):
+# the Mamba temporal head, the bi-level (semantic + optical-flow) consistency loss, evidential
+# uncertainty and confidence-aware fusion. Nothing else differs between the two models.
+ADVANCED_FLAGS = dict(MODEL=dict(TEMPORAL_HEAD_TYPE='SSM', SSM_USE_OFFICIAL_MAMBA=True, USE_UNCERTAINTY=True,
+                                 USE_CONFIDENCE_FUSION=True),
+                      TRAIN=dict(USE_BILEVEL_CONSISTENCY=True))
+VARIANTS = ('baseline', 'advanced', 'both')
+
 # name -> defaults. CLI flags override any of these.
 PRESETS = {
-    # Plumbing check on a handful of videos: minutes, not hours.
+    # Plumbing check on a handful of videos: minutes, not hours. (Also checks that the advanced
+    # model's add-ons - Mamba etc. - run on this GPU, without training it.)
     'smoke': dict(max_videos=6, epochs=1, warmup=1, subset_ratio=0.1, batch_size=2, accum=2,
-                  audit='sample', min_free_gb=10),
-    # "Does it learn?" run: all videos, 10 % of the training windows, 3 epochs.
+                  audit='sample', min_free_gb=10, variant='baseline'),
+    # "Does it learn?" run: all videos, 10 % of the training windows, 3 epochs, baseline model.
     'pilot': dict(max_videos=None, epochs=3, warmup=1, subset_ratio=0.1, batch_size=8, accum=4,
-                  audit='all', min_free_gb=200),
-    # The real run: project defaults (20 epochs, effective batch 192), all training windows.
+                  audit='all', min_free_gb=200, variant='baseline'),
+    # The real run: project defaults (20 epochs, effective batch 192), all training windows - first
+    # the baseline model, then the advanced model, on the same data and splits.
     'full': dict(max_videos=None, epochs=20, warmup=3, subset_ratio=1.0, batch_size=8, accum=24,
-                 audit='all', min_free_gb=200),
+                 audit='all', min_free_gb=200, variant='both'),
 }
 
 
@@ -225,7 +239,8 @@ class Paths:
 
 def stage_env(a, p):
     env = os.environ.copy()
-    env.update(HF_HOME=str(p.hf), PYTHONUNBUFFERED='1', TOKENIZERS_PARALLELISM='false',
+    env.update(HF_HOME=str(p.hf), TORCH_HOME=str(p.root / 'torch_cache'), PYTHONUNBUFFERED='1',
+               TOKENIZERS_PARALLELISM='false',
                PYTHONPATH=str(REPO) + os.pathsep + env.get('PYTHONPATH', ''))
     if a.offline or p.marker('fetch_models').exists():
         env.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')   # cache was populated already
@@ -557,8 +572,10 @@ def resolve_settings(a):
         if getattr(a, key, None) is None:
             setattr(a, key, default)
     a.workers = a.workers or min(16, max(1, cpu_count()))
+    a.run_name_given = a.run_name is not None
     if a.run_name is None:
-        a.run_name = f'{a.preset}_seed{a.seed}'
+        named_by_variant = a.variant == 'advanced' or (a.variant == 'baseline' and PRESETS[a.preset]['variant'] == 'both')
+        a.run_name = f'{a.preset}_{a.variant}_seed{a.seed}' if named_by_variant else f'{a.preset}_seed{a.seed}'
     for attr in ('data_zip', 'data_dir', 'weights_path', 'splits_json'):
         if getattr(a, attr):
             setattr(a, attr, str(Path(getattr(a, attr)).expanduser().resolve()))
@@ -569,6 +586,21 @@ def resolve_settings(a):
     register_secret(a.data_url, 'LGEL_DATA_URL')
     register_secret(a.weights_url, 'LGEL_WEIGHTS_URL')
     return a
+
+
+def model_finished(p):
+    """A run whose evaluation finished (its summary is rewritten on every pass, so it is not required)."""
+    return p.marker('evaluate').exists() and (p.results / 'proposed_test_metrics.json').exists()
+
+
+def variant_runs(a):
+    """(variant, run name) of every model this invocation trains, in order. 'both' = the baseline
+    first, then the advanced model, each a separate run with its own checkpoints and results."""
+    if getattr(a, 'variant', 'baseline') != 'both':
+        return [(getattr(a, 'variant', 'baseline'), a.run_name)]
+    if getattr(a, 'run_name_given', False):
+        return [(v, f'{a.run_name}_{v}') for v in ('baseline', 'advanced')]
+    return [(v, f'{a.preset}_{v}_seed{a.seed}') for v in ('baseline', 'advanced')]
 
 
 def data_source_id(a):
@@ -947,6 +979,113 @@ def stage_fetch_weights(a, p):
     return weights
 
 
+_ADVANCED_CHECKED = False
+
+
+def stage_check_advanced(a, p):
+    """Build the advanced model (every add-on switched on) and run one training step on the GPU with
+    random inputs. This proves - in about a minute, before any long job depends on it - that the Mamba
+    kernels, evidential uncertainty, confidence fusion and the bi-level loss (including the download of
+    the optical-flow network's weights) all work in this environment. It trains nothing."""
+    global _ADVANCED_CHECKED
+    if _ADVANCED_CHECKED:
+        log('advanced model already checked in this job')
+        return
+    amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
+    cfg = dict(MODEL=dict(ADVANCED_FLAGS['MODEL'], TEXT_ENCODER_MODEL=a.text_model),
+               TRAIN=dict(ADVANCED_FLAGS['TRAIN'], AMP_DTYPE=amp))
+    p.tmp.mkdir(parents=True, exist_ok=True)
+    cfg_path = p.tmp / 'check_advanced.json'
+    write_json(cfg_path, cfg)
+    try:
+        run([sys.executable, __file__, '_check_advanced', cfg_path], a, p, 'check_advanced')
+    except StageError as e:
+        if getattr(e, 'rc', None) == MAMBA_MISSING:
+            raise StageError(f'{e}\n   The Mamba package (mamba_ssm) is missing or broken in this environment, so the '
+                             f'advanced model cannot run. setup_env.sh installs it, and run.sh retries the download at the '
+                             f'start of every job that is not --offline (see the job log and logs/check_advanced.log).')
+        if getattr(e, 'rc', None) == FLOW_WEIGHTS_MISSING:
+            raise StageError(f'{e}\n   The weights of the optical-flow network used by the advanced model\'s bi-level '
+                             f'loss (torchvision RAFT-small, a few MB from download.pytorch.org) are not in '
+                             f'{p.root / "torch_cache"} and could not be downloaded. Run the same command once with '
+                             f'internet access (without --offline).')
+        raise
+    _ADVANCED_CHECKED = True
+
+
+def _check_advanced(cfg_path):
+    """Internal (subprocess): one forward/backward step of the advanced model on random data."""
+    import torch
+    from project_config import config
+    _apply_overrides(config, json.loads(Path(cfg_path).read_text()))
+    from losses import MasterLoss
+    try:                                                        # works without a GPU: fetched once, then cached
+        criterion = MasterLoss(config)                          # (TORCH_HOME = <root>/torch_cache)
+    except Exception as e:                                      # noqa: BLE001
+        print(f'OPTICAL-FLOW WEIGHTS UNAVAILABLE: {e!r}', flush=True)
+        sys.exit(FLOW_WEIGHTS_MISSING)
+    print('optical-flow network (bi-level loss) ready', flush=True)
+    if not torch.cuda.is_available():
+        print('advanced-model check SKIPPED: no CUDA GPU here (the Mamba kernels only run on a GPU)', flush=True)
+        return
+    try:
+        import mamba_ssm
+        import selective_scan_cuda  # noqa: F401  pyflakes: ignore (Mamba's compiled GPU kernels)
+    except Exception as e:                                      # noqa: BLE001
+        print(f'MAMBA NOT AVAILABLE: {e!r}', flush=True)
+        sys.exit(MAMBA_MISSING)
+    print(f'mamba_ssm {mamba_ssm.__version__}, torch {torch.__version__}, GPU {torch.cuda.get_device_name(0)}', flush=True)
+    from models import LocalizationFramework
+    torch.manual_seed(0)
+    dev = 'cuda'
+    model = LocalizationFramework(config, initialize_backbone=False).to(dev).train()
+    criterion = criterion.to(dev)
+    criterion.set_epoch(0)
+    length, size = config.DATA.CLIP_LENGTH, config.DATA.TRAIN_CROP_SIZE
+    video = torch.randn(2, 3, length, size, size, device=dev)
+    text = model.text_encoder.tokenizer(['grasper', 'calot triangle dissection'], padding='max_length', truncation=True,
+                                        max_length=config.DATA.MAX_TEXT_LENGTH, return_tensors='pt')
+    target = torch.zeros(2, length, device=dev)
+    target[:, length // 2:] = 1
+    target[1, 0] = -100                                         # an unlabelled frame, as in real windows
+    dtype = torch.bfloat16 if config.TRAIN.AMP_DTYPE == 'bf16' else torch.float16
+    torch.cuda.reset_peak_memory_stats()
+    with torch.autocast(device_type='cuda', dtype=dtype):
+        outputs = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))
+        loss, primary, regularizer = criterion(outputs, video, target)
+    loss.backward()
+    evidence = outputs[-1]
+    problems = []
+    if not torch.isfinite(loss):
+        problems.append(f'non-finite loss {float(loss)}')
+    if evidence is None or tuple(evidence.shape) != (2, length, 2) or bool((evidence < 0).any()):
+        problems.append('the uncertainty (evidence) output is missing or malformed')
+    if not float(regularizer) > 0:
+        problems.append('the bi-level consistency loss is not active')
+    if model.language_guided_head.confidence_module is None:
+        problems.append('confidence fusion is not active')
+    mixers = [m for m in model.temporal_head.modules() if type(m).__name__ == 'Mamba']
+    if not mixers:
+        problems.append('the temporal head has no official Mamba layers')
+    if not any(q.grad is not None and bool(q.grad.abs().sum() > 0) for m in mixers for q in m.parameters()):
+        problems.append('no gradient reaches the Mamba layers')
+    # Validation and prediction run the model in eval mode, without autocast and without gradients.
+    model.eval()
+    with torch.no_grad():
+        scores = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))[0]
+    if not bool(torch.isfinite(scores).all()) or bool((scores < 0).any()) or bool((scores > 1).any()):
+        problems.append('the evaluation-mode forward pass does not give probabilities in [0, 1]')
+    if problems:
+        print('ADVANCED MODEL CHECK FAILED: ' + '; '.join(problems), flush=True)
+        sys.exit(1)
+    print(f'advanced model OK: Mamba head ({len(mixers)} layers), uncertainty, confidence fusion and bi-level loss '
+          f'(loss {float(loss):.3f} = {float(primary):.3f} + {float(regularizer):.3f}); one training step with batch 2 '
+          f'used {gb(torch.cuda.max_memory_allocated()):.1f} GB of GPU memory', flush=True)
+
+
+MAMBA_MISSING, FLOW_WEIGHTS_MISSING = 3, 4
+
+
 def _check_model(cfg_path):
     """Internal: construct the model exactly as train.py will (validates checkpoint + text encoder)."""
     from project_config import config
@@ -1309,10 +1448,12 @@ def train_config(a, p, workers, amp_dtype):
         TRAIN_TRIPLETS_CSV_PATH=str(p.triplet_csv('train')), VAL_TRIPLETS_CSV_PATH=str(p.triplet_csv('val')),
         TEST_TRIPLETS_CSV_PATH=str(p.triplet_csv('test')),
         CHECKPOINT_DIR=str(p.run), OUTPUT_DIR=str(p.results),
-        MODEL=dict(M2CRL_WEIGHTS_PATH=read_weights_path(p, a), TEXT_ENCODER_MODEL=a.text_model),
+        MODEL=dict(M2CRL_WEIGHTS_PATH=read_weights_path(p, a), TEXT_ENCODER_MODEL=a.text_model,
+                   **(ADVANCED_FLAGS['MODEL'] if getattr(a, 'variant', 'baseline') == 'advanced' else {})),
         DATA=dict(NUM_WORKERS=workers, SAMPLE_FPS=a.sample_fps),
         TRAIN=dict(SEED=a.seed, NUM_EPOCHS=a.epochs, WARMUP_EPOCHS=a.warmup, BATCH_SIZE=a.batch_size,
-                   GRADIENT_ACCUMULATION_STEPS=a.accum, SUBSET_RATIO=a.subset_ratio, AMP_DTYPE=amp_dtype))
+                   GRADIENT_ACCUMULATION_STEPS=a.accum, SUBSET_RATIO=a.subset_ratio, AMP_DTYPE=amp_dtype,
+                   **(ADVANCED_FLAGS['TRAIN'] if getattr(a, 'variant', 'baseline') == 'advanced' else {})))
 
 
 def completed_epochs(p):
@@ -1481,8 +1622,18 @@ def stage_summary(a, p):
         commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, capture_output=True, text=True).stdout.strip()
     except Exception:                                           # noqa: BLE001
         commit = ''
-    summary = dict(run=a.run_name, preset=a.preset, git_commit=commit, args={k: str(v) for k, v in vars(a).items()
-                                                                             if 'url' not in k})
+    summary = dict(run=a.run_name, preset=a.preset, git_commit=commit,
+                   latest_command_args={k: str(v) for k, v in vars(a).items() if 'url' not in k})
+    if p.run_cfg.exists():                              # what this model was actually trained with
+        trained = json.loads(p.run_cfg.read_text())
+        summary['trained_with'] = dict(MODEL=trained.get('MODEL', {}), TRAIN=trained.get('TRAIN', {}))
+        advanced = trained.get('MODEL', {}).get('TEMPORAL_HEAD_TYPE') == 'SSM'
+        tr = trained.get('TRAIN', {})
+        lines += [f'Model: **{"advanced" if advanced else "baseline"}**'
+                  + (' (Mamba temporal head, bi-level consistency loss, evidential uncertainty, confidence fusion)'
+                     if advanced else ' (Transformer temporal head)')
+                  + f'; trained for {tr.get("NUM_EPOCHS", "?")} epochs, batch {tr.get("BATCH_SIZE", "?")} x '
+                    f'{tr.get("GRADIENT_ACCUMULATION_STEPS", "?")} accumulation, {tr.get("AMP_DTYPE", "?")}.', '']
     if p.audit.exists():
         au = json.loads(p.audit.read_text())
         lines += ['## Data', '', '| split | videos | unique video-queries | labels (-100 / 0 / 1) |', '|---|---|---|---|']
@@ -1517,6 +1668,7 @@ def stage_summary(a, p):
             full = PRESETS['full']
             epoch_s = tr * full['subset_ratio'] / a.subset_ratio + va
             summary['full_run_estimate_hours'] = round(full['epochs'] * epoch_s / 3600, 1)
+            summary['full_run_estimate_note'] = 'baseline model only; the full preset also trains the advanced model'
             lines += ['## Time estimate for the `full` preset', '',
                       f'Pilot epoch (median): {tr / 60:.1f} min training on {a.subset_ratio:.0%} of the training windows + '
                       f'{va / 60:.1f} min validation. Scaling the training part to all windows gives about '
@@ -1524,6 +1676,10 @@ def stage_summary(a, p):
                       f'{full["epochs"]} epochs**, plus prediction. Rough: it assumes the same GPU and file system, and '
                       f'that training time grows linearly with the number of training windows. Each job must fit at '
                       f'least one whole epoch, because training resumes from the last finished epoch.', '']
+            if a.variant == 'baseline':
+                lines += ['This is for the **baseline** model. The `full` preset then trains the **advanced** model for '
+                      'the same number of epochs; it also computes optical flow at every step, so plan for **at least '
+                      'twice this time in total** (the advanced run reports its own epoch times).', '']
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -1561,6 +1717,27 @@ def stage_summary(a, p):
     log(f'summary written: {p.results / "SUMMARY.md"}')
 
 
+def write_comparison(a, plans):
+    """One table with the test results of the baseline and the advanced model side by side."""
+    keys = ('average_precision', 'auroc', 'f1', 'precision', 'recall', 'brier', 'ece')
+    lines = [f'# Baseline vs advanced model: {a.run_name}', '',
+             'Same data and splits; the advanced model adds the Mamba temporal head, the bi-level consistency '
+             'loss, evidential uncertainty and confidence fusion. Test videos, threshold fixed from validation.', '',
+             '| model | run | ' + ' | '.join(k.replace('_', ' ') for k in keys) + ' | epochs | batch x accumulation | precision |',
+             '|---|---|' + '---|' * len(keys) + '---|---|---|']
+    for sub, sp in plans:
+        f = sp.results / 'proposed_test_metrics.json'
+        m = json.loads(f.read_text()) if f.exists() else {}
+        tr = json.loads(sp.run_cfg.read_text()).get('TRAIN', {}) if sp.run_cfg.exists() else {}
+        lines.append(f'| {sub.variant} | {sub.run_name} | ' + ' | '.join(_fmt(m.get(k)) for k in keys) +
+                     f' | {tr.get("NUM_EPOCHS", "?")} | {tr.get("BATCH_SIZE", "?")} x '
+                     f'{tr.get("GRADIENT_ACCUMULATION_STEPS", "?")} | {tr.get("AMP_DTYPE", "?")} |')
+    out = plans[0][1].root / 'results' / f'{a.run_name}_COMPARISON.md'
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text('\n'.join(lines) + '\n')
+    log(f'comparison written: {out}')
+
+
 # --------------------------------------------------------------------------- report bundle
 BUNDLE_TOTAL = 80 * 1024 ** 2        # uncompressed payload of one report (about 15-20 MB as .tar.gz)
 BUNDLE_FILE = 25 * 1024 ** 2         # largest single file taken whole
@@ -1569,16 +1746,23 @@ BUNDLE_TEXT = {'.json', '.jsonl', '.csv', '.md', '.txt', '.log', '.out'}
 BUNDLE_IMAGES = {'training_curves.png'}
 
 
-def _bundle_candidates(p):
-    """Report files in priority order: results and metrics first, bulky predictions last."""
-    first = [p.results / n for n in ('SUMMARY.md', 'summary.json', 'proposed_calibration.json',
-                                       'proposed_test_metrics.json', 'training_curves.png')]
-    first += [p.run / 'training_metrics.jsonl', p.run / 'run_config.json', p.run / 'parameter_counts.json',
-              p.run_cfg, p.run_inputs, p.audit, p.splits, p.splits.with_suffix('.provenance.json'),
+def _bundle_candidates(ps):
+    """Report files in priority order: results and metrics first, bulky predictions last.
+    `ps`: the Paths of every run this job handled (the baseline and the advanced model)."""
+    ps = ps if isinstance(ps, (list, tuple)) else [ps]
+    p = ps[0]
+    first = sorted((p.root / 'results').glob('*_COMPARISON.md')) if (p.root / 'results').exists() else []
+    for q in ps:
+        first += [q.results / n for n in ('SUMMARY.md', 'summary.json', 'proposed_calibration.json',
+                                          'proposed_test_metrics.json', 'training_curves.png')]
+    for q in ps:
+        first += [q.run / 'training_metrics.jsonl', q.run / 'run_config.json', q.run / 'parameter_counts.json',
+                  q.run_cfg, q.run_inputs]
+    first += [p.audit, p.splits, p.splits.with_suffix('.provenance.json'),
               p.data / 'annotations_sanitized.json', p.metadata, p.inventory, *sorted(p.state.glob('*.json'))]
     logs = sorted(p.logs.glob('*')) if p.logs.exists() else []
     logs.sort(key=lambda f: (f.name != 'main.log', not f.name.startswith('slurm-'), f.name))
-    rest = sorted(p.results.glob('*')) if p.results.exists() else []
+    rest = [f for q in ps for f in (sorted(q.results.glob('*')) if q.results.exists() else [])]
     seen, out = set(), []
     for f in first + logs + rest:
         if f not in seen:
@@ -1591,7 +1775,10 @@ def write_report_bundle(a, p, rc):
     """After every job (finished, failed or stopped by the scheduler) pack what is needed to see what
     happened - results, metrics, settings, data reports, logs - into one small file in <root>/outbox
     that can be sent back. Checkpoints, data and unknown files never go in; private links are
-    redacted; the size is bounded; MANIFEST.txt lists anything left out or shortened."""
+    redacted; the size is bounded; MANIFEST.txt lists anything left out or shortened.
+    `p`: the Paths of the run, or a list of them when one job trains several models."""
+    ps = p if isinstance(p, (list, tuple)) else [p]
+    p = ps[0]
     try:
         import io
         import tarfile
@@ -1601,7 +1788,7 @@ def write_report_bundle(a, p, rc):
         name = f'{a.run_name}-{time.strftime("%Y%m%d-%H%M%S")}{f"-job{job}" if job else ""}-{status}.tar.gz'
         included, shortened, omitted, total = [], [], [], 0
         payload = []
-        for f in _bundle_candidates(p):
+        for f in _bundle_candidates(ps):
             try:
                 if f.is_symlink() or not f.is_file() or p.root not in f.resolve().parents:
                     continue
@@ -1699,7 +1886,8 @@ def main(argv=None):
     ap.add_argument('--root', default=os.environ.get('LGEL_ROOT'),
                     help='working directory for ALL data/checkpoints/results (put it on scratch; needs ~200 GB). '
                          'Required for the pilot/full presets (or env LGEL_ROOT).')
-    ap.add_argument('--run-name', help='default: <preset>_seed<seed>')
+    ap.add_argument('--run-name', help='default: <preset>_seed<seed>; with the full preset <preset>_<model>_seed<seed> '
+                                       '(full_baseline_seed42, full_advanced_seed42)')
     g = ap.add_argument_group('inputs')
     g.add_argument('--data-url', help='direct link to the Cholec80 zip (or env LGEL_DATA_URL)')
     g.add_argument('--data-zip', help='already-downloaded zip file')
@@ -1715,6 +1903,9 @@ def main(argv=None):
     g.add_argument('--keep-zip', action='store_true'); g.add_argument('--skip-zip-check', action='store_true')
     g.add_argument('--cleanup-raw', action='store_true', help='delete the extracted raw videos after frame extraction')
     g = ap.add_argument_group('experiment (None = take from preset)')
+    g.add_argument('--variant', choices=VARIANTS,
+                   help='baseline, advanced (Mamba head + bi-level loss + uncertainty + confidence fusion) or both '
+                        '(the baseline first, then the advanced model). Default: both for full, baseline otherwise')
     g.add_argument('--max-videos', type=int); g.add_argument('--epochs', type=int); g.add_argument('--warmup', type=int)
     g.add_argument('--subset-ratio', type=float); g.add_argument('--batch-size', type=int); g.add_argument('--accum', type=int)
     g.add_argument('--audit', choices=['all', 'sample'])
@@ -1741,6 +1932,9 @@ def main(argv=None):
     if argv is None and len(sys.argv) > 1 and sys.argv[1] == '_check_model':     # internal helper
         _check_model(sys.argv[2])
         return 0
+    if argv is None and len(sys.argv) > 1 and sys.argv[1] == '_check_advanced':  # internal helper
+        _check_advanced(sys.argv[2])
+        return 0
     a = ap.parse_args(argv)
     if a.list_stages:
         print('\n'.join(STAGES))
@@ -1752,7 +1946,14 @@ def main(argv=None):
                      'free-space check.')
         a.root = str(REPO / 'lgel_run')
     a = resolve_settings(a)
-    p = Paths(a.root, a.run_name)
+    # The advanced model's add-ons are checked whenever it will be trained, and by the smoke test.
+    a.check_advanced = a.preset == 'smoke' or a.variant != 'baseline'
+    plans = []
+    for variant, name in variant_runs(a):
+        sub = argparse.Namespace(**vars(a))
+        sub.variant, sub.run_name = variant, name
+        plans.append((sub, Paths(a.root, name)))
+    p = plans[0][1]                                     # the shared root, logs and state
     selected = select_stages(a)
     redo = []
     for f in filter(None, (a.force or '').split(',')):
@@ -1761,18 +1962,24 @@ def main(argv=None):
         redo += [s for s in STAGES[STAGES.index(f):] if s not in redo]
 
     if a.dry_run:                                       # describe only: nothing is created or deleted
-        print(f'preset={a.preset} run={a.run_name} root={p.root}')
-        print('stages: ' + ' -> '.join(selected))
-        for s in selected:
-            if s in ALWAYS_RUN:
-                what = 'run'
-            elif s in redo:
-                what = 'run (forced)'
-            elif s == 'train':
-                what = 'run (resumes, or confirms that training is finished)'
-            else:
-                what = 'skip (finished)' if p.marker(s).exists() else 'run'
-            print(f'  {s}: {what}')
+        for i, (sub, sp) in enumerate(plans):
+            print(f'preset={a.preset} run={sub.run_name} model={sub.variant} root={sp.root}')
+            if i < len(plans) - 1 and not redo and model_finished(sp) and selected[-1] == STAGES[-1]:
+                print('  already finished (trained, predicted and evaluated): only its summary would be redone')
+                continue
+            print('stages: ' + ' -> '.join(selected))
+            for s in selected:
+                if s == 'check_advanced' and not a.check_advanced:
+                    what = 'skip (the advanced model is not trained by this command)'
+                elif s in ALWAYS_RUN:
+                    what = 'run'
+                elif s in redo:
+                    what = 'run (forced)'
+                elif s == 'train':
+                    what = 'run (resumes, or confirms that training is finished)'
+                else:
+                    what = 'skip (finished)' if sp.marker(s).exists() else 'run'
+                print(f'  {s}: {what}')
         if redo:
             print('(--force would first discard the "finished" markers of: ' + ', '.join(redo) + ')')
         return 0
@@ -1793,7 +2000,26 @@ def main(argv=None):
             pass
     rc = 1
     try:
-        rc = _drive(a, p, selected, redo)
+        for i, (sub, sp) in enumerate(plans):
+            if len(plans) > 1:
+                log(f'##### model {i + 1} of {len(plans)}: {sub.variant} (run {sub.run_name})')
+            stages = selected
+            if i < len(plans) - 1 and not redo and model_finished(sp) and selected[-1] == STAGES[-1]:
+                # Trained, predicted and evaluated: only its summary is redone (which also checks that the
+                # data has not changed since, and exports its weights if that was interrupted). Its
+                # training settings are not compared, so this command's settings can differ for the next model.
+                log(f'{sub.run_name} has already finished (trained, predicted and evaluated): only its summary is redone')
+                stages = ['summary']
+            # data stages are redone (--force) once; run stages for every model
+            rc = _drive(sub, sp, stages, redo if i == 0 else [s for s in redo if s in RUN_SCOPED])
+            if rc != 0:
+                break
+        if rc == 0 and len(plans) > 1:
+            try:
+                write_comparison(a, plans)
+            except Exception as e:                              # noqa: BLE001
+                rc = 1
+                log(f'!! could not write the comparison table: {e!r}')
     except SystemExit as e:
         rc = e.code if isinstance(e.code, int) else 1
         log(f'!! stopped (exit code {rc}); resubmit the same command to continue')
@@ -1801,7 +2027,7 @@ def main(argv=None):
     finally:
         for s in previous:
             signal.signal(s, signal.SIG_IGN)                # a second stop signal must not cut the report short
-        write_report_bundle(a, p, rc)
+        write_report_bundle(a, [sp for _, sp in plans], rc)
         for s, handler in previous.items():
             signal.signal(s, handler)
     return rc
@@ -1868,7 +2094,8 @@ def _drive(a, p, selected, redo):
     except StageError as e:
         log(f'!! {e}')
         return 1
-    funcs = dict(fetch_models=stage_fetch_models, fetch_weights=stage_fetch_weights, fetch_data=stage_fetch_data,
+    funcs = dict(fetch_models=stage_fetch_models, fetch_weights=stage_fetch_weights,
+                 check_advanced=stage_check_advanced, fetch_data=stage_fetch_data,
                  extract_frames=stage_extract_frames, sanitize_annotations=stage_sanitize_annotations,
                  parse_annotations=stage_parse_annotations, splits=stage_splits, triplets=stage_triplets,
                  audit=stage_audit, train=stage_train, predict=stage_predict, evaluate=stage_evaluate,
@@ -1876,6 +2103,10 @@ def _drive(a, p, selected, redo):
     for stage in selected:
         if stage == 'preflight':
             continue                                            # already run above
+        if stage == 'check_advanced' and not getattr(a, 'check_advanced', False):
+            if a.stages:
+                log('== check_advanced: skipped (this command does not train the advanced model)')
+            continue
         marker = p.marker(stage)
         sig = stage_signature(stage, a)
         if stage in RUN_SCOPED:
@@ -1886,7 +2117,8 @@ def _drive(a, p, selected, redo):
             except OSError as e:
                 log(f'!! could not lock {p.prep_lock} ({e}); resubmit the job, or use --single-job if this keeps happening.')
                 return 1
-            unfinished = [s for s in STAGES[1:STAGES.index('train')] if not p.marker(s).exists()]
+            unfinished = [s for s in STAGES[1:STAGES.index('train')]
+                          if s not in ALWAYS_RUN and not p.marker(s).exists()]
             prep_lock.release()
             if unfinished:
                 log(f'!! the prepared data is incomplete: data stage(s) {unfinished} have not finished. Run the full '
