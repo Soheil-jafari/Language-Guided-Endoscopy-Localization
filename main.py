@@ -982,6 +982,20 @@ def stage_fetch_weights(a, p):
 _ADVANCED_CHECKED = False
 
 
+def flow_weights_file(p):
+    """Where torchvision caches the optical-flow network (RAFT-small) used by the bi-level loss."""
+    from torchvision.models.optical_flow import Raft_Small_Weights
+    return p.root / 'torch_cache' / 'hub' / 'checkpoints' / Path(Raft_Small_Weights.DEFAULT.url).name
+
+
+def require_flow_weights_offline(a, p):
+    """--offline must never touch the network: refuse before anything would try to download them."""
+    if a.offline and not flow_weights_file(p).exists():
+        raise StageError(f'--offline: the weights of the optical-flow network used by the advanced model\'s bi-level '
+                         f'loss ({flow_weights_file(p).name}) are not in {flow_weights_file(p).parent} yet. Run the same '
+                         f'command once without --offline on a machine with internet (e.g. with --to-stage fetch_data).')
+
+
 def stage_check_advanced(a, p):
     """Build the advanced model (every add-on switched on) and run one training step on the GPU with
     random inputs. This proves - in about a minute, before any long job depends on it - that the Mamba
@@ -991,6 +1005,7 @@ def stage_check_advanced(a, p):
     if _ADVANCED_CHECKED:
         log('advanced model already checked in this job')
         return
+    require_flow_weights_offline(a, p)
     amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
     cfg = dict(MODEL=dict(ADVANCED_FLAGS['MODEL'], TEXT_ENCODER_MODEL=a.text_model),
                TRAIN=dict(ADVANCED_FLAGS['TRAIN'], AMP_DTYPE=amp))
@@ -1515,6 +1530,8 @@ def recover_unresumable_run(p):
 
 def stage_train(a, p):
     check_run_inputs(p, a.run_name)
+    if getattr(a, 'variant', 'baseline') == 'advanced':
+        require_flow_weights_offline(a, p)
     amp = a.amp_dtype
     if amp == 'auto':
         amp = 'bf16' if native_bf16() else 'fp16'
@@ -2014,7 +2031,7 @@ def main(argv=None):
             rc = _drive(sub, sp, stages, redo if i == 0 else [s for s in redo if s in RUN_SCOPED])
             if rc != 0:
                 break
-        if rc == 0 and len(plans) > 1:
+        if rc == 0 and len(plans) > 1 and all(model_finished(sp) for _, sp in plans):   # not after partial runs
             try:
                 write_comparison(a, plans)
             except Exception as e:                              # noqa: BLE001

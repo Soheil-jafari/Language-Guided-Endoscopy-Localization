@@ -193,3 +193,28 @@ def test_each_summary_records_what_that_model_was_trained_with(tmp_path, monkeyp
     assert 'Model: **advanced** (Mamba temporal head' in text and 'batch 4 x 48 accumulation' in text
     summary = json.loads((p.results / 'summary.json').read_text())
     assert summary['trained_with']['TRAIN']['BATCH_SIZE'] == 4 and summary['latest_command_args']['batch_size'] == '8'
+
+
+def test_offline_jobs_refuse_missing_optical_flow_weights_without_touching_the_network(tmp_path, monkeypatch):
+    p = pipeline.Paths(tmp_path, 'full_advanced_seed42')
+    a = argparse.Namespace(offline=True, amp_dtype='bf16', text_model='t', variant='advanced')
+    launched = []
+    monkeypatch.setattr(pipeline, 'run', lambda *x, **k: launched.append(x))
+    monkeypatch.setattr(pipeline, '_ADVANCED_CHECKED', False)
+    with pytest.raises(pipeline.StageError, match='--offline'):
+        pipeline.stage_check_advanced(a, p)
+    assert not launched                                          # nothing was started that could download
+    f = pipeline.flow_weights_file(p)
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b'cached')
+    pipeline.stage_check_advanced(a, p)                          # cached: the check runs
+    assert len(launched) == 1
+
+
+def test_no_comparison_is_written_until_both_models_have_results(tmp_path, monkeypatch):
+    written = []
+    monkeypatch.setattr(pipeline, '_drive', lambda a, p, s, r: 0)
+    monkeypatch.setattr(pipeline, 'write_report_bundle', lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, 'write_comparison', lambda *a, **k: written.append(1))
+    assert pipeline.main(['--root', str(tmp_path), '--single-job', '--preset', 'full', '--to-stage', 'fetch_data']) == 0
+    assert not written
