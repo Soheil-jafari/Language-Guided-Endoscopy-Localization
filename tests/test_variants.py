@@ -218,3 +218,34 @@ def test_no_comparison_is_written_until_both_models_have_results(tmp_path, monke
     monkeypatch.setattr(pipeline, 'write_comparison', lambda *a, **k: written.append(1))
     assert pipeline.main(['--root', str(tmp_path), '--single-job', '--preset', 'full', '--to-stage', 'fetch_data']) == 0
     assert not written
+
+
+def test_hugging_face_switches_from_the_machine_are_not_inherited(tmp_path, monkeypatch):
+    # RunPod's image sets HF_HUB_ENABLE_HF_TRANSFER=1 without installing hf_transfer: every model download failed.
+    monkeypatch.setenv('HF_HUB_ENABLE_HF_TRANSFER', '1')
+    monkeypatch.setenv('HF_HUB_OFFLINE', '1')
+    monkeypatch.setenv('TRANSFORMERS_OFFLINE', '1')
+    p = pipeline.Paths(tmp_path, 'r')
+    env = pipeline.stage_env(argparse.Namespace(offline=False), p)
+    assert not {'HF_HUB_ENABLE_HF_TRANSFER', 'HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE'} & set(env)
+    assert env['HF_HOME'] == str(p.hf)
+    env = pipeline.stage_env(argparse.Namespace(offline=True), p)       # offline is the pipeline's own decision
+    assert env['HF_HUB_OFFLINE'] == '1' and env['TRANSFORMERS_OFFLINE'] == '1'
+    assert 'HF_HUB_ENABLE_HF_TRANSFER' not in env
+
+
+def test_pilot_time_estimate_includes_the_measured_prediction_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, 'export_model_weights', lambda p: None)
+    p = pipeline.Paths(tmp_path, 'pilot_seed42')
+    p.run.mkdir(parents=True)
+    (p.run / 'training_metrics.jsonl').write_text(json.dumps(dict(epoch=1, train_loss=1.0, val_frame_nll=0.5,
+                                                                   train_seconds=30.0, val_seconds=48.0)) + '\n')
+    a = argparse.Namespace(run_name='pilot_seed42', preset='pilot', variant='baseline', subset_ratio=0.1)
+    pipeline.stage_summary(a, p)
+    assert 'Prediction (all validation' not in (p.results / 'SUMMARY.md').read_text()   # not measured yet
+    p.state.mkdir(parents=True, exist_ok=True)
+    p.marker('predict').write_text(json.dumps(dict(seconds=306)))
+    pipeline.stage_summary(a, p)
+    text = (p.results / 'SUMMARY.md').read_text()
+    assert 'Prediction (all validation and test videos) took **5 min**' in text, text
+    assert json.loads((p.results / 'summary.json').read_text())['prediction_minutes_per_model'] == 5.1

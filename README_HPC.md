@@ -357,7 +357,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 176 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 178 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.
@@ -417,15 +417,21 @@ deliberately **tiny** model on CPU:
 * **Environment scripts:** with a real conda (Miniforge, conda 26.7), `run.sh` activates and checks
   exactly the environment folder the job specifies (never another environment with the same name),
   and `setup_env.sh` creates it there up to the PyTorch download.
+* **On a real GPU** (RunPod, NVIDIA RTX 4090 24 GB, October 2026), with the real-size models, 3 real
+  Cholec80 videos taken from the official archive and a randomly initialised backbone:
+  * `setup_env.sh` built the environment from scratch in 2 minutes, with Mamba 2.2.4 from the
+    ready-made build (no compiling); all tests passed there;
+  * `smoke`, a baseline `pilot` (batch 8, bf16, 19 GB of GPU memory) stopped with SIGTERM after
+    epoch 1 and resumed at epoch 2, and an advanced `pilot` (official Mamba layers, bi-level loss,
+    uncertainty, confidence fusion; 19 GB) all finished with `ALL DONE`;
+  * the archive behind the real data link: 80 complete videos (video, phase and tool file each),
+    standard compression only (no Deflate64), recognised correctly by the pipeline.
 
 **Not verified** (could not be tested where this was written):
 
-* The real-size model, real GPU training, mixed precision and memory use on actual hardware,
-  including the Mamba kernels running on a GPU (the smoke test's `check_advanced` step does this).
-* Creating the environment from scratch (conda-forge + PyTorch CUDA 12.4 wheels): the build
-  machine could not reach those servers.
-* The real cluster itself (Slurm, modules, conda, GPU): the smoke job checks it in about 30 minutes.
-* The real dataset archive, the real M2CRL checkpoint file, and the final download links.
+* The real cluster itself (Slurm, modules, conda, the A100 node): the smoke job checks it in about 30 minutes.
+* The real M2CRL checkpoint file.
+* The full 75 GB download, its integrity check and extraction, and all 80 videos.
 * Training time and the quality of the final results. Run the `pilot` preset first.
 
 Known data issue handled automatically: in the official Cholec80 release, the phase files of

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """One-command pipeline: raw Cholec80 download -> frames -> labels -> splits -> train -> evaluate.
 
-    python main.py --preset full --root /scratch/me/lgel \
-        --data-url "$LGEL_DATA_URL" --weights-url "$LGEL_WEIGHTS_URL"
+    bash hpc/submit.sh full --repeat 2                       # on the Slurm cluster: README_HPC.md, section 0
+    python main.py --preset full --root /scratch/me/lgel     # elsewhere; the private download links are read
+                                                             # from LGEL_DATA_URL / LGEL_WEIGHTS_URL in the
+                                                             # environment, never typed on a command line
 
 Every stage is idempotent: it writes a marker in <root>/state when it finishes and is
 skipped on the next invocation, so a job killed by a wall-clock limit is resumed simply
@@ -239,6 +241,11 @@ class Paths:
 
 def stage_env(a, p):
     env = os.environ.copy()
+    # Not inherited from the machine: some images switch on the optional 'hf_transfer' downloader without
+    # installing it (RunPod's does, and every model download then fails), and an inherited offline switch
+    # would stop the first download. Offline mode is decided below (--offline, or models already fetched).
+    for k in ('HF_HUB_ENABLE_HF_TRANSFER', 'HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE'):
+        env.pop(k, None)
     env.update(HF_HOME=str(p.hf), TORCH_HOME=str(p.root / 'torch_cache'), PYTHONUNBUFFERED='1',
                TOKENIZERS_PARALLELISM='false',
                PYTHONPATH=str(REPO) + os.pathsep + env.get('PYTHONPATH', ''))
@@ -1686,13 +1693,23 @@ def stage_summary(a, p):
             epoch_s = tr * full['subset_ratio'] / a.subset_ratio + va
             summary['full_run_estimate_hours'] = round(full['epochs'] * epoch_s / 3600, 1)
             summary['full_run_estimate_note'] = 'baseline model only; the full preset also trains the advanced model'
+            predict_s = None
+            try:
+                predict_s = json.loads(p.marker('predict').read_text()).get('seconds')
+            except (OSError, ValueError):
+                pass
+            predicted = ''
+            if isinstance(predict_s, (int, float)):
+                summary['prediction_minutes_per_model'] = round(predict_s / 60, 1)
+                predicted = (f' Prediction (all validation and test videos) took **{_duration(predict_s)}** here; the '
+                             f'full run predicts the same videos, so add about that much per model.')
             lines += ['## Time estimate for the `full` preset', '',
                       f'Pilot epoch (median): {tr / 60:.1f} min training on {a.subset_ratio:.0%} of the training windows + '
                       f'{va / 60:.1f} min validation. Scaling the training part to all windows gives about '
                       f'**{_duration(epoch_s)} per full epoch** and **{_duration(full["epochs"] * epoch_s)} for '
-                      f'{full["epochs"]} epochs**, plus prediction. Rough: it assumes the same GPU and file system, and '
-                      f'that training time grows linearly with the number of training windows. Each job must fit at '
-                      f'least one whole epoch, because training resumes from the last finished epoch.', '']
+                      f'{full["epochs"]} epochs**, plus prediction.{predicted} Rough: it assumes the same GPU and file '
+                      f'system, and that training time grows linearly with the number of training windows. Each job '
+                      f'must fit at least one whole epoch, because training resumes from the last finished epoch.', '']
             if a.variant == 'baseline':
                 lines += ['This is for the **baseline** model. The `full` preset then trains the **advanced** model for '
                       'the same number of epochs; it also computes optical flow at every step, so plan for **at least '
