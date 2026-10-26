@@ -119,9 +119,11 @@ works for the baseline model, and `run.sh` retries the download at the start of 
   `PIP_CACHE_DIR` in `site_env.sh` to a persistent location that compute nodes can read.
 * `setup_env.sh` marks the environment as complete only at the very end. If it is interrupted,
   just run it again; `run.sh` refuses to use a half-installed environment.
-* The environment is self-contained: Python packages the user installed personally (in `~/.local`)
-  are neither used nor changed by it, by `setup_env.sh` or by the jobs (`PYTHONNOUSERSITE=1`). If the
-  environment can no longer import its packages, the next job installs the missing ones again.
+* The environment is self-contained. With conda (and always in the cluster job), Python packages the
+  user installed personally (in `~/.local`) are neither used nor changed: Python's user site is switched
+  off (`PYTHONNOUSERSITE=1`), an inherited `PYTHONPATH` is cleared, and the installers ignore pip settings
+  that would install elsewhere (`PIP_USER`, `PIP_TARGET`, `PIP_PREFIX`, `PIP_ROOT`, `user = true`). If the
+  environment can no longer import its packages, or Mamba, the next job installs them again.
 
 ## 3. Run
 
@@ -360,7 +362,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 185 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with 191 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.

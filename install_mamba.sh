@@ -7,6 +7,8 @@
 # Exit code 0 when Mamba imports afterwards, 1 otherwise (it never stops the caller by itself).
 set -uo pipefail
 export PYTHONNOUSERSITE=1          # never read or change the user's own packages in ~/.local (see setup_env.sh)
+unset PYTHONPATH PYTHONHOME PIP_TARGET PIP_PREFIX PIP_ROOT
+export PIP_USER=0                  # install into this environment only, whatever pip's own configuration says
 PY="${1:?usage: bash install_mamba.sh /path/to/python}"
 CONDA_PREFIX="$("$PY" -c 'import sys; print(sys.prefix)')"
 

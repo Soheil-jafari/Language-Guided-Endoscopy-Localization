@@ -248,7 +248,7 @@ def stage_env(a, p):
         env.pop(k, None)
     env.update(HF_HOME=str(p.hf), TORCH_HOME=str(p.root / 'torch_cache'), PYTHONUNBUFFERED='1',
                TOKENIZERS_PARALLELISM='false',
-               PYTHONPATH=str(REPO) + os.pathsep + env.get('PYTHONPATH', ''))
+               PYTHONPATH=os.pathsep.join(x for x in (str(REPO), env.get('PYTHONPATH', '')) if x))
     if a.offline or p.marker('fetch_models').exists():
         env.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')   # cache was populated already
     return env

@@ -32,6 +32,7 @@ if [ "${LGEL_SKIP_ENV:-0}" != "1" ]; then
   ENV_PREFIX="${LGEL_ENV_PREFIX:-}"            # an exact location (set by the cluster job), else by name
   if command -v conda >/dev/null 2>&1; then
     export PYTHONNOUSERSITE=1                  # only the environment's own packages, never ~/.local (see setup_env.sh)
+    unset PYTHONPATH PYTHONHOME                # (nor a profile's PYTHONPATH, which could point there too)
     set +u                                     # conda's shell scripts are not all 'set -u' safe
     # shellcheck disable=SC1091
     source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -63,9 +64,11 @@ if [ "${LGEL_SKIP_ENV:-0}" != "1" ]; then
       conda deactivate
       needs_setup "conda env '$TARGET' can no longer import all of its packages"
       conda activate "$TARGET"
-    elif [ "$OFFLINE" != "1" ] && [ -e "$CONDA_PREFIX/.lgel_mamba_missing" ]; then
-      # An earlier Mamba installation failed (e.g. a network hiccup): retry only that download. Never fatal:
-      # the baseline model does not need Mamba, and the advanced model's check reports it if still missing.
+    elif [ "$OFFLINE" != "1" ] && { [ -e "$CONDA_PREFIX/.lgel_mamba_missing" ] || \
+         ! "$CONDA_PREFIX/bin/python" -c 'import mamba_ssm, selective_scan_cuda' >/dev/null 2>&1; }; then
+      # An earlier Mamba installation failed (e.g. a network hiccup), or Mamba no longer imports: retry only
+      # that installation. Never fatal: the baseline model does not need Mamba, and the advanced model's
+      # check reports it if still missing.
       echo "the Mamba package is missing from conda env '$TARGET' - retrying its installation"
       LGEL_MAMBA_NO_COMPILE=1 bash "$REPO/install_mamba.sh" "$CONDA_PREFIX/bin/python" \
         || echo "WARNING: Mamba is still missing; the baseline model can run, the advanced model cannot"

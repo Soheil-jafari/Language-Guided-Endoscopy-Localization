@@ -14,6 +14,10 @@ set -euo pipefail
 export PYTHONNOUSERSITE=1
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$REPO/site_env.sh" ]; then source "$REPO/site_env.sh"; fi
+# ... and no inherited setting that points Python or pip somewhere else (a profile's PYTHONPATH, a pip
+# configuration with "user = true", PIP_TARGET ...): everything is installed into this environment only.
+unset PYTHONPATH PYTHONHOME PIP_TARGET PIP_PREFIX PIP_ROOT
+export PIP_USER=0
 
 ENV_NAME="${LGEL_ENV:-lgel}"
 ENV_PREFIX="${LGEL_ENV_PREFIX:-}"
@@ -64,6 +68,10 @@ fi
 set -u
 PY="$CONDA_PREFIX/bin/python"                    # never fall back to a system python
 rm -f "$CONDA_PREFIX/.lgel_env_ready"
+if ! "$PY" -m pip --version >/dev/null 2>&1; then  # e.g. removed by an interrupted pip upgrade
+  echo "pip is missing from $TARGET - reinstalling it"
+  "$PY" -m ensurepip --upgrade
+fi
 
 "$PY" -m pip install --upgrade pip
 "$PY" -m pip install "torch==2.5.1" "torchvision==0.20.1" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}"

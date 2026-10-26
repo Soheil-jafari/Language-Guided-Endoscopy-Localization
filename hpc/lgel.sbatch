@@ -52,8 +52,10 @@ set -u                                         # (module scripts are not always 
 export LGEL_ENV_PREFIX="$LGEL_BASE/conda/envs/lgel"
 export CONDA_ENVS_PATH="$LGEL_BASE/conda/envs" CONDA_PKGS_DIRS="$LGEL_BASE/conda/pkgs"
 export PIP_CACHE_DIR="$LGEL_BASE/conda/pip-cache" TMPDIR="$LGEL_BASE/tmp"
-# Only the environment's own Python packages: never read or change the personal ones in ~/.local.
+# Only the environment's own Python packages: never read or change the personal ones in ~/.local, and no
+# PYTHONPATH from the login profile or a module (it could point there too).
 export PYTHONNOUSERSITE=1
+unset PYTHONPATH PYTHONHOME
 mkdir -p "$CONDA_ENVS_PATH" "$CONDA_PKGS_DIRS" "$PIP_CACHE_DIR" "$TMPDIR"
 
 # The two private download links (never stored in the repository, never printed).
