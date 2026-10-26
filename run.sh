@@ -31,6 +31,7 @@ if [ "${LGEL_SKIP_ENV:-0}" != "1" ]; then
   ENV_NAME="${LGEL_ENV:-lgel}"
   ENV_PREFIX="${LGEL_ENV_PREFIX:-}"            # an exact location (set by the cluster job), else by name
   if command -v conda >/dev/null 2>&1; then
+    export PYTHONNOUSERSITE=1                  # only the environment's own packages, never ~/.local (see setup_env.sh)
     set +u                                     # conda's shell scripts are not all 'set -u' safe
     # shellcheck disable=SC1091
     source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -56,6 +57,11 @@ if [ "${LGEL_SKIP_ENV:-0}" != "1" ]; then
        [ "$(cat "$CONDA_PREFIX/.lgel_env_ready" 2>/dev/null || true)" != "$WANT" ]; then
       conda deactivate                         # let setup_env.sh start from a clean shell
       needs_setup "conda env '$TARGET' is incomplete or out of date"
+      conda activate "$TARGET"
+    elif ! "$CONDA_PREFIX/bin/python" -c 'import torch, torchvision, transformers, cv2, pandas, sklearn, einops, PIL, numpy, scipy' >/dev/null 2>&1; then
+      # Something changed the environment after it was set up: install what is missing again.
+      conda deactivate
+      needs_setup "conda env '$TARGET' can no longer import all of its packages"
       conda activate "$TARGET"
     elif [ "$OFFLINE" != "1" ] && [ -e "$CONDA_PREFIX/.lgel_mamba_missing" ]; then
       # An earlier Mamba installation failed (e.g. a network hiccup): retry only that download. Never fatal:

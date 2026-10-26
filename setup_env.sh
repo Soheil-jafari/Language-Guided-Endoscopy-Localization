@@ -8,6 +8,10 @@
 # Needs conda/mamba on PATH (on many clusters: `module load anaconda` or similar first; put
 # such lines in site_env.sh, which this script and run.sh both source if it exists).
 set -euo pipefail
+# Only this environment's own packages. Without this, Python also sees the user's personal packages in
+# ~/.local: pip then counts those as already installed (the environment breaks when they change later)
+# and, when upgrading, uninstalls them from ~/.local (which breaks the user's own work).
+export PYTHONNOUSERSITE=1
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$REPO/site_env.sh" ]; then source "$REPO/site_env.sh"; fi
 
@@ -71,7 +75,12 @@ rm -f "$CONDA_PREFIX/.lgel_env_ready"
 bash "$REPO/install_mamba.sh" "$PY" || true
 
 "$PY" - <<'EOF'
-import torch, torchvision, transformers, cv2, pandas, sklearn, einops, PIL
+import os, sys
+import torch, torchvision, transformers, cv2, pandas, sklearn, einops, PIL, numpy, scipy
+outside = [m.__name__ for m in (torch, torchvision, transformers, cv2, pandas, sklearn, einops, PIL, numpy, scipy)
+           if not os.path.realpath(m.__file__).startswith(os.path.realpath(sys.prefix) + os.sep)]
+if outside:
+    print("WARNING: these packages are loaded from outside the environment (PYTHONPATH?):", outside)
 try:
     import mamba_ssm, selective_scan_cuda
     mamba = mamba_ssm.__version__

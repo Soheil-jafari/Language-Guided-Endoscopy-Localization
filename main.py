@@ -709,7 +709,7 @@ def record_environment(p):
     keys = ('SLURM_JOB_ID', 'SLURM_JOB_NAME', 'SLURM_JOB_PARTITION', 'SLURM_JOB_NODELIST', 'SLURM_CPUS_PER_TASK',
             'SLURM_MEM_PER_NODE', 'SLURM_GPUS', 'SLURM_GPUS_ON_NODE', 'SLURM_JOB_GPUS', 'SLURM_RESTART_COUNT',
             'CUDA_VISIBLE_DEVICES', 'CONDA_PREFIX', 'CONDA_ENVS_PATH', 'CONDA_PKGS_DIRS', 'LGEL_BASE', 'LGEL_ROOT',
-            'LGEL_PRESET', 'LGEL_ENV_PREFIX', 'LGEL_SINGLE_JOB')
+            'LGEL_PRESET', 'LGEL_ENV_PREFIX', 'LGEL_SINGLE_JOB', 'PYTHONNOUSERSITE', 'PYTHONUSERBASE', 'PYTHONPATH')
     parts.append('===== environment variables\n' + '\n'.join(f'{k}={os.environ[k]}' for k in keys if k in os.environ))
     (p.logs / 'environment.txt').write_text(redact('\n'.join(parts)) + '\n')
 
