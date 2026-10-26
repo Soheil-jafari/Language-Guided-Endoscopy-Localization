@@ -56,19 +56,58 @@ def _wheel(directory):
 
 
 def test_pip_user_0_overrides_a_pip_configuration_that_asks_for_user_installs(tmp_path):
-    """The mechanism the installers rely on: PIP_USER=0 wins over `user = true` in a pip configuration file."""
+    """The mechanism the installers rely on: PIP_USER=0 wins over `user = true` in a pip configuration file.
+    Checked inside a fresh virtualenv, where a user install is an error, so the two outcomes differ."""
+    venv = tmp_path / 'venv'
+    made = subprocess.run([sys.executable, '-m', 'venv', str(venv)], capture_output=True, text=True)
+    py = venv / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if made.returncode != 0 or not py.exists():
+        pytest.skip(f'cannot create a virtualenv here: {made.stderr[-200:]}')
     _wheel(tmp_path)
     (tmp_path / 'pip.conf').write_text('[install]\nuser = true\n')
     env = {k: v for k, v in os.environ.items() if not k.startswith('PIP_')}
     env.update(PIP_CONFIG_FILE=str(tmp_path / 'pip.conf'), PIP_DISABLE_PIP_VERSION_CHECK='1')
-    cmd = [sys.executable, '-m', 'pip', 'install', '--dry-run', '--no-index', '--find-links', str(tmp_path), 'lgeldummy']
+    cmd = [str(py), '-m', 'pip', 'install', '--dry-run', '--no-index', '--find-links', str(tmp_path), 'lgeldummy']
     asked = subprocess.run(cmd, env=env, capture_output=True, text=True)
     overridden = subprocess.run(cmd, env=dict(env, PIP_USER='0'), capture_output=True, text=True)
-    if sys.prefix == getattr(sys, 'base_prefix', sys.prefix):   # not a virtualenv: a user install would be allowed
-        assert 'Would install' in overridden.stdout
-        return
+    forced = subprocess.run(cmd, env=dict(env, PIP_USER='1'), capture_output=True, text=True)
     assert asked.returncode != 0 and '--user' in asked.stderr                  # the configuration asks for --user
+    assert forced.returncode != 0 and '--user' in forced.stderr
     assert overridden.returncode == 0 and 'Would install lgeldummy-1.0' in overridden.stdout
+
+
+@posix_only
+@pytest.mark.parametrize('location', [None, 'target', 'prefix', 'root'])
+def test_installers_refuse_a_pip_configuration_that_sets_an_install_location(tmp_path, location):
+    """`target`, `prefix` or `root` in a pip configuration file cannot be switched off by environment
+    variables: install_mamba.sh (and setup_env.sh, same lines) stop instead of installing elsewhere."""
+    calls = tmp_path / 'calls'
+    # the real interpreter, except: its prefix is tmp_path, Mamba works unless MAMBA_BROKEN exists, and
+    # pip installs are only recorded (so nothing is ever downloaded or installed)
+    py = tmp_path / 'python'
+    py.write_text(f'''#!/bin/bash
+if [ "$1" = -c ] && [[ "$2" == *"sys.prefix"* ]]; then echo "{tmp_path}"; exit 0; fi
+if [ "$1" = -c ] && [[ "$2" == *"import mamba_ssm"* ]]; then [ -e "{tmp_path}/MAMBA_BROKEN" ] && exit 1; exit 0; fi
+if [ "$1" = -m ] && [ "$2" = pip ] && [ "$3" = install ]; then echo "PIP INSTALL" >> "{calls}"; exit 0; fi
+exec "{sys.executable}" "$@"
+''')
+    py.chmod(0o755)
+    if location:
+        (tmp_path / 'MAMBA_BROKEN').write_text('')            # Mamba missing: an installation would follow
+    conf = tmp_path / 'pip.conf'
+    conf.write_text('[global]\ntimeout = 60\n' + (f'[install]\n{location} = /somewhere/else\n' if location else ''))
+    env = {k: v for k, v in os.environ.items() if not k.startswith('PIP_')}
+    env.update(PIP_CONFIG_FILE=str(conf))
+    out = subprocess.run(['bash', str(REPO / 'install_mamba.sh'), str(py)], env=env, capture_output=True, text=True,
+                         timeout=120)
+    if location:
+        assert out.returncode == 1 and f'install.{location}' in out.stderr and 'install location' in out.stderr
+        assert not calls.exists() and (tmp_path / '.lgel_mamba_missing').exists()
+    else:                                                     # an ordinary configuration: no complaint, and
+        assert out.returncode == 0 and 'install location' not in out.stderr and not calls.exists()   # Mamba works
+    guard = 'pip config list'
+    code = _code('setup_env.sh')
+    assert code.index(guard) < code.index('pip install') and _code('install_mamba.sh').count(guard) == 1
 
 
 def test_stage_subprocesses_get_the_repository_on_their_path_and_no_empty_entry(tmp_path, monkeypatch):

@@ -11,6 +11,16 @@ unset PYTHONPATH PYTHONHOME PIP_TARGET PIP_PREFIX PIP_ROOT
 export PIP_USER=0                  # install into this environment only, whatever pip's own configuration says
 PY="${1:?usage: bash install_mamba.sh /path/to/python}"
 CONDA_PREFIX="$("$PY" -c 'import sys; print(sys.prefix)')"
+# A pip configuration file can also set an install location (target / prefix / root); that cannot be
+# switched off from here, so such a setting is refused rather than installing outside this environment.
+PIP_LOCATIONS="$("$PY" -m pip config list 2>/dev/null | grep -E '^[^=]*[.](target|prefix|root)=' || true)"
+if [ -n "$PIP_LOCATIONS" ]; then
+  echo "ERROR: a pip configuration file sets an install location, so pip would install outside this environment:" >&2
+  echo "$PIP_LOCATIONS" >&2
+  echo "       Remove these settings (\"$PY -m pip config debug\" shows the files), then run again." >&2
+  touch "$CONDA_PREFIX/.lgel_mamba_missing"
+  exit 1
+fi
 
 # Mamba (the advanced model's temporal head). The ready-made mamba-ssm build for this torch / CUDA /
 # Python is downloaded from its GitHub releases (with time limits and retries) and installed: no
