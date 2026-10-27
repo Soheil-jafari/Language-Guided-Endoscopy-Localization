@@ -1,0 +1,666 @@
+"""The paper protocol: run plan, unseen wordings, comparison-method plumbing, the analysis' metrics and the
+job driver's failure isolation. Everything runs offline on synthetic data and tiny models."""
+import argparse
+import json
+import math
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+
+import main as pipeline
+import paper_protocol as protocol
+import paper_analysis as pa
+from data_contract import PHRASES
+from paper_fixtures import make_prepared, tiny_xclip
+
+REPO = Path(pipeline.__file__).resolve().parent
+
+
+# --------------------------------------------------------------------------- protocol
+def test_the_protocol_lists_every_run_once_in_priority_order():
+    plans = protocol.plans('paper')
+    names = [p['name'] for p in plans]
+    assert len(names) == len(set(names)) == 15
+    assert names[:2] == ['paper_baseline_s42', 'paper_advanced_s42']           # the main comparison first
+    assert names[-4:] == ['paper_baseline_s43', 'paper_advanced_s43', 'paper_baseline_s44', 'paper_advanced_s44']
+    assert {p['kind'] for p in plans} - {'proposed'} == set(pipeline.COMPARISON_METHODS) == set(protocol.COMPARISONS)
+    assert protocol.ADVANCED == pipeline.ADVANCED_FLAGS                          # one definition of "advanced"
+    ablations = [p for p in plans if p['group'] == 'ablation']
+    assert len(ablations) == 4 and not any(p['paraphrases'] for p in ablations)
+    for p, (label, flags) in zip(ablations, protocol.ADDONS.values()):
+        assert p['flags'] == flags and protocol.describe_flags(p['flags']) == f'baseline + {label}'
+    assert protocol.describe_flags({}) == 'baseline (Transformer temporal head)'
+    assert protocol.describe_flags(protocol.ADVANCED).startswith('advanced (')
+    seeds = sorted((p['seed'], protocol.describe_flags(p['flags'])[:8]) for p in plans
+                   if p['kind'] == 'proposed' and p['group'] in ('main', 'seed'))
+    assert [s for s, _ in seeds] == [42, 42, 43, 43, 44, 44]
+    assert all(p['seed'] == protocol.MAIN_SEED for p in plans if p['kind'] != 'proposed')
+    assert [p['name'] for p in protocol.plans('x')][0] == 'x_baseline_s42'
+
+
+def test_standard_split_file_is_40_8_32_and_disjoint():
+    split = json.loads(protocol.SPLIT_FILE.read_text())
+    assert [len(split[k]) for k in ('train', 'val', 'test')] == [40, 8, 32]
+    assert split['train'][0] == 'CHOLEC80__video01' and split['val'][0] == 'CHOLEC80__video41'
+    assert split['test'] == [f'CHOLEC80__video{i:02d}' for i in range(49, 81)]
+    allv = [v for vs in split.values() for v in vs]
+    assert len(set(allv)) == 80
+
+
+def test_paraphrases_cover_every_concept_and_never_reuse_training_wordings(tmp_path):
+    sets = protocol.load_paraphrases()
+    assert set(sets) == {'A', 'B'} and all(len(m) == 14 for m in sets.values())
+    assert protocol.canonical_queries() == PHRASES and len(protocol.phase_queries()) == 7
+    for words, prompt in zip(('preparation', 'calot', 'clip', 'dissection', 'packaging', 'coagulation', 'retraction'),
+                             protocol.PESKAVLP_PHASE_PROMPTS):
+        assert words in prompt.lower()
+    data = json.loads(protocol.PARAPHRASE_FILE.read_text())
+    bad = json.loads(json.dumps(data))
+    bad['sets']['A']['queries'][0]['text'] = PHRASES[0]                          # a training sentence
+    (tmp_path / 'bad.json').write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match='training sentence'):
+        protocol.load_paraphrases(tmp_path / 'bad.json')
+    bad = json.loads(json.dumps(data))
+    first = bad['sets']['A']['queries'][0]
+    assert first['concept'] == 'phase'
+    first['text'] = 'grasper'                                   # a known word of another concept (a tool)
+    (tmp_path / 'bad.json').write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match='contradicts'):
+        protocol.load_paraphrases(tmp_path / 'bad.json')
+
+
+def _args(argv):
+    a = pipeline.build_parser().parse_args(argv)
+    return pipeline.resolve_settings(a)
+
+
+def test_paper_preset_settings_and_runs(tmp_path):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path)])
+    assert a.splits_json == str(protocol.SPLIT_FILE) and a.paraphrases and a.epochs == 10
+    subs = pipeline.experiment_plans(a)
+    assert [s.run_name for s in subs] == [p['name'] for p in protocol.plans('paper')]
+    by = {s.run_name: s for s in subs}
+    assert by['paper_advanced_s42'].flags == pipeline.ADVANCED_FLAGS and by['paper_advanced_s42'].variant == 'advanced'
+    assert by['paper_baseline_s43'].seed == 43 and by['paper_baseline_s43'].flags == {}
+    assert by['paper_ablation_mamba_s42'].variant == 'ablation' and not by['paper_ablation_mamba_s42'].paraphrase_eval
+    assert by['paper_univtg_s42'].kind == 'univtg' and by['paper_univtg_s42'].paraphrase_eval
+    cfg = pipeline.train_config(by['paper_ablation_bilevel_s42'], pipeline.Paths(tmp_path, 'x'), 4, 'bf16')
+    assert cfg['TRAIN']['USE_BILEVEL_CONSISTENCY'] is True and 'TEMPORAL_HEAD_TYPE' not in cfg['MODEL']
+    assert cfg['TRAIN']['SEED'] == 42 and cfg['TRAIN']['NUM_EPOCHS'] == 10
+    assert pipeline.uses_flow(by['paper_advanced_s42']) and not pipeline.uses_flow(by['paper_baseline_s42'])
+    # the data stages are the same for every run (and include the unseen-wording manifests)
+    sigs = {json.dumps(pipeline.stage_signature('triplets', s), sort_keys=True) for s in subs}
+    assert len(sigs) == 1 and 'paraphrases' in sigs.pop()
+    with pytest.raises(SystemExit, match='variant'):
+        _args(['--preset', 'paper', '--root', str(tmp_path), '--variant', 'baseline'])
+    # other presets are unchanged
+    full = pipeline.experiment_plans(_args(['--preset', 'full', '--root', str(tmp_path)]))
+    assert [(s.variant, s.run_name, s.kind) for s in full] == [('baseline', 'full_baseline_seed42', 'proposed'),
+                                                              ('advanced', 'full_advanced_seed42', 'proposed')]
+    assert full[1].flags == pipeline.ADVANCED_FLAGS and full[0].flags == {}
+
+
+def test_paper_dry_run_lists_the_protocol(tmp_path, capsys):
+    assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path / 'r'), '--dry-run']) == 0
+    out = capsys.readouterr().out
+    assert 'paper protocol: 15 runs' in out and 'paper_peskavlp_finetune_s42' in out and 'unseen wordings' in out
+    assert not (tmp_path / 'r').exists()
+
+
+# --------------------------------------------------------------------------- the job driver
+def _fake_drive(fail):
+    calls = []
+
+    def drive(a, p, stages, redo):
+        calls.append(a.run_name)
+        a.failed_stage = fail.get(a.run_name)
+        return 1 if a.run_name in fail else 0
+    return drive, calls
+
+
+@pytest.mark.parametrize('stage,continues', [('train', True), ('predict', True), ('evaluate', True), ('summary', True),
+                                             ('duplicate', True), ('fetch_data', False), ('preflight', False),
+                                             ('check_advanced', False), ('locks', False), ('data', False)])
+def test_a_failed_run_stops_the_protocol_only_if_others_are_affected(tmp_path, monkeypatch, stage, continues):
+    drive, calls = _fake_drive({'paper_clip_zeroshot': stage})
+    monkeypatch.setattr(pipeline, '_drive', drive)
+    monkeypatch.setattr(pipeline, 'write_report_bundle', lambda *a, **k: None)
+    outputs = []
+    monkeypatch.setattr(pipeline, 'paper_outputs', lambda a, plans: outputs.append(len(plans)) or 0)
+    monkeypatch.setattr(pipeline, 'data_prepared', lambda p: True)
+    rc = pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job'])
+    assert rc == 1
+    names = [p['name'] for p in protocol.plans('paper')]
+    if continues:
+        assert calls == names and outputs == [15]
+    else:
+        assert calls == names[:names.index('paper_clip_zeroshot') + 1]
+
+
+def test_the_paper_analysis_runs_after_every_complete_job(tmp_path, monkeypatch):
+    drive, calls = _fake_drive({})
+    monkeypatch.setattr(pipeline, '_drive', drive)
+    monkeypatch.setattr(pipeline, 'write_report_bundle', lambda *a, **k: None)
+    launched = []
+    monkeypatch.setattr(pipeline, 'run', lambda cmd, a, p, name, **k: launched.append((name, [str(c) for c in cmd])))
+    monkeypatch.setattr(pipeline, 'data_prepared', lambda p: True)
+    assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job']) == 0
+    assert [n for n, _ in launched] == ['paper_analysis']            # no finished model yet: no explanation maps
+    cmd = launched[0][1]
+    assert cmd[1] == 'paper_analysis.py' and cmd[cmd.index('--prefix') + 1] == 'paper'
+    # an analysis failure is reported (exit code 1) but does not touch the runs
+    def failing(cmd, a, p, name, **k):
+        raise pipeline.StageError('boom')
+    monkeypatch.setattr(pipeline, 'run', failing)
+    assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job']) == 1
+    # a partial command (--to-stage) does not run it
+    monkeypatch.setattr(pipeline, 'run', lambda *x, **k: launched.append('again'))
+    assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--to-stage', 'audit']) == 0
+    assert 'again' not in launched
+
+
+def test_failed_stage_is_recorded_by_the_real_driver(tmp_path, monkeypatch):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu'])
+    sub = pipeline.experiment_plans(a)[0]
+    p = pipeline.Paths(tmp_path, sub.run_name)
+    for d in (p.state, p.logs):
+        d.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pipeline, 'stage_preflight', lambda *x: None)
+    monkeypatch.setattr(pipeline, 'stage_train', lambda a, p: (_ for _ in ()).throw(pipeline.StageError('no')))
+    for s in pipeline.STAGES[1:pipeline.STAGES.index('train')]:
+        if s not in pipeline.ALWAYS_RUN:
+            pipeline.write_json(p.marker(s), dict(signature=pipeline.stage_signature(s, sub)))
+    sub.check_advanced = False
+    assert pipeline._drive(sub, p, ['train'], []) == 1 and sub.failed_stage == 'train'
+    assert p.log_scope is None
+
+
+def test_run_stage_logs_go_to_a_folder_per_run(tmp_path):
+    a = argparse.Namespace(offline=True)
+    p = pipeline.Paths(tmp_path, 'r1')
+    p.log_scope = 'r1'
+    pipeline.run([sys.executable, '-c', 'print("hello")'], a, p, 'predict_test')
+    assert 'hello' in (p.logs / 'r1' / 'predict_test.log').read_text()
+
+
+# --------------------------------------------------------------------------- shared comparison plumbing
+def test_work_orders_and_score_matrices_round_trip_to_the_standard_prediction_files(tmp_path):
+    d = make_prepared(tmp_path, n_videos=4, seconds=12)
+    from comparison_models import frame_scores as fs
+    order = fs.write_work_order(d['triplets']('test'), d['metadata'], d['frames'], d['annotations'],
+                                tmp_path / 'o.json', 1.0, labels=tmp_path / 'l.npz',
+                                prompts={PHRASES[0]: 'In preparation phase I insert trocars'})
+    texts = [q['text'] for q in order['queries']]
+    assert len(texts) == 14 and order['queries'][texts.index(PHRASES[0])]['prompt'].startswith('In preparation')
+    z = np.load(tmp_path / 'l.npz')
+    video = d['split']['test'][0]
+    assert z['labels'].shape == (len(order['videos'][video]['frame_idx']), 14)
+    assert list(z['canonical']) == list(PHRASES)
+    # a scorer's matrix (frames x scored sentences) -> the standard CSV, exactly the manifest's pairs
+    sentences = [q['prompt'] for q in order['queries']]
+    frame_idx = [i for v in order['videos'].values() for i in v['frame_idx']]
+    offsets = np.cumsum([0] + [len(v['frame_idx']) for v in order['videos'].values()])
+    scores = np.random.default_rng(0).random((len(frame_idx), len(sentences)))
+    np.savez(tmp_path / 's.npz', video_ids=np.asarray(list(order['videos'])), offsets=offsets,
+             frame_idx=np.asarray(frame_idx), queries=np.asarray(sentences), scores=scores)
+    df = fs.assemble(tmp_path / 's.npz', d['triplets']('test'), d['metadata'], d['annotations'], tmp_path / 'p.csv',
+                     1.0, prompts={PHRASES[0]: 'In preparation phase I insert trocars'})
+    assert set(df.text_query) == set(PHRASES) and len(df) == 14 * len(frame_idx)
+    first = df[(df.text_query == PHRASES[0])].score.to_numpy()
+    np.testing.assert_allclose(first, scores[:, sentences.index('In preparation phase I insert trocars')])
+    ref = tmp_path / 'ref.csv'
+    subprocess.run([sys.executable, 'build_reference.py', '--triplets', d['triplets']('test'), '--metadata',
+                    d['metadata'], '--frames', d['frames'], '--annotations', d['annotations'], '--output', ref],
+                   cwd=REPO, check=True)
+    from evaluate import checked_frames
+    merged = checked_frames(tmp_path / 'p.csv', ref)                 # exactly the reference's frames
+    ours = df.set_index(['video_id', 'text_query', 'frame_idx']).label
+    theirs = merged.set_index(['video_id', 'text_query', 'frame_idx']).label
+    assert len(merged) == len(df) and (ours.sort_index() == theirs.sort_index()).all()
+    with pytest.raises(FileExistsError):
+        fs.assemble(tmp_path / 's.npz', d['triplets']('test'), d['metadata'], d['annotations'], tmp_path / 'p.csv')
+    bad = scores.copy(); bad[0, 0] = 1.5
+    np.savez(tmp_path / 'bad.npz', video_ids=np.asarray(list(order['videos'])), offsets=offsets,
+             frame_idx=np.asarray(frame_idx), queries=np.asarray(sentences), scores=bad)
+    with pytest.raises(ValueError, match='probabilities'):
+        fs.read_scores(tmp_path / 'bad.npz')
+
+
+def test_unseen_wording_manifests_keep_frames_and_labels(tmp_path):
+    d = make_prepared(tmp_path, n_videos=4, seconds=10)
+    written = protocol.write_paraphrase_triplets(d['triplets']('test'), tmp_path)
+    test = pd.read_csv(d['triplets']('test'))
+    for name, path in written.items():
+        para = pd.read_csv(path)
+        assert len(para) == len(test) and (para.frame_path == test.frame_path).all()
+        assert (para.relevance_label == test.relevance_label).all()
+        assert not set(para.text_query) & set(PHRASES)
+        from data_contract import validate_triplets
+        specs = validate_triplets(para)
+        assert specs == validate_triplets(test)                       # same concept on every row
+
+
+def test_peskavlp_archive_is_unpacked_safely(tmp_path):
+    good = tmp_path / 'g.zip'
+    with zipfile.ZipFile(good, 'w') as z:
+        z.writestr('PeskaVLP.pth', b'w')
+        z.writestr('__MACOSX/._PeskaVLP.pth', b'junk')
+    a = argparse.Namespace(offline=True)
+    p = pipeline.Paths(tmp_path / 'root', 'x')
+    target = p.root / 'comparisons' / 'peskavlp' / 'PeskaVLP.download'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(good.read_bytes())
+    pipeline.write_json(target.with_name(target.name + '.complete'), dict(size=target.stat().st_size))
+    found = pipeline.peskavlp_weights(a, p)                         # offline: the finished download is reused
+    assert found.name == 'PeskaVLP.pth' and found.read_bytes() == b'w'
+    evil = tmp_path / 'e.zip'
+    with zipfile.ZipFile(evil, 'w') as z:
+        z.writestr('../escape.pth', b'x')
+    with pytest.raises(pipeline.StageError, match='unsafe'):
+        pipeline.safe_extract(evil, tmp_path / 'out')
+
+
+def _record_runs(monkeypatch):
+    launched = []
+
+    def fake_run(cmd, a, p, name, **k):
+        launched.append((name, [str(c) for c in cmd]))
+    monkeypatch.setattr(pipeline, 'run', fake_run)
+    return launched
+
+
+def test_comparison_methods_are_dispatched_with_their_own_settings(tmp_path, monkeypatch):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job'])
+    subs = {s.kind: s for s in pipeline.experiment_plans(a) if s.kind != 'proposed'}
+    launched = _record_runs(monkeypatch)
+    monkeypatch.setattr(pipeline, 'check_run_inputs', lambda *x: None)
+    # X-CLIP: the repository's fine-tuning with the protocol's settings, resumed from latest.pt
+    sub = subs['xclip_finetune']
+    p = pipeline.Paths(tmp_path, sub.run_name)
+    (p.run / 'xclip').mkdir(parents=True)
+    (p.run / 'xclip' / 'latest.pt').write_bytes(b'x')
+    (p.run / 'xclip' / 'best.pt').write_bytes(b'x')
+    pipeline.stage_train(sub, p)
+    names = [n for n, _ in launched]
+    assert names == ['fetch_xclip', 'train']
+    cmd = launched[1][1]
+    assert cmd[1] == 'train_xclip.py' and cmd[cmd.index('--epochs') + 1] == '5' and '--resume-from' in cmd
+    assert pipeline.finished_marker(p.run / 'xclip').exists()
+    launched.clear()
+    pipeline.stage_train(sub, p)                                     # finished: only the model check-out
+    assert [n for n, _ in launched] == ['fetch_xclip']
+    # UniVTG: features (once per backbone), text features (incl. unseen wordings), training
+    sub = subs['univtg']
+    p = pipeline.Paths(tmp_path, sub.run_name)
+    p.weights_ref.parent.mkdir(parents=True, exist_ok=True)
+    pipeline.write_json(p.weights_ref, dict(path='', random_init=True))
+    sub.random_init = True
+    launched.clear()
+    pipeline.stage_train(sub, p)
+    assert [n for n, _ in launched] == ['univtg_features', 'univtg_text', 'train']
+    text_cmd = launched[1][1]
+    assert any('test_paraA' in c for c in text_cmd) and any('test_paraB' in c for c in text_cmd)
+    feat = launched[0][1]
+    assert feat[feat.index('--weights') + 1] == '' and feat[feat.index('--output') + 1].endswith('m2crl_random-init')
+    train = launched[2][1]
+    assert train[train.index('--epochs') + 1] == '200' and train[train.index('--clip-frames') + 1] == '4'
+    # predictions for every evaluation set, with the native windows kept
+    launched.clear()
+    p.results.mkdir(parents=True, exist_ok=True)
+    pipeline.univtg_predict(sub, p, pipeline.prediction_sets(sub, p))
+    assert [n for n, _ in launched] == ['predict_val', 'predict_test', 'predict_test_paraA', 'predict_test_paraB']
+    assert all('--segments' in c for _, c in launched)
+
+
+def test_peskavlp_zero_shot_also_scores_the_authors_phase_prompts(tmp_path, monkeypatch):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job'])
+    sub = [s for s in pipeline.experiment_plans(a) if s.kind == 'peskavlp_zeroshot'][0]
+    p = pipeline.Paths(tmp_path, sub.run_name)
+    launched = _record_runs(monkeypatch)
+    monkeypatch.setattr(pipeline, 'peskavlp_weights', lambda a, p: tmp_path / 'w.pth')
+    copied = []
+    monkeypatch.setattr(pipeline.shutil, 'copy2', lambda src, dst: copied.append(str(dst)))
+    p.results.mkdir(parents=True)
+    pipeline.peskavlp_predict(sub, p, pipeline.prediction_sets(sub, p))
+    scored = [n for n, _ in launched if n.startswith('peskavlp_')]
+    assert scored == ['peskavlp_val', 'peskavlp_test', 'peskavlp_test_paraA', 'peskavlp_test_paraB',
+                      'peskavlp_authorprompts_val', 'peskavlp_authorprompts_test']
+    prompts = json.loads((p.run / 'work' / 'authorprompts_test.prompts.json').read_text())
+    assert prompts == dict(zip(PHRASES[:7], protocol.PESKAVLP_PHASE_PROMPTS))
+    assemble = [c for n, c in launched if n == 'assemble_authorprompts_test'][0]
+    assert assemble[assemble.index('--output') + 1].endswith('authorprompts_test.csv')    # not a proposed_* file
+    assert any(c.endswith('authorprompts_test.csv.manifest.json') for c in copied)
+    launched.clear()
+    sub2 = [s for s in pipeline.experiment_plans(a) if s.kind == 'peskavlp_finetune'][0]
+    pipeline.COMPARISON_METHODS['peskavlp_finetune']['predict'](sub2, pipeline.Paths(tmp_path, sub2.run_name),
+                                                                  [('test', tmp_path / 't.csv')])
+    score = [c for n, c in launched if n == 'peskavlp_test'][0]
+    assert score[score.index('--checkpoint') + 1].endswith('peskavlp/best.pt')
+    assert not any(n.startswith('peskavlp_authorprompts') for n, _ in launched)
+
+
+def test_the_peskavlp_environment_never_sees_this_repository(tmp_path):
+    a = argparse.Namespace(offline=False)
+    p = pipeline.Paths(tmp_path, 'x')
+    env = pipeline.peskavlp_env(a, p, online=True)
+    assert 'PYTHONPATH' not in env and 'HF_HUB_OFFLINE' not in env and env['HF_HOME'] == str(p.hf)
+
+
+# --------------------------------------------------------------------------- X-CLIP scoring
+def test_xclip_scores_all_queries_of_a_window_at_once_exactly_like_one_at_a_time(tmp_path):
+    folder = tiny_xclip(tmp_path / 'xclip')
+    from transformers import XCLIPModel, XCLIPProcessor
+    model = XCLIPModel.from_pretrained(folder).eval()
+    proc = XCLIPProcessor.from_pretrained(folder)
+    clip = [np.random.default_rng(i).integers(0, 255, (16, 24, 3), dtype=np.uint8) for i in range(4)]
+    texts = list(PHRASES[:3])
+    with torch.no_grad():
+        together = model(**proc(videos=[clip], text=texts, padding=True, return_tensors='pt')).logits_per_video[0]
+        alone = [model(**proc(videos=[clip], text=[t], padding=True, return_tensors='pt')).logits_per_video[0, 0]
+                 for t in texts]
+    torch.testing.assert_close(together, torch.stack(alone), rtol=1e-4, atol=1e-5)
+    d = make_prepared(tmp_path / 'data', n_videos=4, seconds=10)
+    out = tmp_path / 'pred.csv'
+    subprocess.run([sys.executable, 'benchmark.py', '--model', 'xclip', '--model-name', folder, '--triplets',
+                    d['triplets']('test'), '--metadata', d['metadata'], '--frames', d['frames'], '--annotations',
+                    d['annotations'], '--output', out, '--device', 'cpu'], cwd=REPO, check=True, capture_output=True)
+    df = pd.read_csv(out)
+    assert set(df.text_query) == set(PHRASES) and df.score.between(0, 1).all()
+    manifest = json.loads(Path(str(out) + '.manifest.json').read_text())
+    assert manifest['frame_scores'] == len(df) and manifest['seconds'] >= 0 and manifest['parameters'] > 0
+
+
+# --------------------------------------------------------------------------- UniVTG adapter
+def test_univtg_batches_never_repeat_a_query_and_use_every_sample_once():
+    import random
+    from comparison_models.univtg import adapter
+    samples = [dict(query=q) for q in PHRASES for _ in range(5)] + [dict(query=PHRASES[0])] * 7
+    batches = adapter.distinct_query_batches(samples, 8, random.Random(1))
+    flat = [i for b in batches for i in b]
+    assert sorted(flat) == list(range(len(samples)))
+    assert all(len({samples[i]['query'] for i in b}) == len(b) <= 8 for b in batches)
+    assert sum(len(b) == 8 for b in batches) >= len(batches) - 4
+    assert adapter.distinct_query_batches(samples, 8, random.Random(1)) == batches          # deterministic
+
+
+def test_univtg_targets_follow_the_official_dense_formulation():
+    import random
+    from comparison_models.univtg import adapter
+    s = dict(vfeat=np.zeros((10, 4)), windows=[[2, 4], [7, 9]])
+    t = adapter.targets_for(s, random.Random(0))
+    inside = t['timestamp_window'].numpy()
+    assert inside.tolist() == [0, 0, 1, 1, 0, 0, 0, 1, 1, 0]          # clips 2,3 and 7,8
+    np.testing.assert_allclose(t['timestamp'][:, 0].numpy(), (np.arange(10) + 0.5) / 10)
+    np.testing.assert_allclose(t['span_labels_nn'][2].numpy(), [0.2, 0.4])
+    np.testing.assert_allclose(t['span_labels_nn'][8].numpy(), [0.7, 0.9])
+    assert t['saliency_pos_labels'][0] in (2, 3, 7, 8)
+    # the official fall-back when no clip centre lies inside a window: the window's first clip
+    t = adapter.targets_for(dict(vfeat=np.zeros((10, 4)), windows=[[5, 5.4]]), random.Random(0))
+    assert t['timestamp_window'].numpy().tolist() == [0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+
+
+def test_univtg_trains_resumes_and_predicts_on_synthetic_features(tmp_path, monkeypatch):
+    from comparison_models.univtg import adapter
+    monkeypatch.setitem(adapter.OFFICIAL, 'hidden_dim', 32)
+    monkeypatch.setitem(adapter.OFFICIAL, 'dim_feedforward', 32)
+    monkeypatch.setitem(adapter.OFFICIAL, 'enc_layers', 1)
+    monkeypatch.setitem(adapter.OFFICIAL, 'nheads', 4)
+    d = make_prepared(tmp_path, n_videos=4, seconds=24)
+    meta = json.loads(d['metadata'].read_text())
+    feats = tmp_path / 'features'
+    feats.mkdir()
+    rng = np.random.default_rng(0)
+    for v, m in meta.items():
+        n = len(range(0, m['frame_count'], 25))
+        np.save(feats / f'{v}.npy', rng.normal(size=(n, adapter.VIDEO_DIM)).astype(np.float16))
+    texts = {q: rng.normal(size=(5, adapter.TEXT_DIM)).astype(np.float16) for q in PHRASES}
+    torch.save(texts, tmp_path / 'text.pt')
+    out = tmp_path / 'univtg'
+    args = argparse.Namespace(train=str(d['triplets']('train')), val=str(d['triplets']('val')), metadata=str(d['metadata']),
+                              annotations=str(d['annotations']), features=str(feats), text_features=str(tmp_path / 'text.pt'),
+                              output=str(out), clip_frames=4, epochs=3, eval_every=1, batch_size=4, lr=1e-4, seed=1,
+                              sample_fps=1.0, device='cpu')
+    adapter.train(args)
+    rows = [json.loads(l) for l in (out / 'training_metrics.jsonl').read_text().splitlines()]
+    assert [r['epoch'] for r in rows] == [1, 2, 3] and all('val_window_map' in r for r in rows)
+    best = torch.load(out / 'best.pt', weights_only=False)
+    adapter.train(args)                                                 # finished: nothing is trained again
+    assert len((out / 'training_metrics.jsonl').read_text().splitlines()) == 3
+    with pytest.raises(ValueError, match='different settings'):
+        adapter.train(argparse.Namespace(**{**vars(args), 'lr': 2e-4}))
+    pred = tmp_path / 'pred.csv'
+    adapter.predict(argparse.Namespace(checkpoint=str(out / 'best.pt'), triplets=str(d['triplets']('test')),
+                                       metadata=str(d['metadata']), annotations=str(d['annotations']), features=str(feats),
+                                       text_features=str(tmp_path / 'text.pt'), output=str(pred),
+                                       segments=str(tmp_path / 'seg.jsonl'), batch_size=4, device='cpu'))
+    df = pd.read_csv(pred)
+    assert set(df.text_query) == set(PHRASES) and df.score.between(0, 1).all()
+    test_video = d['split']['test'][0]
+    assert len(df[df.video_id == test_video]) == 14 * len(range(0, meta[test_video]['frame_count'], 25))
+    segs = [json.loads(l) for l in (tmp_path / 'seg.jsonl').read_text().splitlines()]
+    assert len(segs) == 14 * len(d['split']['test'])
+    assert all(0 <= w[0] < w[1] <= s['duration'] and 0 <= w[2] <= 1 for s in segs for w in s['predictions'])
+    man = json.loads(Path(str(pred) + '.manifest.json').read_text())
+    assert man['frame_scores'] == len(df) and man['checkpoint_epoch'] == best['epoch']
+
+
+# --------------------------------------------------------------------------- analysis metrics
+def test_weighted_ap_and_auroc_match_scikit_learn_with_ties_and_weights():
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    rng = np.random.default_rng(3)
+    for _ in range(20):
+        n = int(rng.integers(5, 300))
+        y = rng.integers(0, 2, n)
+        if y.sum() in (0, n):
+            continue
+        s = np.round(rng.random(n), int(rng.integers(1, 3)))           # many ties
+        video = rng.integers(0, 6, n)
+        w = rng.integers(0, 3, 6).astype(float)
+        if not ((w[video] > 0) & (y == 1)).any() or not ((w[video] > 0) & (y == 0)).any():
+            continue
+        r = pa.Ranked(y, s, video)
+        assert r.ap() == pytest.approx(average_precision_score(y, s))
+        assert r.ap(w) == pytest.approx(average_precision_score(y, s, sample_weight=w[video]))
+        assert r.auroc(w) == pytest.approx(roc_auc_score(y, s, sample_weight=w[video]))
+
+
+def test_segment_metrics_match_the_repository_definitions():
+    from metrics import temporal_ap
+    from evaluate import segment_metrics
+    rng = np.random.default_rng(5)
+    pairs, records = [], []
+    for k in range(25):
+        dur = 100.0
+        gt = []
+        t = 0.0
+        while rng.random() < 0.7 and t < 80:
+            a = t + rng.uniform(0, 10); b = a + rng.uniform(1, 10); gt.append([a, b]); t = b + 1
+        pred = []
+        for _ in range(int(rng.integers(0, 6))):
+            a = rng.uniform(0, 90); b = a + rng.uniform(0.5, 10)
+            pred.append([a, min(b, dur), float(np.round(rng.random(), 1))])
+        key = (f'v{k % 5}', f'q{k}')
+        pairs.append(dict(video=k % 5, key=str(key), gt=gt, pred=pred, frame_iou=0.5 if gt else None))
+        records.append(dict(video_id=key[0], text_query=key[1], duration=dur, ground_truth=gt, predictions=pred))
+    match = pa.SegmentMatch(pairs, 0.5, 5)
+    ours = match.metrics()
+    theirs = segment_metrics(records, 0.5)
+    for t in pa.IOUS:
+        key = lambda r: (r['video_id'], r['text_query'])                                    # noqa: E731
+        assert ours[f'mAP@{t}'] == pytest.approx(temporal_ap({key(r): r['predictions'] for r in records},
+                                                             {key(r): r['ground_truth'] for r in records}, t))
+        assert ours[f'mAP@{t}'] == pytest.approx(theirs[f'pooled_AP@{t}'])
+        assert ours[f'R1@{t}'] == pytest.approx(theirs[f'R1@{t}'])
+    assert ours['absent_false_alarm'] == pytest.approx(theirs['absent_query_false_positive_rate'])
+    # weights = how often each video is drawn; duplicating the pairs of a video gives the same numbers
+    w = np.asarray([2.0, 1, 0, 1, 1])
+    dup = [dict(p, video=i) for i, p in enumerate([q for q in pairs for _ in range(int(w[q['video']]))])]
+    dup = [dict(p, key=str((p['key'], i))) for i, p in enumerate(dup)]
+    for t in pa.IOUS:
+        expect = pa.SegmentMatch(dup, 0.5, len(dup)).metrics()[f'R1@{t}']
+        assert match.metrics(w)[f'R1@{t}'] == pytest.approx(expect)
+
+
+def test_phase_recognition_metrics_on_a_hand_example():
+    gt = np.array([0, 0, 0, 1, 1, 2, 2, 2])
+    pred = np.array([0, 0, 1, 1, 1, 2, 2, 0])
+    t = pa.phase_tables({0: (gt, pred)})
+    s = pa.phase_summary(t)
+    assert s['accuracy'] == pytest.approx(6 / 8)
+    assert s['per_phase']['recall'][:3] == pytest.approx([2 / 3, 1.0, 2 / 3])
+    assert s['per_phase']['precision'][:3] == pytest.approx([2 / 3, 2 / 3, 1.0])
+    assert s['per_phase']['jaccard'][:3] == pytest.approx([2 / 4, 2 / 3, 2 / 3])
+    assert all(math.isnan(x) for x in s['per_phase']['recall'][3:])         # phases absent from the video
+
+
+def test_holm_and_bootstrap_p_values():
+    np.testing.assert_allclose(pa.holm([0.01, 0.04, 0.03, math.nan]), [0.03, 0.06, 0.06, math.nan])
+    assert pa.bootstrap_p(np.ones(999)) == pytest.approx(2 / 1000)
+    assert pa.bootstrap_p(np.r_[np.ones(500), -np.ones(500)]) == 1.0
+
+
+def _write_results(root, d, plan, rng, quality, sets=('val', 'test'), para=None):
+    from data_contract import AnnotationIndex, query_spec
+    meta = json.loads(d['metadata'].read_text())
+    index = AnnotationIndex(d['annotations'])
+    results = root / 'results' / plan['name']
+    results.mkdir(parents=True, exist_ok=True)
+    for name in sets + tuple(f'test_para{k}' for k in (para or {})):
+        split = 'val' if name == 'val' else 'test'
+        rows = []
+        for v in d['split'][split]:
+            m = meta[v]
+            for q in PHRASES:
+                text = q if not name.startswith('test_para') else para[name[-1]][query_spec(q)]
+                for i in range(0, m['frame_count'], 25):
+                    y = index.label(v, i, query_spec(q))
+                    s = 1 / (1 + math.exp(-(quality * (2 * (y == 1) - 1) + rng.normal())))
+                    rows.append(dict(video_id=v, text_query=text, frame_idx=i, time_sec=i / 25, score=s, label=y))
+        df = pd.DataFrame(rows)
+        if plan['short'] == 'advanced':
+            df['evidence_uncertainty'] = rng.random(len(df))
+        df.to_csv(results / f'proposed_{name}.csv', index=False)
+        df[['video_id', 'text_query', 'frame_idx', 'label']].to_csv(results / f'{name}_reference.csv', index=False)
+        if name == 'test' and plan['kind'] == 'peskavlp_zeroshot':
+            df.to_csv(results / 'authorprompts_test.csv', index=False)
+        if name == 'test' and plan['kind'] == 'univtg':
+            with open(results / 'native_segments_test.jsonl', 'w') as f:
+                for (v, q), g in df.groupby(['video_id', 'text_query']):
+                    f.write(json.dumps(dict(video_id=v, text_query=q, duration=meta[v]['frame_count'] / 25,
+                                            predictions=[[1.0, 4.0, 0.9], [6.0, 9.0, 0.4]])) + '\n')
+    (results / 'proposed_calibration.json').write_text(json.dumps(dict(split='validation', threshold=0.5)))
+    (results / 'proposed_test_metrics.json').write_text('{}')
+    (root / 'state').mkdir(exist_ok=True)
+    (root / 'state' / f'evaluate.{plan["name"]}.done.json').write_text('{}')
+    run = root / 'runs' / plan['name']
+    run.mkdir(parents=True, exist_ok=True)
+    if plan['kind'] == 'proposed':
+        (run / 'training_metrics.jsonl').write_text(''.join(json.dumps(dict(
+            epoch=e, train_loss=1 / e, val_frame_nll=0.5 + abs(e - 2) / 10, average_precision=0.8, train_seconds=60,
+            val_seconds=10, peak_gpu_memory_gb=12.5)) + '\n' for e in (1, 2, 3)))
+        (run / 'parameter_counts.json').write_text(json.dumps(dict(vision_backbone=dict(total=86e6, trainable=1e6))))
+        man = dict(frame_scores=1000, seconds=10, parameters=150e6)
+    else:
+        man = dict(frames=100, seconds=2, parameters=50e6)
+    (results / 'proposed_test.csv.manifest.json').write_text(json.dumps(man))
+
+
+def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
+    root = tmp_path / 'root'
+    d = make_prepared(root, n_videos=8, seconds=40, split=dict(
+        train=[f'CHOLEC80__video0{i}' for i in (1, 2, 3, 4)], val=['CHOLEC80__video05'],
+        test=['CHOLEC80__video06', 'CHOLEC80__video07', 'CHOLEC80__video08']))
+    para = protocol.load_paraphrases()
+    rng = np.random.default_rng(0)
+    plans = protocol.plans('paper')
+    for p in plans:
+        p['short'] = 'advanced' if p['flags'] == protocol.ADVANCED else p['kind']
+        if p['name'] == 'paper_peskavlp_finetune_s42':
+            continue                                                   # a run that has not finished yet
+        _write_results(root, d, p, rng, quality=3.0 if p['kind'] == 'proposed' else 1.0,
+                       para=para if p['paraphrases'] else None)
+    assert pa.main(['--root', str(root), '--bootstrap', '30']) == 0
+    out = root / 'paper'
+    text = (out / 'PAPER_RESULTS.md').read_text()
+    assert 'Runs finished: **14 of 15**' in text and 'paper_peskavlp_finetune_s42' in text
+    for section in ('Main results', 'Paired significance', 'Temporal segments', 'phase recognition', 'Tool presence',
+                    'Per-query AP', 'Ablations', 'seeds', 'unseen query wordings', 'Efficiency', 'Published results'):
+        assert section.lower() in text.lower(), section
+    for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'tool_presence', 'per_query_ap',
+                  'breakdown', 'ablations', 'seeds', 'generalisation', 'efficiency', 'literature_template'):
+        assert (out / 'tables' / f'{table}.csv').exists() and (out / 'tables' / f'{table}.tex').exists(), table
+        assert '\\begin{tabular}' in (out / 'tables' / f'{table}.tex').read_text()
+    for fig in ('reliability', 'risk_coverage', 'training_dynamics', 'per_query_ap', 'generalisation',
+                'timeline_CHOLEC80__video06'):
+        assert (out / 'figures' / f'{fig}.png').exists() and (out / 'figures' / f'{fig}.pdf').exists(), fig
+    report = json.loads((out / 'analysis.json').read_text())
+    assert 'figure_error' not in report
+    main = pd.read_csv(out / 'tables' / 'main_results.csv')
+    assert list(main.Method)[-2:] == ['Baseline (ours)', 'Advanced (ours)'] and len(main) == 6
+    seg = pd.read_csv(out / 'tables' / 'segment_results.csv')
+    assert any('own windows' in m for m in seg.Method)
+    phase = pd.read_csv(out / 'tables' / 'phase_recognition.csv')
+    assert any("authors' phase prompts" in m for m in phase.Method)
+    gen = pd.read_csv(out / 'tables' / 'generalisation.csv')
+    assert {'AP set A', 'AP set B', 'mAP set A'} <= set(gen.columns) and len(gen) == 2 + 4 + 4
+    seeds = pd.read_csv(out / 'tables' / 'seeds.csv')
+    assert list(seeds.Seeds) == ['42, 43, 44', '42, 43, 44']
+    m = report['methods']['paper_advanced_s42']['frame']
+    assert m['average_precision'] > 0.8 and 'evidence_uncertainty_aurc' in m
+    sig = report['significance']
+    assert {r['metric'] for r in sig} == {'AP', 'mAP', 'F1', 'Segment mAP@0.5'}
+    # a missing input of a finished run is an error, not a silently smaller table
+    (root / 'results' / 'paper_clip_zeroshot' / 'test_reference.csv').write_text('video_id,text_query,frame_idx,label\n')
+    with pytest.raises(ValueError):
+        pa.main(['--root', str(root), '--bootstrap', '5'])
+
+
+def test_the_analysis_of_a_root_without_finished_runs_is_a_short_note(tmp_path):
+    (tmp_path / 'data').mkdir()
+    (tmp_path / 'data' / 'video_metadata.json').write_text(json.dumps({'v': dict(source_fps=25.0, frame_count=10)}))
+    assert pa.main(['--root', str(tmp_path), '--bootstrap', '5']) == 0
+    assert 'No run has finished yet' in (tmp_path / 'paper' / 'PAPER_RESULTS.md').read_text()
+
+
+# --------------------------------------------------------------------------- report bundle
+def test_report_bundle_carries_the_paper_tables_figures_and_per_run_logs(tmp_path):
+    import tarfile
+    p = pipeline.Paths(tmp_path, 'paper_baseline_s42')
+    (p.paper / 'tables').mkdir(parents=True)
+    (p.paper / 'figures').mkdir(parents=True)
+    (p.paper / 'PAPER_RESULTS.md').write_text('# results')
+    (p.paper / 'tables' / 'main_results.tex').write_text('\\begin{tabular}')
+    (p.paper / 'figures' / 'reliability.png').write_bytes(b'\x89PNG fake')
+    (p.paper / 'figures' / 'reliability.pdf').write_bytes(b'%PDF fake')
+    (p.logs / 'paper_baseline_s42').mkdir(parents=True)
+    (p.logs / 'paper_baseline_s42' / 'train.log').write_text('epoch 1')
+    (p.logs / 'main.log').write_text('main')
+    a = argparse.Namespace(run_name='paper', preset='paper')
+    pipeline.write_report_bundle(a, [p], 0)
+    name = (p.outbox / 'LATEST.txt').read_text().strip()
+    with tarfile.open(p.outbox / name) as tar:
+        names = set(tar.getnames())
+    assert {'paper/PAPER_RESULTS.md', 'paper/tables/main_results.tex', 'paper/figures/reliability.png',
+            'logs/paper_baseline_s42/train.log', 'logs/main.log'} <= names
+    assert 'paper/figures/reliability.pdf' not in names
+
+
+def test_each_run_records_the_unseen_wording_manifests_it_was_evaluated_on(tmp_path):
+    make_prepared(tmp_path, n_videos=4, seconds=10)
+    p = pipeline.Paths(tmp_path, 'r')
+    pipeline.check_run_inputs(p, 'r')                                  # recorded before the manifests existed
+    protocol.write_paraphrase_triplets(p.triplet_csv('test'), p.triplets)
+    p.results.mkdir(parents=True)
+    (p.results / 'proposed_test.csv').write_text('x')                 # the run has produced something
+    pipeline.check_run_inputs(p, 'r')                                  # new files are added to the record
+    assert 'cholec80_test_paraA_triplets.csv' in json.loads(p.run_inputs.read_text())
+    manifest = p.triplets / 'cholec80_test_paraA_triplets.csv'
+    manifest.write_text(manifest.read_text() + '\n')
+    with pytest.raises(pipeline.StageError, match='changed'):
+        pipeline.check_run_inputs(p, 'r')

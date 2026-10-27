@@ -160,6 +160,7 @@ def main(args):
     (output/'parameter_counts.json').write_text(json.dumps(parameter_counts,indent=2))
     for epoch in range(start,config.TRAIN.NUM_EPOCHS):
         criterion.set_epoch(epoch)
+        if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
         started=time.time()
         loss=train_one_epoch(model,train_loader,optimizer,criterion,scheduler,config.TRAIN.DEVICE,scaler,dtype)
         trained=time.time()
@@ -172,6 +173,7 @@ def main(args):
         save_checkpoint(model,optimizer,scheduler,scaler,epoch+1,best,output/'latest_model.pth',extra)
         row=dict(epoch=epoch+1,train_loss=loss,val_frame_nll=val,auroc=auc,average_precision=ap,accuracy=acc,validation_f1=f1,validation_threshold=threshold,
                  train_seconds=round(trained-started,1),val_seconds=round(validated-trained,1))  # wall time, for planning job lengths
+        if torch.cuda.is_available(): row['peak_gpu_memory_gb']=round(torch.cuda.max_memory_allocated()/1024**3,2)  # efficiency table
         with (output/'training_metrics.jsonl').open('a') as f: f.write(json.dumps(row,allow_nan=False)+'\n')
         print(json.dumps(row))
 

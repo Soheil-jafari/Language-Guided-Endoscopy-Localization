@@ -76,38 +76,82 @@ def test_pip_user_0_overrides_a_pip_configuration_that_asks_for_user_installs(tm
     assert overridden.returncode == 0 and 'Would install lgeldummy-1.0' in overridden.stdout
 
 
-@posix_only
-@pytest.mark.parametrize('location', [None, 'target', 'prefix', 'root'])
-def test_installers_refuse_a_pip_configuration_that_sets_an_install_location(tmp_path, location):
-    """`target`, `prefix` or `root` in a pip configuration file cannot be switched off by environment
-    variables: install_mamba.sh (and setup_env.sh, same lines) stop instead of installing elsewhere."""
+# ------------------------------------------------------------------ the installers' pip-location check
+LOCATION_CASES = {          # pip configuration file -> refused?
+    'ordinary': ('[global]\ntimeout = 60\n', False),
+    'install-target': ('[install]\ntarget = /elsewhere\n', True),
+    'global-prefix': ('[global]\nprefix = /elsewhere\n', True),
+    'install-root': ('[install]\nroot = /elsewhere\n', True),
+    'hidden-by-quiet': ('[global]\nquiet = 1\n[install]\ntarget = /elsewhere\n', True),
+    'hidden-by-config-global': ('[config]\nglobal = true\n[install]\ntarget = /elsewhere\n', True),
+    'listing-fails-by-config': ('[config]\nglobal = true\nsite = true\n[install]\ntarget = /elsewhere\n', True),
+    'other-section-only': ('[download]\ntarget = /elsewhere\n', False),       # pip install ignores it
+    'empty-value': ('[install]\nprefix =\n', False),                          # selects no location
+    'listing-fails': ('[global]\ntimeout = 60\n', True),                     # pip config list itself fails
+}
+
+
+def _installer(tmp_path, script, case):
+    """Runs the real setup_env.sh or install_mamba.sh against stand-ins: a conda env whose python is the
+    real interpreter except that pip installs are only recorded, Mamba imports unless MAMBA_BROKEN exists,
+    and `pip config list` fails in the 'listing-fails' case; plus curl and conda stand-ins. Nothing is
+    ever downloaded or installed."""
+    conf_text, refused = LOCATION_CASES[case]
     calls = tmp_path / 'calls'
-    # the real interpreter, except: its prefix is tmp_path, Mamba works unless MAMBA_BROKEN exists, and
-    # pip installs are only recorded (so nothing is ever downloaded or installed)
-    py = tmp_path / 'python'
+    env_dir = tmp_path / 'env'
+    (env_dir / 'bin').mkdir(parents=True)
+    (env_dir / 'conda-meta').mkdir()
+    py = env_dir / 'bin' / 'python'
     py.write_text(f'''#!/bin/bash
-if [ "$1" = -c ] && [[ "$2" == *"sys.prefix"* ]]; then echo "{tmp_path}"; exit 0; fi
+if [ "$1" = -c ] && [[ "$2" == *"sys.prefix"* ]]; then echo "{env_dir}"; exit 0; fi
 if [ "$1" = -c ] && [[ "$2" == *"import mamba_ssm"* ]]; then [ -e "{tmp_path}/MAMBA_BROKEN" ] && exit 1; exit 0; fi
 if [ "$1" = -m ] && [ "$2" = pip ] && [ "$3" = install ]; then echo "PIP INSTALL" >> "{calls}"; exit 0; fi
+if [ "$1" = -m ] && [ "$2" = pip ] && [ "$3" = config ] && [ -e "{tmp_path}/LIST_FAILS" ]; then echo boom >&2; exit 1; fi
+if [ "$1" = - ]; then cat >/dev/null; exit 0; fi
 exec "{sys.executable}" "$@"
 ''')
     py.chmod(0o755)
-    if location:
-        (tmp_path / 'MAMBA_BROKEN').write_text('')            # Mamba missing: an installation would follow
+    stub = tmp_path / 'bin'
+    stub.mkdir()
+    (stub / 'curl').write_text(f'#!/bin/bash\necho "CURL" >> "{calls}"; exit 1\n')
+    base = tmp_path / 'condabase'
+    (base / 'etc' / 'profile.d').mkdir(parents=True)
+    (base / 'etc' / 'profile.d' / 'conda.sh').write_text(
+        'conda() { case "$1" in activate) export CONDA_PREFIX="$2"; export PATH="$2/bin:$PATH" ;; '
+        'deactivate) unset CONDA_PREFIX ;; esac; }\n')
+    (stub / 'conda').write_text(f'#!/bin/bash\n[ "$1" = info ] && echo "{base}"\n')
+    for f in ('curl', 'conda'):
+        (stub / f).chmod(0o755)
+    if refused:
+        (tmp_path / 'MAMBA_BROKEN').write_text('')   # Mamba missing: a regression would try to install it
+    if case == 'listing-fails':
+        (tmp_path / 'LIST_FAILS').write_text('')
     conf = tmp_path / 'pip.conf'
-    conf.write_text('[global]\ntimeout = 60\n' + (f'[install]\n{location} = /somewhere/else\n' if location else ''))
-    env = {k: v for k, v in os.environ.items() if not k.startswith('PIP_')}
-    env.update(PIP_CONFIG_FILE=str(conf))
-    out = subprocess.run(['bash', str(REPO / 'install_mamba.sh'), str(py)], env=env, capture_output=True, text=True,
-                         timeout=120)
-    if location:
-        assert out.returncode == 1 and f'install.{location}' in out.stderr and 'install location' in out.stderr
-        assert not calls.exists() and (tmp_path / '.lgel_mamba_missing').exists()
-    else:                                                     # an ordinary configuration: no complaint, and
-        assert out.returncode == 0 and 'install location' not in out.stderr and not calls.exists()   # Mamba works
-    guard = 'pip config list'
-    code = _code('setup_env.sh')
-    assert code.index(guard) < code.index('pip install') and _code('install_mamba.sh').count(guard) == 1
+    conf.write_text(conf_text)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('PIP_', 'CONDA_'))}
+    env.update(PIP_CONFIG_FILE=str(conf), PATH=f'{stub}:{os.environ["PATH"]}', LGEL_ENV_PREFIX=str(env_dir))
+    cmd = ['bash', str(REPO / script)] + ([str(py)] if script == 'install_mamba.sh' else [])
+    out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+    return out, (calls.read_text() if calls.exists() else ''), env_dir, refused
+
+
+@posix_only
+@pytest.mark.parametrize('script', ['setup_env.sh', 'install_mamba.sh'])
+@pytest.mark.parametrize('case', sorted(LOCATION_CASES))
+def test_installers_refuse_a_pip_configuration_that_installs_elsewhere(tmp_path, script, case):
+    out, calls, env_dir, refused = _installer(tmp_path, script, case)
+    assert 'CURL' not in calls                                       # never a download in this test
+    if refused:
+        assert out.returncode == 1, out.stdout + out.stderr
+        assert ('could not read' if case == 'listing-fails' else 'sets an install location') in out.stderr
+        assert 'PIP INSTALL' not in calls                            # nothing installed anywhere
+        if script == 'install_mamba.sh':
+            assert (env_dir / '.lgel_mamba_missing').exists()
+    elif script == 'install_mamba.sh':                               # Mamba works: nothing to do
+        assert out.returncode == 0 and not calls, out.stderr
+    else:                                                            # setup goes on and completes
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert calls.count('PIP INSTALL') == 4 and (env_dir / '.lgel_env_ready').exists()
 
 
 def test_stage_subprocesses_get_the_repository_on_their_path_and_no_empty_entry(tmp_path, monkeypatch):

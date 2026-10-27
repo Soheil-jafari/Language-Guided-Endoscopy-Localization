@@ -6,6 +6,7 @@ Thresholds must be selected separately on validation by evaluate.py.
 """
 import argparse
 import json
+import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -50,16 +51,19 @@ def main():
             raise ValueError('X-CLIP checkpoint name/time-grid/schema mismatch')
         load_model_state(model,ckpt)
     pairs,meta,store,ann=prepare_pairs(a.triplets,a.metadata,a.frames,a.annotations,a.sample_fps)
-    rows=[]
+    rows=[]; started=time.time()
+    by_video={}
+    for (video,query),spec in sorted(pairs.items()): by_video.setdefault(video,[]).append((query,spec))
     with torch.no_grad():
-        for (video,query),spec in sorted(pairs.items()):
+        for video,items in by_video.items():
             m=meta[video]; grid=sample_indices(m['frame_count'],m['source_fps'],a.sample_fps)
-            sums=np.zeros(len(grid)); counts=np.zeros(len(grid))
+            queries=[q for q,_ in items]
+            sums=np.zeros((len(grid),len(queries))); counts=np.zeros(len(grid))
             if a.model=='clip':
                 for start in range(0,len(grid),a.batch_size):
                     chunk=grid[start:start+a.batch_size]
-                    inputs=processor(images=[store.read(video,int(i)) for i in chunk],text=[query],return_tensors='pt',padding=True)
-                    logits=model(**{k:v.to(a.device) for k,v in inputs.items()}).logits_per_image[:,0]
+                    inputs=processor(images=[store.read(video,int(i)) for i in chunk],text=queries,return_tensors='pt',padding=True)
+                    logits=model(**{k:v.to(a.device) for k,v in inputs.items()}).logits_per_image
                     # Undo learned temperature before mapping cosine to [0,1];
                     # sigmoid(logit) can saturate and destroy ranking precision.
                     sums[start:start+len(chunk)]=((logits.float()/model.logit_scale.exp()+1)/2).clamp(0,1).cpu().numpy(); counts[start:start+len(chunk)]=1
@@ -67,18 +71,24 @@ def main():
                 length=model.config.vision_config.num_frames
                 for start in window_positions(len(grid),length,length):
                     ids=grid[start:start+length].tolist(); n=len(ids); ids+=[ids[-1]]*(length-n)
-                    inputs=processor(videos=[[np.asarray(store.read(video,i)) for i in ids]],text=[query],padding=True,return_tensors='pt')
-                    # HF X-CLIP text embeddings are VIDEO-CONDITIONED, not pooled tokens.
-                    logit=model(**{k:v.to(a.device) for k,v in inputs.items()}).logits_per_video[0,0]
-                    sums[start:start+n]+=float(((logit.float()/model.logit_scale.exp()+1)/2).clamp(0,1)); counts[start:start+n]+=1
-            for idx,score in zip(grid,sums/counts):
-                rows.append(dict(video_id=video,text_query=query,frame_idx=int(idx),time_sec=float(idx/m['source_fps']),
-                    score=float(score),label=ann.label(video,int(idx),spec)))
+                    # All queries of the video at once: the window is encoded once. HF X-CLIP text embeddings are
+                    # VIDEO-CONDITIONED (each sentence attends to this window only), so this equals one call per query.
+                    inputs=processor(videos=[[np.asarray(store.read(video,i)) for i in ids]],text=queries,padding=True,return_tensors='pt')
+                    logits=model(**{k:v.to(a.device) for k,v in inputs.items()}).logits_per_video[0]
+                    sums[start:start+n]+=((logits.float()/model.logit_scale.exp()+1)/2).clamp(0,1).cpu().numpy()[None,:]; counts[start:start+n]+=1
+            scores=sums/counts[:,None]
+            for j,(query,spec) in enumerate(items):
+                for idx,score in zip(grid,scores[:,j]):
+                    rows.append(dict(video_id=video,text_query=query,frame_idx=int(idx),time_sec=float(idx/m['source_fps']),
+                        score=float(score),label=ann.label(video,int(idx),spec)))
+    seconds=time.time()-started
     store.close(); Path(a.output).parent.mkdir(parents=True,exist_ok=True)
     pd.DataFrame(rows).to_csv(a.output,index=False)
     Path(a.output+'.manifest.json').write_text(json.dumps(dict(model=name,baseline=a.model,sample_fps=a.sample_fps,
         triplets_sha256=file_hash(a.triplets),metadata_sha256=file_hash(a.metadata),checkpoint_sha256=file_hash(a.checkpoint) if a.checkpoint else None,
-        score_semantics='Uncalibrated (cosine+1)/2; fit operating threshold on validation only'),indent=2))
+        score_semantics='Uncalibrated (cosine+1)/2; fit operating threshold on validation only',
+        parameters=sum(p.numel() for p in model.parameters()),frame_scores=len(rows),seconds=round(seconds,1),
+        frame_scores_per_second=round(len(rows)/max(seconds,1e-9),1)),indent=2))
 
 
 if __name__=='__main__': main()

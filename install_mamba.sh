@@ -11,11 +11,19 @@ unset PYTHONPATH PYTHONHOME PIP_TARGET PIP_PREFIX PIP_ROOT
 export PIP_USER=0                  # install into this environment only, whatever pip's own configuration says
 PY="${1:?usage: bash install_mamba.sh /path/to/python}"
 CONDA_PREFIX="$("$PY" -c 'import sys; print(sys.prefix)')"
-# A pip configuration file can also set an install location (target / prefix / root); that cannot be
-# switched off from here, so such a setting is refused rather than installing outside this environment.
-PIP_LOCATIONS="$("$PY" -m pip config list 2>/dev/null | grep -E '^[^=]*[.](target|prefix|root)=' || true)"
+# A pip configuration file can also set an install location (target / prefix / root) for "pip install".
+# That cannot be switched off from here, so it is refused rather than installing outside this
+# environment. (Quiet mode and pip's own file-selection settings are overridden so the listing is complete.)
+if ! PIP_LIST="$(PIP_QUIET=0 PIP_GLOBAL=0 PIP_SITE=0 "$PY" -m pip config list 2>&1)"; then
+  echo "ERROR: could not read pip's configuration (\"$PY -m pip config list\" failed):" >&2
+  echo "$PIP_LIST" >&2
+  touch "$CONDA_PREFIX/.lgel_mamba_missing"
+  exit 1
+fi
+PIP_LOCATIONS="$(printf '%s\n' "$PIP_LIST" | grep -E "^(global|install|:env:)[.](target|prefix|root)=('[^']|\"[^\"])" || true)"
 if [ -n "$PIP_LOCATIONS" ]; then
-  echo "ERROR: a pip configuration file sets an install location, so pip would install outside this environment:" >&2
+  echo "ERROR: pip's configuration sets an install location for \"pip install\", so packages would go outside" >&2
+  echo "       this environment:" >&2
   echo "$PIP_LOCATIONS" >&2
   echo "       Remove these settings (\"$PY -m pip config debug\" shows the files), then run again." >&2
   touch "$CONDA_PREFIX/.lgel_mamba_missing"

@@ -1,0 +1,43 @@
+{
+  "_comment": "Unseen query wordings for the language-generalisation test. Training only ever uses the 14 canonical sentences in data_contract.PHRASES; these sentences are used only at test time. Set A renames each concept (synonyms and clinical terms); set B describes what is happening. concept/concept_id follow data_contract.PHASES and data_contract.TOOLS. Drafted for review: every sentence must be checked by a clinician or the author before the results are reported.",
+  "sets": {
+    "A": {
+      "description": "synonyms and clinical terminology",
+      "queries": [
+        {"concept": "phase", "concept_id": 0, "text": "the preparatory stage of the operation"},
+        {"concept": "phase", "concept_id": 1, "text": "dissection of the hepatocystic triangle"},
+        {"concept": "phase", "concept_id": 2, "text": "division of the cystic duct and cystic artery between clips"},
+        {"concept": "phase", "concept_id": 3, "text": "separation of the gallbladder from the liver bed"},
+        {"concept": "phase", "concept_id": 4, "text": "placement of the gallbladder into an endoscopic retrieval pouch"},
+        {"concept": "phase", "concept_id": 5, "text": "haemostasis and irrigation of the operative field"},
+        {"concept": "phase", "concept_id": 6, "text": "extraction of the gallbladder from the abdominal cavity"},
+        {"concept": "tool", "concept_id": 0, "text": "a grasping forceps is visible"},
+        {"concept": "tool", "concept_id": 1, "text": "bipolar coagulation forceps are visible"},
+        {"concept": "tool", "concept_id": 2, "text": "a monopolar electrocautery hook is visible"},
+        {"concept": "tool", "concept_id": 3, "text": "laparoscopic shears are visible"},
+        {"concept": "tool", "concept_id": 4, "text": "a surgical clipping device is visible"},
+        {"concept": "tool", "concept_id": 5, "text": "a suction and irrigation cannula is visible"},
+        {"concept": "tool", "concept_id": 6, "text": "an endoscopic retrieval pouch is visible"}
+      ]
+    },
+    "B": {
+      "description": "descriptions of the surgical action",
+      "queries": [
+        {"concept": "phase", "concept_id": 0, "text": "the ports are being placed and the abdomen is being prepared for surgery"},
+        {"concept": "phase", "concept_id": 1, "text": "the surgeon is exposing the cystic duct and the cystic artery"},
+        {"concept": "phase", "concept_id": 2, "text": "the surgeon applies clips to the cystic structures and cuts them"},
+        {"concept": "phase", "concept_id": 3, "text": "the gallbladder is being detached from the liver"},
+        {"concept": "phase", "concept_id": 4, "text": "the detached gallbladder is being put into a bag"},
+        {"concept": "phase", "concept_id": 5, "text": "bleeding points are coagulated and the area is rinsed and suctioned"},
+        {"concept": "phase", "concept_id": 6, "text": "the bag containing the gallbladder is pulled out of the patient"},
+        {"concept": "tool", "concept_id": 0, "text": "the surgeon is holding tissue with a grasping instrument"},
+        {"concept": "tool", "concept_id": 1, "text": "a bipolar instrument is being used to coagulate tissue"},
+        {"concept": "tool", "concept_id": 2, "text": "an electric hook is being used to dissect tissue"},
+        {"concept": "tool", "concept_id": 3, "text": "a pair of scissors is being used to cut"},
+        {"concept": "tool", "concept_id": 4, "text": "clips are being applied with an applicator"},
+        {"concept": "tool", "concept_id": 5, "text": "fluid is being suctioned or irrigated through a cannula"},
+        {"concept": "tool", "concept_id": 6, "text": "a plastic bag for removing the specimen is inside the abdomen"}
+      ]
+    }
+  }
+}

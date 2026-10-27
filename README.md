@@ -24,6 +24,13 @@ See [README_HPC.md](README_HPC.md) for the inputs it needs, the presets, the off
 workflow and troubleshooting. The sections below describe the individual tools that
 `main.py` drives.
 
+**The paper's experiments** (`--preset paper`, defined in `paper_protocol.py`): on the standard
+Cholec80 split (40/8/32 videos), our baseline and advanced models with three seeds, one ablation per
+add-on, five comparison methods (CLIP zero-shot, PeskaVLP zero-shot and fine-tuned, X-CLIP
+fine-tuned, the official UniVTG model on the same M2CRL features), two sets of unseen query
+wordings, and `paper_analysis.py`, which writes every table (CSV + LaTeX) and figure with bootstrap
+confidence intervals and paired significance tests. One resumable command; see README_HPC.md.
+
 ## Environment
 
 The local CPU checks use Python 3.12, PyTorch 2.5.1 and torchvision 0.20.1.
@@ -167,5 +174,10 @@ original licence:
 - `backbone/vision_transformer.py` is adapted from
   [TimeSformer](https://github.com/facebookresearch/TimeSformer) (CC BY-NC 4.0) and
   [pytorch-image-models](https://github.com/huggingface/pytorch-image-models) (Apache 2.0).
-- Pretrained models (the M2CRL backbone checkpoint, CLIP, X-CLIP) and the Cholec80
+- `comparison_models/univtg/official/` is copied unmodified from
+  [UniVTG](https://github.com/showlab/UniVTG) (MIT; see `VENDORED.md` there).
+- PeskaVLP is not included: `comparison_models/peskavlp/setup_env.sh` installs the official
+  [SurgVLP](https://github.com/CAMMA-public/SurgVLP) code at a fixed commit into its own environment, and the
+  pipeline downloads the authors' public weights (CC BY-NC-SA 4.0, research use).
+- Pretrained models (the M2CRL backbone checkpoint, CLIP, X-CLIP, PeskaVLP) and the Cholec80
   dataset are **not** distributed here and are subject to their owners' terms.

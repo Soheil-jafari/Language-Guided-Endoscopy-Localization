@@ -5,12 +5,13 @@
 #   bash hpc/submit.sh pilot          # a few hours: real data prepared once, short training, time estimate
 #   bash hpc/submit.sh full           # the real experiment: baseline, then advanced model (use --repeat 2)
 #   bash hpc/submit.sh full --repeat 2    # same, plus one follow-up job in case 72 h are not enough
+#   bash hpc/submit.sh paper --repeat 6   # the paper's complete protocol (about 11-12 GPU days; see README_HPC.md)
 #
 # Anything after the preset is passed on to main.py, e.g.  bash hpc/submit.sh full --batch-size 4 --accum 48
 # (except --root/--preset, which this script sets, and the download links, which belong in links.env).
 # Site-specific sbatch options, if the cluster ever asks for them:  LGEL_SBATCH_OPTS="--account=xyz" bash ...
 # Everything is written under $LGEL_BASE (default /mnt/scratch/users/daiz1/soheil):
-#   lgel_smoke/ (smoke test)  lgel/ (pilot and full)  conda/ (environment)  links.env (private links)
+#   lgel_smoke/ (smoke test)  lgel/ (pilot and full)  lgel_paper/ (paper)  conda/ (environments)  links.env
 # After each job the file to send back is <root>/outbox/<newest>.tar.gz (name in <root>/outbox/LATEST.txt).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +23,8 @@ case "$PRESET" in
   smoke) ROOT="$BASE/lgel_smoke"; TIME="0-04:00:00" ;;
   pilot) ROOT="$BASE/lgel";       TIME="1-00:00:00" ;;
   full)  ROOT="$BASE/lgel";       TIME="3-00:00:00" ;;
-  *) echo "usage: bash hpc/submit.sh smoke|pilot|full [--repeat N] [main.py options]" >&2; exit 2 ;;
+  paper) ROOT="$BASE/lgel_paper"; TIME="3-00:00:00" ;;      # its own folder: the standard 40/8/32 split
+  *) echo "usage: bash hpc/submit.sh smoke|pilot|full|paper [--repeat N] [main.py options]" >&2; exit 2 ;;
 esac
 shift
 REPEAT=1
@@ -32,7 +34,7 @@ while [ $# -gt 0 ]; do
     --repeat) [ $# -ge 2 ] || die "--repeat needs a number"; REPEAT="$2"; shift 2 ;;
     --repeat=*) REPEAT="${1#--repeat=}"; shift ;;
     --root|--root=*|--preset|--preset=*)
-      die "$1: the folder and the preset are set by this script (use smoke, pilot or full)" ;;
+      die "$1: the folder and the preset are set by this script (use smoke, pilot, full or paper)" ;;
     --data-url|--data-url=*|--weights-url|--weights-url=*)
       die "${1%%=*}: put the download links in $BASE/links.env, never on the command line (it is visible to other users)" ;;
     *) ARGS+=("$1"); shift ;;
@@ -44,6 +46,28 @@ case "$REPO$BASE" in *,*) die "the paths must not contain commas (Slurm's --expo
 
 command -v sbatch >/dev/null 2>&1 || die "sbatch not found: run this on the cluster's login node"
 mkdir -p "$BASE"
+
+# The paper protocol works in its own folder (other split, many runs). It reuses what the earlier runs in
+# lgel/ already have, so nothing is downloaded twice: the unpacked Cholec80 videos (frames are extracted
+# again, for the new folder) and the M2CRL weights file those runs were given. Only until the new folder
+# has its own copy of that information, and never if the command names other inputs.
+given() { local o="$1" x; for x in ${ARGS[@]+"${ARGS[@]}"}; do case "$x" in "$o"|"$o"=*) return 0 ;; esac; done; return 1; }
+if [ "$PRESET" = paper ]; then
+  OLD="$BASE/lgel"
+  if [ ! -f "$ROOT/state/fetch_data.done.json" ] && ! given --data-dir && ! given --data-zip && ! given --synthetic \
+     && [ -f "$OLD/state/fetch_data.done.json" ] && [ -d "$OLD/raw/extracted" ]; then
+    ARGS+=(--data-dir "$OLD/raw/extracted")
+    echo "note: using the Cholec80 videos already unpacked in $OLD/raw/extracted (no new download)"
+  fi
+  if [ ! -f "$ROOT/state/fetch_weights.done.json" ] && ! given --weights-path && ! given --random-init \
+     && [ -f "$OLD/state/weights_ref.json" ]; then
+    W="$(sed -n 's/^ *"path": *"\(.*\)",\{0,1\} *$/\1/p' "$OLD/state/weights_ref.json" | head -n 1)"
+    if [ -n "$W" ] && [ -f "$W" ]; then
+      ARGS+=(--weights-path "$W")
+      echo "note: using the M2CRL weights of the earlier runs: $W"
+    fi
+  fi
+fi
 
 # Only one submission at a time (an atomic lock directory), and only one job at a time (the queue).
 LOCK="$BASE/.submit.lock"

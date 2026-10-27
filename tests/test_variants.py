@@ -186,13 +186,20 @@ def test_each_summary_records_what_that_model_was_trained_with(tmp_path, monkeyp
     p = pipeline.Paths(tmp_path, 'full_advanced_seed42')
     p.run_cfg.parent.mkdir(parents=True)
     p.run_cfg.write_text(json.dumps(dict(MODEL=dict(pipeline.ADVANCED_FLAGS['MODEL']),
-                                         TRAIN=dict(NUM_EPOCHS=20, BATCH_SIZE=4, GRADIENT_ACCUMULATION_STEPS=48, AMP_DTYPE='bf16'))))
+                                         TRAIN=dict(pipeline.ADVANCED_FLAGS['TRAIN'], NUM_EPOCHS=20, BATCH_SIZE=4,
+                                                    GRADIENT_ACCUMULATION_STEPS=48, AMP_DTYPE='bf16', SEED=43))))
     a = argparse.Namespace(run_name='full_advanced_seed42', preset='full', variant='advanced', batch_size=8, subset_ratio=1.0)
     pipeline.stage_summary(a, p)
     text = (p.results / 'SUMMARY.md').read_text()
-    assert 'Model: **advanced** (Mamba temporal head' in text and 'batch 4 x 48 accumulation' in text
+    assert ('Model: **advanced (Mamba temporal head, bi-level consistency loss, evidential uncertainty, confidence '
+            'fusion)**') in text and 'batch 4 x 48 accumulation' in text and 'seed 43' in text
     summary = json.loads((p.results / 'summary.json').read_text())
     assert summary['trained_with']['TRAIN']['BATCH_SIZE'] == 4 and summary['latest_command_args']['batch_size'] == '8'
+    # The description comes from what was trained, so a model with only some add-ons is never called advanced.
+    p.run_cfg.write_text(json.dumps(dict(MODEL=dict(TEMPORAL_HEAD_TYPE='SSM', SSM_USE_OFFICIAL_MAMBA=True),
+                                         TRAIN=dict(NUM_EPOCHS=10))))
+    pipeline.stage_summary(a, p)
+    assert 'Model: **baseline + Mamba temporal head**' in (p.results / 'SUMMARY.md').read_text()
 
 
 def test_offline_jobs_refuse_missing_optical_flow_weights_without_touching_the_network(tmp_path, monkeypatch):

@@ -11,7 +11,7 @@
 #SBATCH --job-name=lgel
 #
 # Slurm job for the whole pipeline on the project cluster. Do not submit this file directly: use
-#     bash hpc/submit.sh smoke|pilot|full
+#     bash hpc/submit.sh smoke|pilot|full|paper
 # which sets the output file, the time limit and the paths below, and makes sure only one job runs at
 # a time. The job creates the conda environment on its first run, then downloads, prepares, trains,
 # evaluates, and writes a report to send back (<root>/outbox/*.tar.gz).
@@ -21,7 +21,7 @@
 # epoch when the same command is submitted again). A SIGTERM (scancel) is handled the same way.
 
 set -o pipefail
-: "${LGEL_REPO:?submit with: bash hpc/submit.sh smoke|pilot|full}"
+: "${LGEL_REPO:?submit with: bash hpc/submit.sh smoke|pilot|full|paper}"
 : "${LGEL_BASE:?}" "${LGEL_PRESET:?}" "${LGEL_ROOT:?}"
 JOB="${SLURM_JOB_ID:-local}"
 SLURM_LOG="$LGEL_ROOT/logs/slurm-$JOB.out"

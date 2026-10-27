@@ -22,6 +22,11 @@ Stages (run `python main.py --list-stages`):
 The `full` preset trains two models, each a separate run on the same prepared data: the baseline,
 then the advanced model (Mamba temporal head, bi-level consistency loss, evidential uncertainty,
 confidence fusion). `--variant` selects baseline, advanced or both.
+
+The `paper` preset runs the complete experimental protocol of the paper (paper_protocol.py) on the
+standard Cholec80 split (40/8/32 videos): both models with three seeds, one ablation per add-on, the
+comparison methods (CLIP, PeskaVLP, X-CLIP, UniVTG), the unseen-wording test, and finally
+paper_analysis.py, which writes every table and figure to <root>/paper/.
 """
 from __future__ import annotations
 
@@ -54,6 +59,8 @@ except ImportError:                              # pragma: no cover
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
+import paper_protocol as protocol  # noqa: E402  (standard library only at import time)
+
 STAGES = ['preflight', 'fetch_models', 'fetch_weights', 'check_advanced', 'fetch_data', 'extract_frames',
           'sanitize_annotations', 'parse_annotations', 'splits', 'triplets', 'audit',
           'train', 'predict', 'evaluate', 'summary']
@@ -84,6 +91,10 @@ PRESETS = {
     # the baseline model, then the advanced model, on the same data and splits.
     'full': dict(max_videos=None, epochs=20, warmup=3, subset_ratio=1.0, batch_size=8, accum=24,
                  audit='all', min_free_gb=200, variant='both'),
+    # The paper's complete protocol (paper_protocol.py): standard split, 10 epochs per model (the 20-epoch
+    # baseline peaked at epoch 3), every run of the protocol in priority order, then the analysis.
+    'paper': dict(max_videos=None, epochs=10, warmup=3, subset_ratio=1.0, batch_size=8, accum=24,
+                  audit='all', min_free_gb=300, variant='both'),
 }
 
 
@@ -229,6 +240,8 @@ class Paths:
         self.prep_lock, self.run_lock = self.state / 'prepare.lock', self.state / f'run.{run}.lock'
         self.outbox = r / 'outbox'
         self.results = r / 'results' / run
+        self.paper = r / 'paper'                       # tables and figures of the paper protocol
+        self.log_scope = None                          # set while a run's own stages execute: logs/<run>/
 
     def triplet_csv(self, split):
         return self.triplets / f'cholec80_{split}_triplets.csv'
@@ -239,7 +252,10 @@ class Paths:
         return self.state / f'{stage}.done.json'
 
 
-def stage_env(a, p):
+def stage_env(a, p, online=False):
+    """Environment of every step. online=True: a step that downloads models (a comparison method's own
+    models, fetched when its run starts) may use the network even after the shared models were fetched -
+    never with --offline."""
     env = os.environ.copy()
     # Not inherited from the machine: some images switch on the optional 'hf_transfer' downloader without
     # installing it (RunPod's does, and every model download then fails), and an inherited offline switch
@@ -249,15 +265,16 @@ def stage_env(a, p):
     env.update(HF_HOME=str(p.hf), TORCH_HOME=str(p.root / 'torch_cache'), PYTHONUNBUFFERED='1',
                TOKENIZERS_PARALLELISM='false',
                PYTHONPATH=os.pathsep.join(x for x in (str(REPO), env.get('PYTHONPATH', '')) if x))
-    if a.offline or p.marker('fetch_models').exists():
+    if a.offline or (p.marker('fetch_models').exists() and not online):
         env.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')   # cache was populated already
     return env
 
 
 def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=None):
     """Run a subprocess, stream its output to the console and logs/<name>.log."""
-    p.logs.mkdir(parents=True, exist_ok=True)
-    logfile = p.logs / f'{name}.log'
+    folder = p.logs / p.log_scope if getattr(p, 'log_scope', None) else p.logs
+    folder.mkdir(parents=True, exist_ok=True)
+    logfile = folder / f'{name}.log'
     cmd = [str(c) for c in cmd]
     shown = redact(' '.join(cmd))
     log(f'$ {shown}')
@@ -502,7 +519,10 @@ def input_fingerprint(p):
     """Hashes of every prepared file a training run consumes (and the test manifest it is evaluated on)."""
     files = dict(splits=p.splits, train_triplets=p.triplet_csv('train'), val_triplets=p.triplet_csv('val'),
                  test_triplets=p.triplet_csv('test'), video_metadata=p.metadata, parsed_annotations=p.parsed)
-    return {k: (file_sha(f) if f.exists() else None) for k, f in files.items()}
+    out = {k: (file_sha(f) if f.exists() else None) for k, f in files.items()}
+    if p.triplets.exists():                             # the unseen-wording test manifests (paper protocol)
+        out.update({f.name: file_sha(f) for f in sorted(p.triplets.glob('cholec80_test_para*_triplets.csv'))})
+    return out
 
 
 def check_run_inputs(p, run_name):
@@ -516,8 +536,11 @@ def check_run_inputs(p, run_name):
                          f'(the full command, or --to-stage audit).')
     if p.run_inputs.exists():
         saved = json.loads(p.run_inputs.read_text())
-        changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))
-        produced = (p.run.exists() and any(p.run.glob('*.pth'))) or \
+        # A file that the record does not mention yet (recorded by an older version) is added to it, not
+        # treated as a change; a recorded file that differs or is gone is a change.
+        changed = sorted(k for k in saved if saved.get(k) != current.get(k))
+        added = sorted(k for k in current if k not in saved)
+        produced = (p.run.exists() and (any(p.run.rglob('*.pth')) or any(p.run.rglob('*.pt')))) or \
             (p.results.exists() and any(p.results.glob('proposed_*')))
         if changed and not produced:
             log(f'run "{run_name}" had not produced anything yet; recording the current data for it')
@@ -529,6 +552,9 @@ def check_run_inputs(p, run_name):
                 f'checkpoints and results belong to the old data and must not be reused or evaluated on the new '
                 f'data. Start a new run with a different --run-name (or use a new --root), or restore the '
                 f'original data settings. (Run folders: {p.run}, {p.results}.)')
+        if added:
+            log(f'run "{run_name}": recording {added} with its inputs')
+            write_json(p.run_inputs, current)
         return
     checkpoints = sorted(p.run.glob('*.pth')) if p.run.exists() else []
     if checkpoints:
@@ -575,11 +601,20 @@ def pin_single_gpu(count):
 # --------------------------------------------------------------------------- settings
 def resolve_settings(a):
     preset = PRESETS[a.preset]
+    a.variant_given = getattr(a, 'variant', None) is not None
     for key, default in preset.items():
         if getattr(a, key, None) is None:
             setattr(a, key, default)
     a.workers = a.workers or min(16, max(1, cpu_count()))
     a.run_name_given = a.run_name is not None
+    # The paper protocol: the standard Cholec80 split (unless another one is given) and the unseen-wording
+    # test manifests. Its runs are named by paper_protocol.py; the name here labels the job's report.
+    a.paraphrases = a.preset == 'paper'
+    if a.preset == 'paper' and getattr(a, 'variant_given', False):
+        raise SystemExit('--variant does not apply to the paper preset: it runs every model of paper_protocol.py')
+    if a.preset == 'paper':
+        a.splits_json = a.splits_json or str(protocol.SPLIT_FILE)
+        a.run_name = a.run_name or 'paper'
     if a.run_name is None:
         named_by_variant = a.variant == 'advanced' or (a.variant == 'baseline' and PRESETS[a.preset]['variant'] == 'both')
         a.run_name = f'{a.preset}_{a.variant}_seed{a.seed}' if named_by_variant else f'{a.preset}_seed{a.seed}'
@@ -610,6 +645,40 @@ def variant_runs(a):
     return [(v, f'{a.preset}_{v}_seed{a.seed}') for v in ('baseline', 'advanced')]
 
 
+def experiment_plans(a):
+    """Every run this invocation handles, in order: a copy of the settings per run, with its name, kind
+    ('proposed' or a comparison method), model flags (the advanced model's add-ons switched on) and seed."""
+    plans = []
+    if a.preset == 'paper':
+        for spec in protocol.plans(a.run_name if a.run_name_given else 'paper'):
+            sub = argparse.Namespace(**vars(a))
+            sub.run_name, sub.kind, sub.flags, sub.seed = spec['name'], spec['kind'], spec['flags'], spec['seed']
+            sub.paraphrase_eval, sub.group, sub.label = spec['paraphrases'], spec['group'], spec['label']
+            sub.variant = (('advanced' if spec['flags'] == protocol.ADVANCED else 'baseline' if not spec['flags']
+                            else 'ablation') if spec['kind'] == 'proposed' else spec['kind'])
+            plans.append(sub)
+        return plans
+    for variant, name in variant_runs(a):
+        sub = argparse.Namespace(**vars(a))
+        sub.variant, sub.run_name, sub.kind = variant, name, 'proposed'
+        sub.flags = protocol.merge_flags(ADVANCED_FLAGS) if variant == 'advanced' else {}
+        sub.paraphrase_eval, sub.group, sub.label = False, 'main', variant
+        plans.append(sub)
+    return plans
+
+
+def run_flags(a):
+    """The add-on flags of a proposed-model run (older callers only set `variant`)."""
+    flags = getattr(a, 'flags', None)
+    if flags is None:
+        flags = ADVANCED_FLAGS if getattr(a, 'variant', 'baseline') == 'advanced' else {}
+    return flags
+
+
+def uses_flow(a):
+    return bool(run_flags(a).get('TRAIN', {}).get('USE_BILEVEL_CONSISTENCY'))
+
+
 def data_source_id(a):
     # Deliberately NOT the URL/path: download links often expire or carry a token, and a resumed or
     # --offline job must not be rejected just because the link is different or absent.
@@ -629,7 +698,8 @@ def stage_signature(stage, a):
         'parse_annotations': dict(data=data_source_id(a)),
         'splits': dict(seed=a.split_seed, val=a.val_ratio, test=a.test_ratio,
                        given=sha(file_sha(a.splits_json) if a.splits_json else '')),
-        'triplets': dict(fps=a.sample_fps),
+        'triplets': dict(fps=a.sample_fps, **({'paraphrases': protocol.paraphrase_signature()}
+                                               if getattr(a, 'paraphrases', False) else {})),
         'audit': dict(mode=a.audit),
         'train': dict(run=a.run_name),
         'predict': dict(run=a.run_name), 'evaluate': dict(run=a.run_name),
@@ -1449,6 +1519,10 @@ def stage_triplets(a, p):
     from dataset_preprocessing.build_dataset import build
     shutil.rmtree(p.triplets, ignore_errors=True)
     build(p.parsed, p.metadata, p.frames, p.splits, p.triplets, a.sample_fps)
+    if getattr(a, 'paraphrases', False):
+        # The test manifest again with each query in unseen wordings (same frames and labels).
+        written = protocol.write_paraphrase_triplets(p.triplet_csv('test'), p.triplets)
+        log(f'unseen-wording test manifests: {sorted(written)}')
     log(f'triplet manifests written to {p.triplets}')
 
 
@@ -1464,6 +1538,7 @@ def stage_audit(a, p):
 
 # --------------------------------------------------------------------------- stage: train
 def train_config(a, p, workers, amp_dtype):
+    flags = run_flags(a)
     return dict(
         EXTRACTED_FRAMES_DIR=str(p.frames), VIDEO_METADATA_PATH=str(p.metadata),
         CHOLEC80_PARSED_ANNOTATIONS=str(p.parsed),
@@ -1471,11 +1546,11 @@ def train_config(a, p, workers, amp_dtype):
         TEST_TRIPLETS_CSV_PATH=str(p.triplet_csv('test')),
         CHECKPOINT_DIR=str(p.run), OUTPUT_DIR=str(p.results),
         MODEL=dict(M2CRL_WEIGHTS_PATH=read_weights_path(p, a), TEXT_ENCODER_MODEL=a.text_model,
-                   **(ADVANCED_FLAGS['MODEL'] if getattr(a, 'variant', 'baseline') == 'advanced' else {})),
+                   **flags.get('MODEL', {})),
         DATA=dict(NUM_WORKERS=workers, SAMPLE_FPS=a.sample_fps),
         TRAIN=dict(SEED=a.seed, NUM_EPOCHS=a.epochs, WARMUP_EPOCHS=a.warmup, BATCH_SIZE=a.batch_size,
                    GRADIENT_ACCUMULATION_STEPS=a.accum, SUBSET_RATIO=a.subset_ratio, AMP_DTYPE=amp_dtype,
-                   **(ADVANCED_FLAGS['TRAIN'] if getattr(a, 'variant', 'baseline') == 'advanced' else {})))
+                   **flags.get('TRAIN', {})))
 
 
 def completed_epochs(p):
@@ -1537,7 +1612,9 @@ def recover_unresumable_run(p):
 
 def stage_train(a, p):
     check_run_inputs(p, a.run_name)
-    if getattr(a, 'variant', 'baseline') == 'advanced':
+    if getattr(a, 'kind', 'proposed') != 'proposed':
+        return COMPARISON_METHODS[a.kind]['train'](a, p)
+    if uses_flow(a):
         require_flow_weights_offline(a, p)
     amp = a.amp_dtype
     if amp == 'auto':
@@ -1594,38 +1671,335 @@ def _epoch_progress(total):
 
 
 # --------------------------------------------------------------------------- predict / evaluate
+def prediction_sets(a, p):
+    """(name, manifest) of everything a run is evaluated on: the validation videos (where the threshold is
+    chosen), the test videos, and - in the paper protocol - the test videos with unseen query wordings."""
+    out = [('val', p.triplet_csv('val')), ('test', p.triplet_csv('test'))]
+    if getattr(a, 'paraphrase_eval', False):
+        for name in sorted(protocol.load_paraphrases()):
+            out.append((f'test_para{name}', p.triplets / protocol.paraphrase_triplet_name(name)))
+    return out
+
+
 def stage_predict(a, p):
     check_run_inputs(p, a.run_name)
-    ckpt = p.run / 'best_model.pth'
-    if not ckpt.exists():
-        raise StageError(f'{ckpt} not found; the train stage must finish first.')
     p.results.mkdir(parents=True, exist_ok=True)
-    cfg = json.loads(p.run_cfg.read_text())
-    for split in ('val', 'test'):
-        out = p.results / f'proposed_{split}.csv'
-        for f in (out, Path(str(out) + '.manifest.json')):
+    sets = prediction_sets(a, p)
+    for name, _ in sets:
+        for f in (p.results / f'proposed_{name}.csv', p.results / f'proposed_{name}.csv.manifest.json'):
             f.unlink(missing_ok=True)
-        run([sys.executable, 'predict.py', '--checkpoint', ckpt, '--triplets', p.triplet_csv(split),
-             '--metadata', p.metadata, '--frames', p.frames, '--annotations', p.parsed, '--output', out,
-             '--batch-size', a.pred_batch_size, '--workers', cfg['DATA']['NUM_WORKERS']], a, p, f'predict_{split}')
-        ref = p.results / f'{split}_reference.csv'
+    if getattr(a, 'kind', 'proposed') != 'proposed':
+        COMPARISON_METHODS[a.kind]['predict'](a, p, sets)
+    else:
+        ckpt = p.run / 'best_model.pth'
+        if not ckpt.exists():
+            raise StageError(f'{ckpt} not found; the train stage must finish first.')
+        cfg = json.loads(p.run_cfg.read_text())
+        for name, manifest in sets:
+            run([sys.executable, 'predict.py', '--checkpoint', ckpt, '--triplets', manifest,
+                 '--metadata', p.metadata, '--frames', p.frames, '--annotations', p.parsed,
+                 '--output', p.results / f'proposed_{name}.csv', '--batch-size', a.pred_batch_size,
+                 '--workers', cfg['DATA']['NUM_WORKERS']], a, p, f'predict_{name}')
+    for name, manifest in sets:                         # labels on the same frames, independent of any model
+        if not (p.results / f'proposed_{name}.csv').exists():
+            raise StageError(f'no predictions were written for {name} ({p.results / f"proposed_{name}.csv"})')
+        ref = p.results / f'{name}_reference.csv'
         ref.unlink(missing_ok=True)
-        run([sys.executable, 'build_reference.py', '--triplets', p.triplet_csv(split), '--metadata', p.metadata,
+        run([sys.executable, 'build_reference.py', '--triplets', manifest, '--metadata', p.metadata,
              '--frames', p.frames, '--annotations', p.parsed, '--output', ref, '--sample-fps', a.sample_fps],
-            a, p, f'reference_{split}')
+            a, p, f'reference_{name}')
+
+
+def metrics_file(p, name):
+    return p.results / ('proposed_test_metrics.json' if name == 'test' else f'proposed_{name}_metrics.json')
 
 
 def stage_evaluate(a, p):
     check_run_inputs(p, a.run_name)
-    calib, test = p.results / 'proposed_calibration.json', p.results / 'proposed_test_metrics.json'
-    for f in (calib, test):
+    sets = prediction_sets(a, p)
+    calib = p.results / 'proposed_calibration.json'
+    for f in [calib] + [metrics_file(p, name) for name, _ in sets if name != 'val']:
         f.unlink(missing_ok=True)
     run([sys.executable, 'evaluate.py', '--predictions', p.results / 'proposed_val.csv', '--reference',
          p.results / 'val_reference.csv', '--split', 'validation', '--select-threshold', '--output', calib],
         a, p, 'evaluate_val')
-    run([sys.executable, 'evaluate.py', '--predictions', p.results / 'proposed_test.csv', '--reference',
-         p.results / 'test_reference.csv', '--split', 'test', '--calibration', calib, '--output', test],
-        a, p, 'evaluate_test')
+    for name, _ in sets:                                # the validation threshold, unchanged, on every test set
+        if name == 'val':
+            continue
+        run([sys.executable, 'evaluate.py', '--predictions', p.results / f'proposed_{name}.csv', '--reference',
+             p.results / f'{name}_reference.csv', '--split', 'test', '--calibration', calib,
+             '--output', metrics_file(p, name)], a, p, f'evaluate_{name}')
+
+
+# --------------------------------------------------------------------------- comparison methods (paper)
+# Each method is a run like ours: its own folder (<root>/runs/<run>), its predictions on exactly the same
+# frames and manifests (proposed_<set>.csv in <root>/results/<run>), evaluated by the same evaluate.py with
+# the threshold chosen on validation. A method that has to be trained resumes after an interruption and
+# writes FINISHED.json when done; its own models are downloaded when its run starts (never with --offline).
+PREFETCH = {
+    'clip': 'from transformers import CLIPModel as M, CLIPProcessor as P',
+    'xclip': 'from transformers import XCLIPModel as M, XCLIPProcessor as P',
+    'cliptext': 'from transformers import CLIPTextModel as M, CLIPTokenizer as P',
+}
+
+
+def prefetch_hf(a, p, family, name):
+    """Download (once) a Hugging Face model and its processor into <root>/hf_cache."""
+    code = PREFETCH[family] + '; import sys; n = sys.argv[1]; M.from_pretrained(n); P.from_pretrained(n); print("ready:", n)'
+    run([sys.executable, '-c', code, name], a, p, f'fetch_{family}', env=stage_env(a, p, online=not a.offline))
+
+
+def finished_marker(folder):
+    return Path(folder) / 'FINISHED.json'
+
+
+def fresh_output(folder):
+    """An output folder for a training script that refuses to overwrite: anything left by an attempt that
+    was stopped before its first checkpoint is moved aside (never deleted)."""
+    folder = Path(folder)
+    if folder.exists() and any(folder.iterdir()) and not (folder / 'latest.pt').exists():
+        aside = folder.with_name(f'{folder.name}.interrupted-{time.strftime("%Y%m%d-%H%M%S")}')
+        os.replace(folder, aside)
+        log(f'{folder.name}: an attempt stopped before its first epoch was moved aside ({aside.name})')
+
+
+def work_order(a, p, manifest, name, labels=False, prompts=None):
+    work = p.run / 'work'
+    work.mkdir(parents=True, exist_ok=True)
+    order = work / f'{name}.order.json'
+    cmd = [sys.executable, 'comparison_models/frame_scores.py', 'work-order', '--triplets', manifest,
+           '--metadata', p.metadata, '--frames', p.frames, '--annotations', p.parsed, '--output', order,
+           '--sample-fps', a.sample_fps]
+    label_file = work / f'{name}.labels.npz' if labels else None
+    if labels:
+        cmd += ['--labels', label_file]
+    if prompts:
+        write_json(work / f'{name}.prompts.json', prompts)
+        cmd += ['--prompts', work / f'{name}.prompts.json']
+    run(cmd, a, p, f'workorder_{name}')
+    return order, label_file
+
+
+def assemble_scores(a, p, scores, manifest, output, prompts=None, name='assemble'):
+    Path(output).unlink(missing_ok=True)
+    cmd = [sys.executable, 'comparison_models/frame_scores.py', 'assemble', '--scores', scores, '--triplets', manifest,
+           '--metadata', p.metadata, '--annotations', p.parsed, '--output', output, '--sample-fps', a.sample_fps]
+    if prompts:
+        write_json(p.run / 'work' / f'{name}.prompts.json', prompts)
+        cmd += ['--prompts', p.run / 'work' / f'{name}.prompts.json']
+    run(cmd, a, p, name)
+
+
+def score_workers(a):
+    return a.train_workers if a.train_workers is not None else min(16, max(0, cpu_count() - 2))
+
+
+# ----- CLIP (zero-shot)
+def clip_train(a, p):
+    prefetch_hf(a, p, 'clip', protocol.COMPARISONS['clip_zeroshot']['model'])
+    log('CLIP zero-shot: nothing to train')
+
+
+def clip_predict(a, p, sets):
+    model = protocol.COMPARISONS['clip_zeroshot']['model']
+    for name, manifest in sets:
+        order, _ = work_order(a, p, manifest, name)
+        scores = p.run / 'work' / f'{name}.scores.npz'
+        scores.unlink(missing_ok=True)
+        run([sys.executable, 'comparison_models/clip_scores.py', '--work-order', order, '--model-name', model,
+             '--output', scores, '--workers', score_workers(a)], a, p, f'clip_{name}')
+        assemble_scores(a, p, scores, manifest, p.results / f'proposed_{name}.csv', name=f'assemble_{name}')
+        shutil.copy2(str(scores) + '.manifest.json', p.results / f'proposed_{name}.csv.manifest.json')
+
+
+# ----- X-CLIP (fine-tuned): the repository's train_xclip.py and benchmark.py
+def xclip_train(a, p):
+    cfg = protocol.COMPARISONS['xclip_finetune']
+    prefetch_hf(a, p, 'xclip', cfg['model'])
+    out = p.run / 'xclip'
+    if finished_marker(out).exists():
+        log('X-CLIP fine-tuning already finished')
+        return
+    fresh_output(out)
+    cmd = [sys.executable, 'train_xclip.py', '--train-triplets', p.triplet_csv('train'), '--val-triplets',
+           p.triplet_csv('val'), '--metadata', p.metadata, '--frames', p.frames, '--annotations', p.parsed,
+           '--output', out, '--model-name', cfg['model'], '--sample-fps', a.sample_fps, '--epochs', cfg['epochs'],
+           '--batch-size', cfg['batch_size'], '--lr', cfg['lr'], '--seed', a.seed]
+    if (out / 'latest.pt').exists():
+        log('continuing the X-CLIP fine-tuning from its last finished epoch')
+        cmd += ['--resume-from', out / 'latest.pt']
+    run(cmd, a, p, 'train')
+    if not (out / 'best.pt').exists():
+        raise StageError('X-CLIP fine-tuning ended without a best checkpoint')
+    write_json(finished_marker(out), dict(finished=time.ctime(), epochs=cfg['epochs']))
+
+
+def xclip_predict(a, p, sets):
+    cfg = protocol.COMPARISONS['xclip_finetune']
+    for name, manifest in sets:
+        run([sys.executable, 'benchmark.py', '--model', 'xclip', '--model-name', cfg['model'], '--checkpoint',
+             p.run / 'xclip' / 'best.pt', '--triplets', manifest, '--metadata', p.metadata, '--frames', p.frames,
+             '--annotations', p.parsed, '--output', p.results / f'proposed_{name}.csv', '--sample-fps', a.sample_fps],
+            a, p, f'predict_{name}')
+
+
+# ----- PeskaVLP (zero-shot and fine-tuned), in its own environment
+def peskavlp_prefix(p):
+    if os.environ.get('LGEL_PESKAVLP_PREFIX'):
+        return Path(os.environ['LGEL_PESKAVLP_PREFIX'])
+    base = os.environ.get('LGEL_ENV_PREFIX') or os.environ.get('CONDA_PREFIX')
+    return Path(base + '-peskavlp') if base else p.root / 'envs' / 'peskavlp'
+
+
+def peskavlp_env(a, p, online=False):
+    env = stage_env(a, p, online=online)
+    env.pop('PYTHONPATH', None)                       # its own environment: nothing of this repository on the path
+    return env
+
+
+def safe_extract(archive, target):
+    """Unpack a zip without letting a member escape the target folder."""
+    target = Path(target)
+    with zipfile.ZipFile(archive) as zf:
+        for member in zf.namelist():
+            dest = (target / member).resolve()
+            if target.resolve() not in dest.parents and dest != target.resolve():
+                raise StageError(f'{archive}: unsafe member path {member!r}')
+        zf.extractall(target)
+
+
+def peskavlp_weights(a, p):
+    folder = p.root / 'comparisons' / 'peskavlp'
+    download_path = folder / 'PeskaVLP.download'
+    download(protocol.PESKAVLP['weights_url'], download_path, a, p, 'peskavlp_weights')
+    if not zipfile.is_zipfile(download_path):
+        return download_path                              # a plain checkpoint file
+    unpacked = folder / 'unpacked'
+    done = unpacked / '.complete'
+    if not done.exists():
+        shutil.rmtree(unpacked, ignore_errors=True)
+        partial = folder / 'unpacked.partial'
+        shutil.rmtree(partial, ignore_errors=True)
+        partial.mkdir(parents=True)
+        safe_extract(download_path, partial)
+        os.replace(partial, unpacked)
+        done.write_text(time.ctime())
+    found = sorted(f for f in unpacked.rglob('*') if f.suffix in ('.pth', '.pt', '.ckpt') and f.is_file()
+                   and not f.name.startswith('._') and '__MACOSX' not in f.parts)      # (macOS archive extras)
+    if len(found) != 1:
+        raise StageError(f'expected one checkpoint in the PeskaVLP download, found {[f.name for f in found]}')
+    return found[0]
+
+
+def peskavlp_setup(a, p):
+    prefix = peskavlp_prefix(p)
+    if a.offline and not (prefix / '.lgel_peskavlp_ready').exists():
+        raise StageError(f'--offline: the PeskaVLP environment ({prefix}) has not been created yet.')
+    if not a.offline:
+        run(['bash', 'comparison_models/peskavlp/setup_env.sh', prefix], a, p, 'peskavlp_setup',
+            env=peskavlp_env(a, p, online=True))
+    weights = peskavlp_weights(a, p)
+    # One construction with the real weights (strict loading); it also fetches what the authors' model
+    # constructor needs: Bio_ClinicalBERT (Hugging Face) and the ImageNet ResNet-50 weights (torchvision).
+    run([prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'check', '--weights', weights],
+        a, p, 'peskavlp_check', env=peskavlp_env(a, p, online=not a.offline))
+    return prefix, weights
+
+
+def peskavlp_zeroshot_train(a, p):
+    peskavlp_setup(a, p)
+    log('PeskaVLP zero-shot: nothing to train')
+
+
+def peskavlp_finetune_train(a, p):
+    cfg = protocol.COMPARISONS['peskavlp_finetune']
+    prefix, weights = peskavlp_setup(a, p)
+    out = p.run / 'peskavlp'
+    if finished_marker(out).exists():
+        log('PeskaVLP fine-tuning already finished')
+        return
+    train_order, train_labels = work_order(a, p, p.triplet_csv('train'), 'train', labels=True)
+    val_order, val_labels = work_order(a, p, p.triplet_csv('val'), 'val_labels', labels=True)
+    out.mkdir(parents=True, exist_ok=True)
+    run([prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'finetune', '--train-order',
+         train_order, '--train-labels', train_labels, '--val-order', val_order, '--val-labels', val_labels,
+         '--weights', weights, '--output', out, '--epochs', cfg['epochs'], '--lr', cfg['lr'], '--batch-size',
+         cfg['batch_size'], '--seed', a.seed, '--workers', score_workers(a)], a, p, 'train', env=peskavlp_env(a, p))
+    if not (out / 'best.pt').exists():
+        raise StageError('PeskaVLP fine-tuning ended without a best checkpoint')
+    write_json(finished_marker(out), dict(finished=time.ctime(), epochs=cfg['epochs']))
+
+
+def peskavlp_predict(a, p, sets, checkpoint=None):
+    prefix, weights = peskavlp_prefix(p), peskavlp_weights(a, p)
+    extra = []
+    if checkpoint is None:
+        # Also with the authors' own phase prompts (their zero-shot protocol), for the phase-recognition table.
+        prompts = dict(zip(protocol.phase_queries(), protocol.PESKAVLP_PHASE_PROMPTS, strict=True))
+        extra = [(f'authorprompts_{name}', manifest, prompts) for name, manifest in sets if name in ('val', 'test')]
+    for name, manifest, prompts in [(n, m, None) for n, m in sets] + extra:
+        order, _ = work_order(a, p, manifest, name, prompts=prompts)
+        scores = p.run / 'work' / f'{name}.scores.npz'
+        scores.unlink(missing_ok=True)
+        cmd = [prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'score', '--work-order', order,
+               '--weights', weights, '--output', scores, '--workers', score_workers(a)]
+        if checkpoint is not None:
+            cmd += ['--checkpoint', checkpoint]
+        run(cmd, a, p, f'peskavlp_{name}', env=peskavlp_env(a, p))
+        output = p.results / (f'{name}.csv' if prompts else f'proposed_{name}.csv')
+        assemble_scores(a, p, scores, manifest, output, prompts=prompts, name=f'assemble_{name}')
+        shutil.copy2(str(scores) + '.manifest.json', str(output) + '.manifest.json')
+
+
+# ----- UniVTG (official model, M2CRL features)
+def univtg_features_dir(a, p):
+    weights = read_weights_path(p, a)
+    key = file_sha(weights) if weights else 'random-init'
+    return p.root / 'features' / f'm2crl_{key}'
+
+
+def univtg_train(a, p):
+    cfg = protocol.COMPARISONS['univtg']
+    features = univtg_features_dir(a, p)
+    weights = read_weights_path(p, a)
+    p.run.mkdir(parents=True, exist_ok=True)
+    run([sys.executable, 'comparison_models/univtg/adapter.py', 'features', '--weights', weights or '',
+         '--metadata', p.metadata, '--frames', p.frames, '--videos', p.splits, '--output', features,
+         '--text-model', a.text_model, '--sample-fps', a.sample_fps], a, p, 'univtg_features')
+    manifests = [p.triplet_csv(s) for s in ('train', 'val', 'test')] + [m for n, m in prediction_sets(a, p)
+                                                                          if n.startswith('test_para')]
+    run([sys.executable, 'comparison_models/univtg/adapter.py', 'text', '--triplets', *manifests,
+         '--output', p.run / 'text_features.pt', '--text-model', a.text_model], a, p, 'univtg_text')
+    out = p.run / 'univtg'
+    if finished_marker(out).exists():
+        log('UniVTG training already finished')
+        return
+    run([sys.executable, 'comparison_models/univtg/adapter.py', 'train', '--train', p.triplet_csv('train'),
+         '--val', p.triplet_csv('val'), '--metadata', p.metadata, '--annotations', p.parsed, '--features', features,
+         '--text-features', p.run / 'text_features.pt', '--output', out, '--clip-frames', cfg['clip_length'],
+         '--epochs', cfg['epochs'], '--eval-every', cfg['eval_every'], '--batch-size', cfg['batch_size'],
+         '--lr', cfg['lr'], '--seed', a.seed, '--sample-fps', a.sample_fps], a, p, 'train')
+    write_json(finished_marker(out), dict(finished=time.ctime(), epochs=cfg['epochs']))
+
+
+def univtg_predict(a, p, sets):
+    for name, manifest in sets:
+        segments = p.results / f'native_segments_{name}.jsonl'
+        segments.unlink(missing_ok=True)
+        run([sys.executable, 'comparison_models/univtg/adapter.py', 'predict', '--checkpoint', p.run / 'univtg' / 'best.pt',
+             '--triplets', manifest, '--metadata', p.metadata, '--annotations', p.parsed,
+             '--features', univtg_features_dir(a, p), '--text-features', p.run / 'text_features.pt',
+             '--output', p.results / f'proposed_{name}.csv', '--segments', segments], a, p, f'predict_{name}')
+
+
+COMPARISON_METHODS = {
+    'clip_zeroshot': dict(train=clip_train, predict=clip_predict),
+    'xclip_finetune': dict(train=xclip_train, predict=xclip_predict),
+    'peskavlp_zeroshot': dict(train=peskavlp_zeroshot_train, predict=lambda a, p, sets: peskavlp_predict(a, p, sets)),
+    'peskavlp_finetune': dict(train=peskavlp_finetune_train,
+                              predict=lambda a, p, sets: peskavlp_predict(a, p, sets, p.run / 'peskavlp' / 'best.pt')),
+    'univtg': dict(train=univtg_train, predict=univtg_predict),
+}
 
 
 # --------------------------------------------------------------------------- summary
@@ -1648,16 +2022,36 @@ def stage_summary(a, p):
         commit = ''
     summary = dict(run=a.run_name, preset=a.preset, git_commit=commit,
                    latest_command_args={k: str(v) for k, v in vars(a).items() if 'url' not in k})
+    kind = getattr(a, 'kind', 'proposed')
+    summary['kind'] = kind
+    if kind != 'proposed':
+        summary['method'] = getattr(a, 'label', kind)
+        lines += [f'Method: **{summary["method"]}** (comparison method; evaluated exactly like our model: the same '
+                  f'frames and manifests, the threshold chosen on the validation videos).', '']
+        for log_file in sorted(p.run.glob('*/training_metrics.jsonl')) if p.run.exists() else []:
+            rows = []
+            for line in log_file.read_text().splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+            summary.setdefault('training', []).extend(rows)
+            if rows:
+                keys = list(dict.fromkeys(k for r in rows for k in r))
+                lines += [f'## Training ({log_file.parent.name})', '', '| ' + ' | '.join(keys) + ' |',
+                          '|' + '---|' * len(keys)]
+                lines += ['| ' + ' | '.join(f'{r[k]:.4g}' if isinstance(r.get(k), float) else str(r.get(k, ''))
+                                            for k in keys) + ' |' for r in rows]
+                lines.append('')
     if p.run_cfg.exists():                              # what this model was actually trained with
         trained = json.loads(p.run_cfg.read_text())
         summary['trained_with'] = dict(MODEL=trained.get('MODEL', {}), TRAIN=trained.get('TRAIN', {}))
-        advanced = trained.get('MODEL', {}).get('TEMPORAL_HEAD_TYPE') == 'SSM'
+        description = protocol.describe_flags(summary['trained_with'])
         tr = trained.get('TRAIN', {})
-        lines += [f'Model: **{"advanced" if advanced else "baseline"}**'
-                  + (' (Mamba temporal head, bi-level consistency loss, evidential uncertainty, confidence fusion)'
-                     if advanced else ' (Transformer temporal head)')
+        lines += [f'Model: **{description}**'
                   + f'; trained for {tr.get("NUM_EPOCHS", "?")} epochs, batch {tr.get("BATCH_SIZE", "?")} x '
-                    f'{tr.get("GRADIENT_ACCUMULATION_STEPS", "?")} accumulation, {tr.get("AMP_DTYPE", "?")}.', '']
+                    f'{tr.get("GRADIENT_ACCUMULATION_STEPS", "?")} accumulation, {tr.get("AMP_DTYPE", "?")}, '
+                    f'seed {tr.get("SEED", "?")}.', '']
     if p.audit.exists():
         au = json.loads(p.audit.read_text())
         lines += ['## Data', '', '| split | videos | unique video-queries | labels (-100 / 0 / 1) |', '|---|---|---|---|']
@@ -1745,6 +2139,17 @@ def stage_summary(a, p):
                 for q, d in sorted(m['per_query'].items()):
                     lines.append(f'| {q} | {_fmt(d["average_precision"])} | {_fmt(d["auroc"])} | {_fmt(d["f1"])} |')
                 lines.append('')
+    unseen = [(name, metrics_file(p, name)) for name, _ in prediction_sets(a, p) if name.startswith('test_para')]
+    unseen = [(name, f) for name, f in unseen if f.exists()]
+    if unseen:
+        lines += ['## Unseen query wordings (test videos, same threshold)', '',
+                  '| query set | AP | AUROC | F1 | precision | recall |', '|---|---|---|---|---|---|']
+        for name, f in unseen:
+            m = json.loads(f.read_text())
+            summary[name] = {k: v for k, v in m.items() if k not in ('per_video', 'per_query')}
+            lines.append(f'| {name[len("test_"):]} | {_fmt(m["average_precision"])} | {_fmt(m["auroc"])} | '
+                         f'{_fmt(m["f1"])} | {_fmt(m["precision"])} | {_fmt(m["recall"])} |')
+        lines.append('')
     export_model_weights(p)
     write_json(p.results / 'summary.json', summary)
     (p.results / 'SUMMARY.md').write_text('\n'.join(lines))
@@ -1776,8 +2181,19 @@ def write_comparison(a, plans):
 BUNDLE_TOTAL = 80 * 1024 ** 2        # uncompressed payload of one report (about 15-20 MB as .tar.gz)
 BUNDLE_FILE = 25 * 1024 ** 2         # largest single file taken whole
 BUNDLE_TAIL = 5 * 1024 ** 2          # larger logs: only their last part
-BUNDLE_TEXT = {'.json', '.jsonl', '.csv', '.md', '.txt', '.log', '.out'}
+BUNDLE_TEXT = {'.json', '.jsonl', '.csv', '.md', '.txt', '.log', '.out', '.tex'}
 BUNDLE_IMAGES = {'training_curves.png'}
+
+
+def _is_image(f, root):
+    """Pictures that go into a report: training curves, and the paper figures (PNG; their PDFs stay)."""
+    if f.name in BUNDLE_IMAGES:
+        return True
+    try:
+        rel = f.relative_to(root / 'paper')
+    except ValueError:
+        return False
+    return f.suffix.lower() == '.png' and rel.parts[0] in ('figures', 'explanations')
 
 
 def _bundle_candidates(ps):
@@ -1785,7 +2201,9 @@ def _bundle_candidates(ps):
     `ps`: the Paths of every run this job handled (the baseline and the advanced model)."""
     ps = ps if isinstance(ps, (list, tuple)) else [ps]
     p = ps[0]
-    first = sorted((p.root / 'results').glob('*_COMPARISON.md')) if (p.root / 'results').exists() else []
+    paper = p.root / 'paper'
+    first = [paper / 'PAPER_RESULTS.md', paper / 'analysis.json'] if paper.exists() else []
+    first += sorted((p.root / 'results').glob('*_COMPARISON.md')) if (p.root / 'results').exists() else []
     for q in ps:
         first += [q.results / n for n in ('SUMMARY.md', 'summary.json', 'proposed_calibration.json',
                                           'proposed_test_metrics.json', 'training_curves.png')]
@@ -1794,9 +2212,10 @@ def _bundle_candidates(ps):
                   q.run_cfg, q.run_inputs]
     first += [p.audit, p.splits, p.splits.with_suffix('.provenance.json'),
               p.data / 'annotations_sanitized.json', p.metadata, p.inventory, *sorted(p.state.glob('*.json'))]
-    logs = sorted(p.logs.glob('*')) if p.logs.exists() else []
-    logs.sort(key=lambda f: (f.name != 'main.log', not f.name.startswith('slurm-'), f.name))
-    rest = [f for q in ps for f in (sorted(q.results.glob('*')) if q.results.exists() else [])]
+    logs = sorted(f for f in p.logs.rglob('*') if f.is_file()) if p.logs.exists() else []    # (logs/<run>/ too)
+    logs.sort(key=lambda f: (f.name != 'main.log', not f.name.startswith('slurm-'), f.parent != p.logs, str(f)))
+    figures = sorted(f for f in paper.rglob('*') if f.is_file()) if paper.exists() else []    # tables, figures
+    rest = figures + [f for q in ps for f in (sorted(q.results.glob('*')) if q.results.exists() else [])]
     seen, out = set(), []
     for f in first + logs + rest:
         if f not in seen:
@@ -1828,10 +2247,11 @@ def write_report_bundle(a, p, rc):
                     continue
                 rel = f.relative_to(p.root).as_posix()
                 suffix = f.suffix.lower()
-                if suffix not in BUNDLE_TEXT and f.name not in BUNDLE_IMAGES:
+                image = _is_image(f, p.root)
+                if suffix not in BUNDLE_TEXT and not image:
                     continue                                    # checkpoints, temporary files, data ...
                 size = f.stat().st_size
-                if f.name in BUNDLE_IMAGES:
+                if image:
                     data = f.read_bytes() if size <= BUNDLE_FILE else None
                 elif size > BUNDLE_FILE and suffix in ('.log', '.out', '.txt'):
                     with open(f, 'rb') as fh:
@@ -1845,7 +2265,7 @@ def write_report_bundle(a, p, rc):
                 if data is None or total + len(data) > BUNDLE_TOTAL:
                     omitted.append(f'{rel} ({size / 1024 ** 2:.1f} MB)')
                     continue
-                if f.name not in BUNDLE_IMAGES:
+                if not image:
                     data = redact(data.decode('utf-8', errors='replace')).encode('utf-8')
                 total += len(data)
                 payload.append((rel, data))
@@ -1912,8 +2332,7 @@ def select_stages(a):
     return STAGES[lo: hi + 1]
 
 
-def main(argv=None):
-    global _LOGFILE
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
     ap.add_argument('--preset', choices=sorted(PRESETS), default='full')
@@ -1921,7 +2340,8 @@ def main(argv=None):
                     help='working directory for ALL data/checkpoints/results (put it on scratch; needs ~200 GB). '
                          'Required for the pilot/full presets (or env LGEL_ROOT).')
     ap.add_argument('--run-name', help='default: <preset>_seed<seed>; with the full preset <preset>_<model>_seed<seed> '
-                                       '(full_baseline_seed42, full_advanced_seed42)')
+                                       '(full_baseline_seed42, full_advanced_seed42); with the paper preset the '
+                                       'prefix of every run name (default paper: paper_baseline_s42, ...)')
     g = ap.add_argument_group('inputs')
     g.add_argument('--data-url', help='direct link to the Cholec80 zip (or env LGEL_DATA_URL)')
     g.add_argument('--data-zip', help='already-downloaded zip file')
@@ -1963,6 +2383,12 @@ def main(argv=None):
     g.add_argument('--from-stage', choices=STAGES); g.add_argument('--to-stage', choices=STAGES)
     g.add_argument('--force', help='comma-separated stages to redo even if finished')
     g.add_argument('--dry-run', action='store_true'); g.add_argument('--list-stages', action='store_true')
+    return ap
+
+
+def main(argv=None):
+    global _LOGFILE
+    ap = build_parser()
     if argv is None and len(sys.argv) > 1 and sys.argv[1] == '_check_model':     # internal helper
         _check_model(sys.argv[2])
         return 0
@@ -1975,18 +2401,18 @@ def main(argv=None):
         return 0
     if a.root is None:
         if a.preset != 'smoke':
-            ap.error('--root is required for the pilot/full presets: give a folder on a large scratch filesystem '
+            ap.error('--root is required for the pilot/full/paper presets: give a folder on a large scratch filesystem '
                      '(~200 GB). The home directory is usually too small, and quotas are not visible to the '
                      'free-space check.')
         a.root = str(REPO / 'lgel_run')
     a = resolve_settings(a)
-    # The advanced model's add-ons are checked whenever it will be trained, and by the smoke test.
-    a.check_advanced = a.preset == 'smoke' or a.variant != 'baseline'
-    plans = []
-    for variant, name in variant_runs(a):
-        sub = argparse.Namespace(**vars(a))
-        sub.variant, sub.run_name = variant, name
-        plans.append((sub, Paths(a.root, name)))
+    subs = experiment_plans(a)
+    # The advanced model's add-ons are checked (once per job, before any data is prepared) whenever a run of
+    # this command uses one of them, and by the smoke test.
+    a.check_advanced = a.preset == 'smoke' or any(sub.kind == 'proposed' and sub.flags for sub in subs)
+    for sub in subs:
+        sub.check_advanced = a.check_advanced
+    plans = [(sub, Paths(a.root, sub.run_name)) for sub in subs]
     p = plans[0][1]                                     # the shared root, logs and state
     selected = select_stages(a)
     redo = []
@@ -1994,8 +2420,17 @@ def main(argv=None):
         if f not in STAGES:
             raise SystemExit(f'--force: unknown stage {f!r}')
         redo += [s for s in STAGES[STAGES.index(f):] if s not in redo]
+    paper = a.preset == 'paper'
 
     if a.dry_run:                                       # describe only: nothing is created or deleted
+        if paper:
+            print(f'paper protocol: {len(plans)} runs, in this order (root={p.root}):')
+            for i, (sub, sp) in enumerate(plans, 1):
+                state = 'finished' if model_finished(sp) else ('started' if sp.run_inputs.exists() else 'to do')
+                extra = ' + unseen wordings' if sub.paraphrase_eval else ''
+                print(f'  {i:2d}. {sub.run_name:<36} {sub.label} [{sub.kind}, seed {sub.seed}{extra}] - {state}')
+            print('then: explanation maps (GPU, minutes) and paper_analysis.py (all tables and figures) -> '
+                  f'{p.paper}')
         for i, (sub, sp) in enumerate(plans):
             print(f'preset={a.preset} run={sub.run_name} model={sub.variant} root={sp.root}')
             if i < len(plans) - 1 and not redo and model_finished(sp) and selected[-1] == STAGES[-1]:
@@ -2034,9 +2469,10 @@ def main(argv=None):
             pass
     rc = 1
     try:
+        failed = []
         for i, (sub, sp) in enumerate(plans):
             if len(plans) > 1:
-                log(f'##### model {i + 1} of {len(plans)}: {sub.variant} (run {sub.run_name})')
+                log(f'##### run {i + 1} of {len(plans)}: {sub.label} (run {sub.run_name})')
             stages = selected
             if i < len(plans) - 1 and not redo and model_finished(sp) and selected[-1] == STAGES[-1]:
                 # Trained, predicted and evaluated: only its summary is redone (which also checks that the
@@ -2045,10 +2481,24 @@ def main(argv=None):
                 log(f'{sub.run_name} has already finished (trained, predicted and evaluated): only its summary is redone')
                 stages = ['summary']
             # data stages are redone (--force) once; run stages for every model
-            rc = _drive(sub, sp, stages, redo if i == 0 else [s for s in redo if s in RUN_SCOPED])
-            if rc != 0:
-                break
-        if rc == 0 and len(plans) > 1 and all(model_finished(sp) for _, sp in plans):   # not after partial runs
+            rc_run = _drive(sub, sp, stages, redo if i == 0 else [s for s in redo if s in RUN_SCOPED])
+            if rc_run == 0:
+                continue
+            failed.append(sub.run_name)
+            if paper and getattr(sub, 'failed_stage', None) in RUN_OWN_FAILURES:
+                # Only this run is affected (e.g. a comparison method's download failed): the protocol goes on
+                # with the next run, and this one is retried when the same command is submitted again.
+                log(f'!! run {sub.run_name} failed (stage {getattr(sub, "failed_stage", None)}); continuing with the next run of the '
+                    f'protocol. It is retried, from where it stopped, when the same command is submitted again.')
+                continue
+            break
+        rc = 1 if failed else 0
+        if paper and selected[-1] == STAGES[-1] and data_prepared(p):
+            rc = max(rc, paper_outputs(a, plans))
+            if failed:
+                log(f'!! {len(failed)} run(s) did not finish in this job: {failed}. Submit the same command again '
+                    f'(finished runs are not repeated).')
+        elif rc == 0 and len(plans) > 1 and all(model_finished(sp) for _, sp in plans):   # not after partial runs
             try:
                 write_comparison(a, plans)
             except Exception as e:                              # noqa: BLE001
@@ -2067,6 +2517,49 @@ def main(argv=None):
     return rc
 
 
+# Failures that concern one run only (its own training, prediction, evaluation or summary, or a duplicate
+# submission of it). Anything else - preflight, locks, the shared data, the advanced-model check - stops the job.
+RUN_OWN_FAILURES = RUN_SCOPED | {'summary', 'duplicate'}
+
+
+def data_prepared(p):
+    return all(p.marker(s).exists() for s in STAGES[1:STAGES.index('train')] if s not in ALWAYS_RUN)
+
+
+def paper_outputs(a, plans):
+    """After the runs of a paper-protocol job: the explanation maps (GPU, minutes; once per checkpoint) and
+    paper_analysis.py, which rewrites every table and figure from whatever has finished so far. Neither can
+    damage a run; a failure is reported (exit code 1) and the step is simply redone by the next job."""
+    p = plans[0][1]
+    rc = 0
+    by_name = {sub.run_name: (sub, sp) for sub, sp in plans}
+    prefix = a.run_name if a.run_name_given else 'paper'
+    for key in (f'baseline_s{protocol.MAIN_SEED}', f'advanced_s{protocol.MAIN_SEED}'):
+        sub, sp = by_name.get(f'{prefix}_{key}', (None, None))
+        if sp is None or not model_finished(sp) or not (sp.run / 'best_model.pth').exists():
+            continue
+        out = p.paper / 'explanations' / key
+        try:
+            checkpoint = sp.run / 'best_model.pth'
+            done = out / 'done.json'
+            if done.exists() and json.loads(done.read_text()).get('checkpoint_sha') == file_sha(checkpoint):
+                continue
+            run([sys.executable, 'paper_explain.py', '--checkpoint', checkpoint, '--triplets', sp.triplet_csv('test'),
+                 '--metadata', sp.metadata, '--frames', sp.frames, '--annotations', sp.parsed, '--output', out,
+                 '--checkpoint-sha', file_sha(checkpoint)], a, p, f'paper_explain_{key}')
+        except Exception as e:                              # noqa: BLE001
+            rc = 1
+            log(f'!! explanation maps for {key} failed ({e}); the analysis continues without them')
+    try:
+        run([sys.executable, 'paper_analysis.py', '--root', p.root, '--prefix', prefix, '--output', p.paper,
+             '--sample-fps', a.sample_fps], a, p, 'paper_analysis')
+        log(f'PAPER: all tables and figures are in {p.paper} (start with PAPER_RESULTS.md)')
+    except Exception as e:                                  # noqa: BLE001
+        rc = 1
+        log(f'!! paper_analysis.py failed ({e}); the runs themselves are intact - the next job redoes the analysis')
+    return rc
+
+
 STOP_SIGNALS = tuple(s for s in (getattr(signal, 'SIGTERM', None), getattr(signal, 'SIGHUP', None)) if s)
 
 
@@ -2077,6 +2570,17 @@ def _on_sigterm(signum, frame):
 
 
 def _drive(a, p, selected, redo):
+    """Run the selected stages for one run. Returns 0 or 1; on failure `a.failed_stage` names where it
+    failed (a stage, or 'preflight' / 'locks' / 'force' / 'data' / 'duplicate'), so that the paper protocol
+    can tell a failure of this run alone (continue with the next run) from one that affects every run."""
+    a.failed_stage = None
+    try:
+        return _drive_stages(a, p, selected, redo)
+    finally:
+        p.log_scope = None
+
+
+def _drive_stages(a, p, selected, redo):
     log(f'preset={a.preset} run={a.run_name} root={p.root}')
     log('stages: ' + ' -> '.join(selected))
     why_not = locks_work(p.state)
@@ -2084,6 +2588,7 @@ def _drive(a, p, selected, redo):
         log(f'!! {why_not}, so the pipeline cannot stop two jobs from using this --root at the same time.\n'
             f'   Run only one job at a time on this --root (the normal way to use it) and add --single-job\n'
             f'   (or export LGEL_SINGLE_JOB=1) to the command, then submit it again.')
+        a.failed_stage = 'locks'
         return 1
     FileLock.disabled = bool(why_not)
     if why_not:
@@ -2096,15 +2601,18 @@ def _drive(a, p, selected, redo):
                 got = prep_lock.acquire(blocking=False)
             except OSError as e:
                 log(f'!! could not lock {p.prep_lock} ({e}); resubmit the job.')
+                a.failed_stage = 'locks'
                 return 1
             if not got:
                 log('!! another job is preparing data in this --root right now; --force of data stages has to wait '
                     'until it has finished.')
+                a.failed_stage = 'force'
                 return 1
             busy = busy_runs(p)
             if busy:
                 log(f'!! run(s) {busy} are using the data of this --root right now; --force of data stages would '
                     f'change it under them. Wait until they have finished.')
+                a.failed_stage = 'force'
                 return 1
             log(f'--force: data stages {shared} will be redone. Runs trained on the previous data cannot be '
                 f'continued or evaluated afterwards (they are refused); start new runs instead.')
@@ -2114,11 +2622,13 @@ def _drive(a, p, selected, redo):
         duplicate = any(s in RUN_SCOPED for s in selected) and not run_lock.acquire(blocking=False)
     except OSError as e:
         log(f'!! could not lock {p.run_lock} ({e}); resubmit the job, or use --single-job if this keeps happening.')
+        a.failed_stage = 'locks'
         return 1
     if duplicate:
         # Refuse a duplicate submission at once, before it waits for or touches anything.
         log(f'!! run "{a.run_name}" is already being processed by another job on this --root. Let that job '
             f'finish (then resubmit if needed), or use a different --run-name.')
+        a.failed_stage = 'duplicate'
         return 1
 
     # Preflight runs first, before anything expensive, and catches the avoidable failures.
@@ -2127,6 +2637,7 @@ def _drive(a, p, selected, redo):
         stage_preflight(a, p, selected)
     except StageError as e:
         log(f'!! {e}')
+        a.failed_stage = 'preflight'
         return 1
     funcs = dict(fetch_models=stage_fetch_models, fetch_weights=stage_fetch_weights,
                  check_advanced=stage_check_advanced, fetch_data=stage_fetch_data,
@@ -2150,6 +2661,7 @@ def _drive(a, p, selected, redo):
                 prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
             except OSError as e:
                 log(f'!! could not lock {p.prep_lock} ({e}); resubmit the job, or use --single-job if this keeps happening.')
+                a.failed_stage = 'locks'
                 return 1
             unfinished = [s for s in STAGES[1:STAGES.index('train')]
                           if s not in ALWAYS_RUN and not p.marker(s).exists()]
@@ -2157,6 +2669,7 @@ def _drive(a, p, selected, redo):
             if unfinished:
                 log(f'!! the prepared data is incomplete: data stage(s) {unfinished} have not finished. Run the full '
                     f'command (without --stages / --from-stage) so the data is prepared first.')
+                a.failed_stage = 'data'
                 return 1
         elif stage not in ALWAYS_RUN and not marker.exists():
             # One job prepares the shared data; a second job started at the same time waits here and
@@ -2165,29 +2678,37 @@ def _drive(a, p, selected, redo):
                 prep_lock.acquire(blocking=True, waiting_for='preparing the shared data')
             except OSError as e:
                 log(f'!! could not lock {p.prep_lock} ({e}); resubmit the job, or use --single-job if this keeps happening.')
+                a.failed_stage = 'locks'
                 return 1
         if stage not in ALWAYS_RUN and marker.exists():
             old = json.loads(marker.read_text())
             if old.get('signature') != sig and stage != 'train':
                 log(f'!! stage "{stage}" was already finished with different settings {old.get("signature")} '
                     f'(now {sig}). Use a fresh --root, or --force {stage} to redo it and every later stage.')
+                a.failed_stage = stage
                 return 1
             if stage != 'train':
                 log(f'== {stage}: already done, skipping')
                 continue
         log(f'== {stage}: starting')
         t0 = time.time()
+        # The step logs of a run's own stages go to logs/<run>/ (the data stages' to logs/).
+        p.log_scope = a.run_name if stage in RUN_SCOPED or stage == 'summary' else None
         try:
             funcs[stage](a, p)
         except StageError as e:
             log(f'!! stage {stage} FAILED: {e}')
             log('   Fix the cause and run the same command again: finished stages are skipped and '
                 'training resumes from its last finished epoch.')
+            a.failed_stage = stage
             return 1
         except Exception as e:                                  # noqa: BLE001
             import traceback
             log(f'!! stage {stage} crashed: {e!r}\n{traceback.format_exc()}')
+            a.failed_stage = stage
             return 1
+        finally:
+            p.log_scope = None
         if stage not in ALWAYS_RUN:
             write_json(marker, dict(signature=sig, finished=time.ctime(), seconds=round(time.time() - t0)))
         log(f'== {stage}: finished in {(time.time() - t0) / 60:.1f} min')

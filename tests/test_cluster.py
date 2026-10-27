@@ -57,7 +57,7 @@ def test_best_checkpoint_is_exported_without_optimizer_state(tmp_path):
 
 def _stub_bin(tmp_path, squeue_output=''):
     stub = tmp_path / 'bin'
-    stub.mkdir()
+    stub.mkdir(exist_ok=True)
     (stub / 'sbatch').write_text('#!/bin/bash\necho "$@" >> "$STUB_LOG"\necho "$((1000 + $(wc -l < "$STUB_LOG")))"\n')
     (stub / 'squeue').write_text(f'#!/bin/bash\nprintf "%s" "{squeue_output}"\n')
     for f in stub.iterdir():
@@ -129,3 +129,32 @@ def test_job_script_runs_the_pipeline_with_the_cluster_settings(tmp_path):
     assert f'root={base / "lgel_smoke"}' in out.stdout
     for d in ('conda/envs', 'conda/pkgs', 'conda/pip-cache', 'tmp'):
         assert (base / d).is_dir()                                     # env and caches kept off $HOME
+
+
+@posix_only
+def test_paper_submission_uses_its_own_folder_and_reuses_the_earlier_inputs(tmp_path):
+    base = tmp_path / 'base'
+    old = base / 'lgel'
+    (old / 'state').mkdir(parents=True)
+    (old / 'raw' / 'extracted').mkdir(parents=True)
+    (old / 'state' / 'fetch_data.done.json').write_text('{}')
+    weights = base / 'm2crl weights.pth'
+    weights.write_bytes(b'w')
+    (old / 'state' / 'weights_ref.json').write_text(json.dumps(dict(path=str(weights), random_init=False), indent=2,
+                                                                 sort_keys=True))
+    out, calls = _submit(tmp_path, 'paper', '--repeat', '3')
+    assert out.returncode == 0, out.stderr
+    assert len(calls) == 3 and all(f'LGEL_ROOT={base}/lgel_paper' in c and 'LGEL_PRESET=paper' in c for c in calls)
+    assert all('--time=3-00:00:00' in c for c in calls)
+    assert all(c.endswith(f'hpc/lgel.sbatch --data-dir {old}/raw/extracted --weights-path {weights}') for c in calls)
+    assert 'no new download' in out.stdout and 'M2CRL weights of the earlier runs' in out.stdout
+    # once the paper folder has its own data and weights, or other inputs are named, nothing is added
+    (base / 'lgel_paper' / 'state').mkdir(parents=True)
+    (base / 'lgel_paper' / 'state' / 'fetch_data.done.json').write_text('{}')
+    (base / 'lgel_paper' / 'state' / 'fetch_weights.done.json').write_text('{}')
+    out, calls = _submit(tmp_path, 'paper')
+    assert out.returncode == 0 and calls[0].endswith('hpc/lgel.sbatch')
+    import shutil
+    shutil.rmtree(base / 'lgel_paper' / 'state')
+    out, calls = _submit(tmp_path, 'paper', '--weights-path', '/x/w.pth', '--data-dir', '/x/d')
+    assert calls[0].endswith('hpc/lgel.sbatch --weights-path /x/w.pth --data-dir /x/d')
