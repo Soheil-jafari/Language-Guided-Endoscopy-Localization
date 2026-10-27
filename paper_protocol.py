@@ -45,11 +45,14 @@ ADVANCED = merge_flags(*(flags for _, flags in ADDONS.values()))
 COMPARISONS = {
     # General-domain image-text model, no training: lower bound.
     'clip_zeroshot': dict(label='CLIP zero-shot', model='openai/clip-vit-base-patch32'),
-    # Surgical video-language model (CAMMA, NeurIPS 2024), no training. Weights: public direct link.
-    'peskavlp_zeroshot': dict(label='PeskaVLP zero-shot'),
+    # The three surgical video-language models of CAMMA (Yuan et al.: SurgVLP, HecVL, PeskaVLP; one code base,
+    # public weights), no training.
+    'surgvlp_zeroshot': dict(label='SurgVLP zero-shot', model='SurgVLP'),
+    'hecvl_zeroshot': dict(label='HecVL zero-shot', model='HecVL'),
+    'peskavlp_zeroshot': dict(label='PeskaVLP zero-shot', model='PeskaVLP'),
     # The same surgical model fine-tuned on our training videos (image encoder trained, text encoder
     # frozen, frame-wise binary objective, best epoch chosen on validation).
-    'peskavlp_finetune': dict(label='PeskaVLP fine-tuned', epochs=5, lr=1e-5, batch_size=64),
+    'peskavlp_finetune': dict(label='PeskaVLP fine-tuned', model='PeskaVLP', epochs=5, lr=1e-5, batch_size=64),
     # General video-language model fine-tuned on our training videos (multi-positive contrastive).
     'xclip_finetune': dict(label='X-CLIP fine-tuned', model='microsoft/xclip-base-patch32', epochs=5,
                            batch_size=8, lr=1e-5),
@@ -57,18 +60,36 @@ COMPARISONS = {
     # pretrained M2CRL video features our model starts from (feature-matched comparison).
     'univtg': dict(label='UniVTG (M2CRL features)', clip_length=4, epochs=200, eval_every=5, batch_size=8,
                    lr=1e-4),
+    # A specialised Cholec80 model: TeCNO (Czempiel et al., MICCAI 2020), re-implemented from the paper and
+    # the authors' configuration (their code is GPL-3.0 and needs a 2020 software stack; details in
+    # comparison_models/tecno/tecno.py). Stage 1: ImageNet ResNet-50, phase (weighted cross-entropy) + tool
+    # (BCE) heads; stage 2: causal multi-stage TCN on its features. Batch 80: their configuration asks for
+    # 1000, which their code caps at 80. TeCNO's own split is the same 40/8/32 split, so its published
+    # numbers are comparable.
+    'tecno': dict(label='TeCNO (re-implementation)', cnn_epochs=15, cnn_min_epochs=6, cnn_lr=5e-4,
+                  cnn_batch_size=80, input_size=224, tcn_epochs=16, tcn_min_epochs=12, tcn_lr=7e-5, patience=3),
+    # Our model without language: the same pretrained M2CRL backbone and temporal head, with a fixed output
+    # per concept instead of the text query (a closed-set multi-label classifier). Same optimiser,
+    # learning rate, schedule, epochs and model selection as ours; batch 8 x 2 so that an epoch has about as
+    # many optimiser steps as ours (each window carries all 14 concepts instead of one).
+    'closedset': dict(label='Our backbone without language (closed-set)', batch_size=8, accum=2),
 }
 
-PESKAVLP = dict(
+# The surgical video-language models: one package (SurgVLP, fixed commit), three public weight files.
+SURGVLP = dict(
     repository='https://github.com/CAMMA-public/SurgVLP.git',
     commit='85e858998eec47614614b89f6af1363e0ad3f47b',     # pinned (also in comparison_models/peskavlp/setup_env.sh)
-    weights_url='https://seafile.unistra.fr/f/65a2b1bf113e428280d0/?dl=1',   # public link of the official weights
+    weights_urls={                                       # the package's own public links (surgvlp._MODELS)
+        'SurgVLP': 'https://seafile.unistra.fr/f/93757ace1bfc47248e1e/?dl=1',
+        'HecVL': 'https://seafile.unistra.fr/f/3b9b9207068a4b03bc2a/?dl=1',
+        'PeskaVLP': 'https://seafile.unistra.fr/f/65a2b1bf113e428280d0/?dl=1',
+    },
     licence='CC BY-NC-SA 4.0 (research use)',
 )
 
-# The authors' own Cholec80 phase prompts (SurgVLP repository, tests/class_prompt.txt at the pinned commit),
-# in the order of data_contract.PHASES. Used once more for PeskaVLP zero-shot, so that its phase recognition
-# can be checked against the numbers the authors report with exactly these prompts.
+# The authors' own Cholec80 phase prompts (SurgVLP repository, tests/class_prompt.txt at the pinned commit; the
+# same file for all three models), in the order of data_contract.PHASES. Used once more for each zero-shot
+# model, so that its phase recognition can be checked against the numbers the authors report with them.
 PESKAVLP_PHASE_PROMPTS = (
     'In preparation phase I insert trocars to patient abdomen cavity',
     'In calot triangle dissection phase I use grasper to hold gallbladder and use hook to expose the hepatic '
@@ -96,6 +117,12 @@ def tool_queries():
     return canonical_queries()[7:]
 
 
+ZERO_SHOT = ('clip_zeroshot', 'surgvlp_zeroshot', 'hecvl_zeroshot', 'peskavlp_zeroshot')
+TRAINED = ('xclip_finetune', 'peskavlp_finetune', 'univtg', 'tecno', 'closedset')
+CLOSED_SET = ('tecno', 'closedset')                     # a fixed output per concept, no text input
+SURGVLP_ZERO_SHOT = ('surgvlp_zeroshot', 'hecvl_zeroshot', 'peskavlp_zeroshot')
+
+
 def plans(prefix='paper'):
     """Every run of the paper protocol, in order. Keys: name, kind, flags, seed, paraphrases, group, label."""
     out = []
@@ -106,10 +133,11 @@ def plans(prefix='paper'):
 
     add(f'baseline_s{MAIN_SEED}', 'proposed', 'main', 'Baseline (ours)')
     add(f'advanced_s{MAIN_SEED}', 'proposed', 'main', 'Advanced (ours)', flags=ADVANCED)
-    for key in ('clip_zeroshot', 'peskavlp_zeroshot'):
+    for key in ZERO_SHOT:
         add(key, key, 'comparison', COMPARISONS[key]['label'])
-    for key in ('xclip_finetune', 'peskavlp_finetune', 'univtg'):
-        add(f'{key}_s{MAIN_SEED}', key, 'comparison', COMPARISONS[key]['label'])
+    for key in TRAINED:
+        # Models without a text input cannot be asked in other words: no unseen-wording test for them.
+        add(f'{key}_s{MAIN_SEED}', key, 'comparison', COMPARISONS[key]['label'], paraphrases=key not in CLOSED_SET)
     for key, (label, flags) in ADDONS.items():
         add(f'ablation_{key}_s{MAIN_SEED}', 'proposed', 'ablation', f'Baseline + {label}', flags=flags,
             paraphrases=False)

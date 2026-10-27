@@ -2,7 +2,7 @@
 
 It is put on PYTHONPATH by that test and does nothing unless LGEL_E2E_TINY=1. It shrinks the model so that
 the whole protocol runs on a CPU in minutes - 32-pixel crops, 4-frame clips, a 1-block backbone (still
-768-d), a smaller PeskaVLP fine-tuning batch (RAM) - and replaces the two GPU-only/network-only parts: the optical-flow network (zero flow) and the
+768-d), a smaller PeskaVLP fine-tuning batch (RAM), TeCNO on 32-pixel frames for two epochs per stage - and replaces the two GPU-only/network-only parts: the optical-flow network (zero flow) and the
 compiled Mamba kernels (mamba_ssm stub in this folder). Everything else is the real code. With the file
 named by LGEL_E2E_FAIL_UNIVTG present, the official UniVTG model refuses to import (an injected failure of
 one run, to test that the protocol continues and retries it).
@@ -41,6 +41,8 @@ if os.environ.get('LGEL_E2E_TINY') == '1':
 
     def _protocol(module):
         module.COMPARISONS['peskavlp_finetune']['batch_size'] = 8      # ResNet-50 training on a small CPU machine
+        module.COMPARISONS['tecno'].update(input_size=32, cnn_batch_size=8, cnn_epochs=2, cnn_min_epochs=1,
+                                           tcn_epochs=2, tcn_min_epochs=1)
 
     PATCHES = {'project_config': _config, 'models': _models, 'torchvision.models.optical_flow': _flow,
                'model.univtg': _univtg, 'paper_protocol': _protocol}

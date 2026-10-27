@@ -330,39 +330,46 @@ class TemporalHeadSSM(nn.Module):
             return logits
 
 
+def build_vision_backbone(config, initialize_backbone=True):
+    """The video backbone (M2CRL TimeSformer), with the pretrained weights when initialize_backbone. Shared by
+    our model and its closed-set comparison (comparison_models/closedset), so both start from the same network."""
+    if config.MODEL.VISION_BACKBONE_NAME == 'M2CRL':
+        print("Initializing Vision Backbone: M2CRL (TimeSformer)")
+        backbone = VisionTransformer(
+            img_size=config.DATA.TRAIN_CROP_SIZE, patch_size=16, in_chans=3,
+            num_classes=0, embed_dim=768, depth=12, num_heads=12,
+            mlp_ratio=4., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            num_frames=config.DATA.NUM_FRAMES,
+            attention_type=config.TIMESFORMER.ATTENTION_TYPE,
+            use_checkpoint=getattr(config.TRAIN, "USE_GRADIENT_CHECKPOINTING", False)
+        )
+        if initialize_backbone and config.MODEL.M2CRL_WEIGHTS_PATH:
+            if not os.path.isfile(config.MODEL.M2CRL_WEIGHTS_PATH):
+                raise FileNotFoundError(config.MODEL.M2CRL_WEIGHTS_PATH)
+            load_pretrained(
+                backbone, cfg=_cfg(), num_classes=0,
+                img_size=config.DATA.TRAIN_CROP_SIZE,
+                num_frames=config.DATA.NUM_FRAMES,
+                num_patches=backbone.patch_embed.num_patches,
+                attention_type=config.TIMESFORMER.ATTENTION_TYPE,
+                pretrained_model=config.MODEL.M2CRL_WEIGHTS_PATH,
+                allow_missing=tuple(getattr(config.MODEL, 'BACKBONE_ALLOW_MISSING_KEYS', ()) or ()),
+                ignore_unexpected_prefixes=tuple(getattr(config.MODEL, 'BACKBONE_IGNORE_UNEXPECTED_PREFIXES', ('head.',)) or ()),
+            )
+            print(f"Loaded pretrained M2CRL weights from {config.MODEL.M2CRL_WEIGHTS_PATH}")
+    elif config.MODEL.VISION_BACKBONE_NAME == 'EndoMamba':
+        raise NotImplementedError('EndoMamba is not integrated. The former branch constructed a TimeSformer. An official checkpoint-compatible implementation is required.')
+    else:
+        raise ValueError(f"Unknown VISION_BACKBONE_NAME: {config.MODEL.VISION_BACKBONE_NAME}")
+    return backbone
+
+
 class LocalizationFramework(nn.Module):
     def __init__(self, config, initialize_backbone=True):
         super().__init__()
         self.config = config
 
-        if config.MODEL.VISION_BACKBONE_NAME == 'M2CRL':
-            print("Initializing Vision Backbone: M2CRL (TimeSformer)")
-            self.vision_backbone = VisionTransformer(
-                img_size=config.DATA.TRAIN_CROP_SIZE, patch_size=16, in_chans=3,
-                num_classes=0, embed_dim=768, depth=12, num_heads=12,
-                mlp_ratio=4., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                num_frames=config.DATA.NUM_FRAMES,
-                attention_type=config.TIMESFORMER.ATTENTION_TYPE,
-                use_checkpoint=getattr(config.TRAIN, "USE_GRADIENT_CHECKPOINTING", False)
-            )
-            if initialize_backbone and config.MODEL.M2CRL_WEIGHTS_PATH:
-                if not os.path.isfile(config.MODEL.M2CRL_WEIGHTS_PATH):
-                    raise FileNotFoundError(config.MODEL.M2CRL_WEIGHTS_PATH)
-                load_pretrained(
-                    self.vision_backbone, cfg=_cfg(), num_classes=0,
-                    img_size=config.DATA.TRAIN_CROP_SIZE,
-                    num_frames=config.DATA.NUM_FRAMES,
-                    num_patches=self.vision_backbone.patch_embed.num_patches,
-                    attention_type=config.TIMESFORMER.ATTENTION_TYPE,
-                    pretrained_model=config.MODEL.M2CRL_WEIGHTS_PATH,
-                    allow_missing=tuple(getattr(config.MODEL, 'BACKBONE_ALLOW_MISSING_KEYS', ()) or ()),
-                    ignore_unexpected_prefixes=tuple(getattr(config.MODEL, 'BACKBONE_IGNORE_UNEXPECTED_PREFIXES', ('head.',)) or ()),
-                )
-                print(f"Loaded pretrained M2CRL weights from {config.MODEL.M2CRL_WEIGHTS_PATH}")
-        elif config.MODEL.VISION_BACKBONE_NAME == 'EndoMamba':
-            raise NotImplementedError('EndoMamba is not integrated. The former branch constructed a TimeSformer. An official checkpoint-compatible implementation is required.')
-        else:
-            raise ValueError(f"Unknown VISION_BACKBONE_NAME: {config.MODEL.VISION_BACKBONE_NAME}")
+        self.vision_backbone = build_vision_backbone(config, initialize_backbone)
 
         if getattr(config.TRAIN, "USE_LORA_BACKBONE", False):
             # Wrap only attention (qkv/proj) + MLP (fc1/fc2) linear layers

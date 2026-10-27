@@ -1,7 +1,7 @@
-"""Shared plumbing for the frame-level comparison models (CLIP, PeskaVLP).
+"""Shared plumbing for the frame-level comparison models (CLIP, SurgVLP/HecVL/PeskaVLP, TeCNO, closed set).
 
 `work-order`: list the sampled frames (1 fps grid, same frames as our model) and the query sentences of a
-    split manifest, as a JSON file a scorer can read without this repository (PeskaVLP runs in its own
+    split manifest, as a JSON file a scorer can read without this repository (the SurgVLP models run in their own
     Python environment). With --labels it also writes the per-frame labels of all 14 concepts (for
     fine-tuning): -100 = not observed, 0/1 otherwise.
 `assemble`: turn a scorer's score matrix (frames x query sentences) into the standard prediction CSV

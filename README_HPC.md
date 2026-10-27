@@ -92,18 +92,20 @@ bash code/hpc/submit.sh paper --repeat 6
 
 This runs the complete experimental protocol of `paper_protocol.py` in its own folder,
 `/mnt/scratch/users/daiz1/soheil/lgel_paper/`, on the **standard Cholec80 split** (videos 1-40 train,
-41-48 validation, 49-80 test; `protocol/cholec80_split_40_8_32.json`). Fifteen runs, in this order:
+41-48 validation, 49-80 test; `protocol/cholec80_split_40_8_32.json`). Nineteen runs, in this order:
 
 | # | runs | what |
 |---|---|---|
 | 1-2 | `paper_baseline_s42`, `paper_advanced_s42` | our two models (10 epochs each) |
-| 3-7 | `paper_clip_zeroshot`, `paper_peskavlp_zeroshot`, `paper_xclip_finetune_s42`, `paper_peskavlp_finetune_s42`, `paper_univtg_s42` | the comparison methods |
-| 8-11 | `paper_ablation_{mamba,bilevel,uncertainty,fusion}_s42` | the baseline plus one add-on each |
-| 12-15 | `paper_{baseline,advanced}_s{43,44}` | two more training seeds of both models |
+| 3-6 | `paper_clip_zeroshot`, `paper_surgvlp_zeroshot`, `paper_hecvl_zeroshot`, `paper_peskavlp_zeroshot` | comparison methods without training |
+| 7-11 | `paper_xclip_finetune_s42`, `paper_peskavlp_finetune_s42`, `paper_univtg_s42`, `paper_tecno_s42`, `paper_closedset_s42` | trained comparison methods (TeCNO: a specialised Cholec80 phase model; closed set: our backbone and temporal head without language) |
+| 12-15 | `paper_ablation_{mamba,bilevel,uncertainty,fusion}_s42` | the baseline plus one add-on each |
+| 16-19 | `paper_{baseline,advanced}_s{43,44}` | two more training seeds of both models |
 
 Every run is evaluated on the same test frames with its own threshold chosen on the validation
 videos; the main, comparison and seed runs are also evaluated with two sets of query wordings never
-seen in training (`protocol/paraphrases.json`). At the end of every job, `paper_analysis.py` (CPU,
+seen in training (`protocol/paraphrases.json`; not TeCNO and the closed-set model, which have no text
+input). At the end of every job, `paper_analysis.py` (CPU,
 minutes) rewrites all tables and figures from whatever has finished:
 `lgel_paper/paper/PAPER_RESULTS.md`, `paper/tables/*.csv|.tex`, `paper/figures/*.png|.pdf`,
 `paper/explanations/` (patch-relevance maps of our two models), `paper/analysis.json`. The report
@@ -112,7 +114,8 @@ bundle in `lgel_paper/outbox/` includes them.
 * **Nothing is downloaded twice.** The first job reuses the Cholec80 videos already unpacked in
   `lgel/raw/extracted` and the M2CRL weights file the earlier runs used (`submit.sh` prints both); the
   frames are extracted again for the new folder (a few hours). The earlier `lgel/` runs are not touched.
-* **Time:** about 11-12 days of GPU time in total, dominated by the nine trainings of our model.
+* **Time:** about 12 days of GPU time in total, dominated by the nine trainings of our model (TeCNO,
+  the closed-set model and the SurgVLP/HecVL scoring add a few hours).
   Each job runs up to 72 h and the next one continues where it stopped, so `--repeat 6` queues enough
   jobs; a job that starts when everything is already finished only redoes the summaries and the
   analysis (about 20 minutes).
@@ -122,11 +125,12 @@ bundle in `lgel_paper/outbox/` includes them.
   check) stops the job at once, as before.
 * **Internet (first job):** besides what the earlier runs needed, the comparison methods fetch
   `openai/clip-vit-base-patch32`, `microsoft/xclip-base-patch32` and `emilyalsentzer/Bio_ClinicalBERT`
-  from Hugging Face, the official SurgVLP/PeskaVLP code from GitHub (fixed commit) and the public
-  PeskaVLP weights from `seafile.unistra.fr`. PeskaVLP needs older library versions, so it gets its own
+  from Hugging Face, the official SurgVLP code from GitHub (fixed commit), the public SurgVLP, HecVL and
+  PeskaVLP weights from `seafile.unistra.fr`, and torchvision's ImageNet ResNet-50 weights (for TeCNO)
+  from `download.pytorch.org`. The SurgVLP code needs older library versions, so it gets its own
   environment next to the main one (`conda/envs/lgel-peskavlp`, about 6 GB, created automatically).
-  The PeskaVLP weights are licensed CC BY-NC-SA 4.0 (research use only).
-* **Space:** about 100 GB more under `lgel_paper/` (frames, checkpoints, predictions).
+  The SurgVLP/HecVL/PeskaVLP weights are licensed CC BY-NC-SA 4.0 (research use only).
+* **Space:** about 110 GB more under `lgel_paper/` (frames, checkpoints, predictions, TeCNO features).
 
 The rest of this guide explains the pipeline in general and applies to any cluster.
 

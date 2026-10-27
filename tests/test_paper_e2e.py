@@ -1,13 +1,14 @@
-"""The whole paper protocol, end to end, on synthetic videos and on a CPU (about half an hour):
+"""The whole paper protocol, end to end, on synthetic videos and on a CPU (about 45 minutes):
 
     LGEL_PAPER_E2E=1 LGEL_PESKAVLP_PYTHON=/path/to/envs/lgel-peskavlp/bin/python \
         python -m pytest tests/test_paper_e2e.py -s
 
 Real code everywhere (main.py and every stage, train.py, predict.py, evaluate.py, the comparison runners -
-CLIP, X-CLIP, the official SurgVLP/PeskaVLP code in its own environment, the official UniVTG model -, the
-analysis and the report), with three test-only substitutions made by tests/e2e_hook: a smaller backbone and
-crop (so a CPU can train it), zero optical flow and a Mamba stand-in (both need a GPU or the network); and
-tiny stand-ins for the Hugging Face models under their real names in the job's own model cache, because this
+CLIP, X-CLIP, the official SurgVLP code (SurgVLP, HecVL, PeskaVLP) in its own environment, the official UniVTG
+model, TeCNO, the closed-set model -, the analysis and the report), with three test-only substitutions made by
+tests/e2e_hook: a smaller backbone and crop (so a CPU can train it), zero optical flow and a Mamba stand-in
+(both need a GPU or the network); and stand-ins for the downloaded models (random weights of the real
+architectures; tiny Hugging Face models under their real names in the job's own model cache), because this
 machine has no internet (the job runs with --offline).
 
 The test stops a job in the middle (as the time limit would), injects a failure into one run, and checks
@@ -97,6 +98,13 @@ def test_the_paper_protocol_end_to_end(tmp_path):
     subprocess.run([PESKA, '-c', BERT_AND_WEIGHTS, hf, download, REPO / 'comparison_models' / 'peskavlp'],
                    env=dict(clean, HF_HOME=str(hf), HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1'), check=True)
     (download.parent / f'{download.name}.complete').write_text(json.dumps(dict(size=download.stat().st_size)))
+    import zipfile
+    for model in ('SurgVLP', 'HecVL'):                  # same architecture: the same random state dict, own download
+        other = root / 'comparisons' / model.lower() / f'{model}.download'
+        other.parent.mkdir(parents=True)
+        with zipfile.ZipFile(other, 'w') as z:
+            z.write(download.parent / 'PeskaVLP.pth', f'{model}.pth')
+        (other.parent / f'{other.name}.complete').write_text(json.dumps(dict(size=other.stat().st_size)))
     (tmp_path / 'split.json').write_text(json.dumps(dict(
         train=[f'CHOLEC80__video0{i}' for i in (1, 2, 3, 4)], val=['CHOLEC80__video05', 'CHOLEC80__video06'],
         test=['CHOLEC80__video07', 'CHOLEC80__video08'])))
@@ -104,6 +112,10 @@ def test_the_paper_protocol_end_to_end(tmp_path):
     flow = root / 'torch_cache' / 'hub' / 'checkpoints' / Path(of.Raft_Small_Weights.DEFAULT.url).name
     flow.parent.mkdir(parents=True)
     flow.write_bytes(b'not used: the test hook replaces the flow network')
+    import torch
+    import torchvision
+    torch.save(torchvision.models.resnet50().state_dict(),               # TeCNO's ImageNet start (random here)
+               flow.parent / Path(torchvision.models.ResNet50_Weights.IMAGENET1K_V1.url).name)
     sentinel = tmp_path / 'fail_univtg'
     sentinel.write_text('x')
     env = dict(clean, PYTHONPATH=str(REPO / 'tests' / 'e2e_hook'), LGEL_E2E_TINY='1', LGEL_E2E_FAIL_UNIVTG=str(sentinel),
@@ -138,24 +150,30 @@ def test_the_paper_protocol_end_to_end(tmp_path):
         assert (root / 'runs' / n / 'training_metrics.jsonl').read_text() == content, n
     assert all((root / 'results' / n / 'proposed_test_metrics.json').exists() for n in names)
     text = (paper / 'PAPER_RESULTS.md').read_text()
-    assert 'Runs finished: **15 of 15**' in text
+    assert 'Runs finished: **19 of 19**' in text
     report = json.loads((paper / 'analysis.json').read_text())
-    assert 'figure_error' not in report and len(report['methods']) == 15
-    for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'tool_presence', 'ablations',
-                  'seeds', 'generalisation', 'efficiency'):
+    assert 'figure_error' not in report and len(report['methods']) == 19
+    for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'phase_recognition_relaxed',
+                  'tool_presence', 'ablations', 'seeds', 'generalisation', 'efficiency'):
         assert (paper / 'tables' / f'{table}.tex').exists(), table
     main = pd.read_csv(paper / 'tables' / 'main_results.csv')
-    assert len(main) == 7
+    assert len(main) == 11
     phase = pd.read_csv(paper / 'tables' / 'phase_recognition.csv')
-    assert any("authors' phase prompts" in m for m in phase.Method)
+    assert sum("authors' phase prompts" in m for m in phase.Method) == 3
     seg = pd.read_csv(paper / 'tables' / 'segment_results.csv')
     assert any('own windows' in m for m in seg.Method)
-    assert len(pd.read_csv(paper / 'tables' / 'generalisation.csv')) == 11
+    assert len(pd.read_csv(paper / 'tables' / 'generalisation.csv')) == 13       # every method with a text input
+    eff = pd.read_csv(paper / 'tables' / 'efficiency.csv').set_index('Method')
+    for label in ('TeCNO (re-implementation)', 'Our backbone without language (closed-set)'):
+        assert eff.loc[label, 'Training (h)'] != 'n/a' and eff.loc[label, 'Trainable (M)'] != 'n/a', label
     for key in ('baseline_s42', 'advanced_s42'):
         done = json.loads((paper / 'explanations' / key / 'done.json').read_text())
         assert done['figures'] and (paper / 'explanations' / key / f'explanation_{done["figures"][0]}.png').exists()
     # every run's summary says what it is
     assert 'Method: **UniVTG (M2CRL features)**' in (root / 'results' / 'paper_univtg_s42' / 'SUMMARY.md').read_text()
+    assert 'Method: **TeCNO (re-implementation)**' in (root / 'results' / 'paper_tecno_s42' / 'SUMMARY.md').read_text()
+    assert 'Training (tecno_tcn)' in (root / 'results' / 'paper_tecno_s42' / 'SUMMARY.md').read_text()
+    assert 'Training (closedset)' in (root / 'results' / 'paper_closedset_s42' / 'SUMMARY.md').read_text()
     assert 'Model: **baseline + Mamba temporal head**' in \
         (root / 'results' / 'paper_ablation_mamba_s42' / 'SUMMARY.md').read_text()
     assert 'Unseen query wordings' in (root / 'results' / 'paper_advanced_s43' / 'SUMMARY.md').read_text()

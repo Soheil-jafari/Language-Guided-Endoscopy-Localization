@@ -26,7 +26,7 @@ REPO = Path(pipeline.__file__).resolve().parent
 def test_the_protocol_lists_every_run_once_in_priority_order():
     plans = protocol.plans('paper')
     names = [p['name'] for p in plans]
-    assert len(names) == len(set(names)) == 15
+    assert len(names) == len(set(names)) == 19
     assert names[:2] == ['paper_baseline_s42', 'paper_advanced_s42']           # the main comparison first
     assert names[-4:] == ['paper_baseline_s43', 'paper_advanced_s43', 'paper_baseline_s44', 'paper_advanced_s44']
     assert {p['kind'] for p in plans} - {'proposed'} == set(pipeline.COMPARISON_METHODS) == set(protocol.COMPARISONS)
@@ -41,6 +41,11 @@ def test_the_protocol_lists_every_run_once_in_priority_order():
                    if p['kind'] == 'proposed' and p['group'] in ('main', 'seed'))
     assert [s for s, _ in seeds] == [42, 42, 43, 43, 44, 44]
     assert all(p['seed'] == protocol.MAIN_SEED for p in plans if p['kind'] != 'proposed')
+    comparisons = [p for p in plans if p['group'] == 'comparison']
+    assert [p['kind'] for p in comparisons] == list(protocol.ZERO_SHOT + protocol.TRAINED)
+    # models without a text input are not asked in other words; every other method is
+    assert {p['kind'] for p in comparisons if not p['paraphrases']} == set(protocol.CLOSED_SET) == {'tecno', 'closedset'}
+    assert {protocol.COMPARISONS[k]['model'] for k in protocol.SURGVLP_ZERO_SHOT} == set(protocol.SURGVLP['weights_urls'])
     assert [p['name'] for p in protocol.plans('x')][0] == 'x_baseline_s42'
 
 
@@ -109,7 +114,8 @@ def test_paper_preset_settings_and_runs(tmp_path):
 def test_paper_dry_run_lists_the_protocol(tmp_path, capsys):
     assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path / 'r'), '--dry-run']) == 0
     out = capsys.readouterr().out
-    assert 'paper protocol: 15 runs' in out and 'paper_peskavlp_finetune_s42' in out and 'unseen wordings' in out
+    assert 'paper protocol: 19 runs' in out and 'paper_peskavlp_finetune_s42' in out and 'unseen wordings' in out
+    assert 'paper_tecno_s42' in out and 'paper_closedset_s42' in out and 'paper_hecvl_zeroshot' in out
     assert not (tmp_path / 'r').exists()
 
 
@@ -138,7 +144,7 @@ def test_a_failed_run_stops_the_protocol_only_if_others_are_affected(tmp_path, m
     assert rc == 1
     names = [p['name'] for p in protocol.plans('paper')]
     if continues:
-        assert calls == names and outputs == [15]
+        assert calls == names and outputs == [19]
     else:
         assert calls == names[:names.index('paper_clip_zeroshot') + 1]
 
@@ -259,6 +265,16 @@ def test_peskavlp_archive_is_unpacked_safely(tmp_path):
     pipeline.write_json(target.with_name(target.name + '.complete'), dict(size=target.stat().st_size))
     found = pipeline.peskavlp_weights(a, p)                         # offline: the finished download is reused
     assert found.name == 'PeskaVLP.pth' and found.read_bytes() == b'w'
+    for model in ('SurgVLP', 'HecVL'):                                # each model has its own download
+        with pytest.raises(pipeline.StageError, match=f'--offline: {model}.download'):
+            pipeline.peskavlp_weights(a, p, model)
+        target = p.root / 'comparisons' / model.lower() / f'{model}.download'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b'plain checkpoint')
+        pipeline.write_json(target.with_name(target.name + '.complete'), dict(size=target.stat().st_size))
+        assert pipeline.peskavlp_weights(a, p, model) == target
+    with pytest.raises(pipeline.StageError, match='unknown'):
+        pipeline.peskavlp_weights(a, p, 'CLIP')
     evil = tmp_path / 'e.zip'
     with zipfile.ZipFile(evil, 'w') as z:
         z.writestr('../escape.pth', b'x')
@@ -318,30 +334,54 @@ def test_comparison_methods_are_dispatched_with_their_own_settings(tmp_path, mon
     assert all('--segments' in c for _, c in launched)
 
 
-def test_peskavlp_zero_shot_also_scores_the_authors_phase_prompts(tmp_path, monkeypatch):
+@pytest.mark.parametrize('kind', protocol.SURGVLP_ZERO_SHOT)
+def test_surgical_vlm_zero_shot_also_scores_the_authors_phase_prompts(tmp_path, monkeypatch, kind):
     a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job'])
-    sub = [s for s in pipeline.experiment_plans(a) if s.kind == 'peskavlp_zeroshot'][0]
+    sub = [s for s in pipeline.experiment_plans(a) if s.kind == kind][0]
+    model = protocol.COMPARISONS[kind]['model']
+    tag = model.lower()
     p = pipeline.Paths(tmp_path, sub.run_name)
     launched = _record_runs(monkeypatch)
-    monkeypatch.setattr(pipeline, 'peskavlp_weights', lambda a, p: tmp_path / 'w.pth')
+    asked = []
+    monkeypatch.setattr(pipeline, 'peskavlp_weights', lambda a, p, m='PeskaVLP': asked.append(m) or tmp_path / f'{m}.pth')
     copied = []
     monkeypatch.setattr(pipeline.shutil, 'copy2', lambda src, dst: copied.append(str(dst)))
     p.results.mkdir(parents=True)
-    pipeline.peskavlp_predict(sub, p, pipeline.prediction_sets(sub, p))
-    scored = [n for n, _ in launched if n.startswith('peskavlp_')]
-    assert scored == ['peskavlp_val', 'peskavlp_test', 'peskavlp_test_paraA', 'peskavlp_test_paraB',
-                      'peskavlp_authorprompts_val', 'peskavlp_authorprompts_test']
+    pipeline.COMPARISON_METHODS[kind]['predict'](sub, p, pipeline.prediction_sets(sub, p))
+    assert set(asked) == {model}
+    scored = [n for n, _ in launched if n.startswith(tag + '_')]
+    assert scored == [f'{tag}_val', f'{tag}_test', f'{tag}_test_paraA', f'{tag}_test_paraB',
+                      f'{tag}_authorprompts_val', f'{tag}_authorprompts_test']
+    for n, c in launched:
+        if n.startswith(tag + '_'):
+            assert c[c.index('--model') + 1] == model and c[c.index('--weights') + 1].endswith(f'{model}.pth')
+            assert '--checkpoint' not in c
     prompts = json.loads((p.run / 'work' / 'authorprompts_test.prompts.json').read_text())
     assert prompts == dict(zip(PHRASES[:7], protocol.PESKAVLP_PHASE_PROMPTS))
     assemble = [c for n, c in launched if n == 'assemble_authorprompts_test'][0]
     assert assemble[assemble.index('--output') + 1].endswith('authorprompts_test.csv')    # not a proposed_* file
     assert any(c.endswith('authorprompts_test.csv.manifest.json') for c in copied)
+    # the zero-shot "training": environment and a strict construction with this model's weights
     launched.clear()
+    sub.offline = True
+    (pipeline.peskavlp_prefix(p) / '.lgel_peskavlp_ready').parent.mkdir(parents=True, exist_ok=True)
+    (pipeline.peskavlp_prefix(p) / '.lgel_peskavlp_ready').write_text('ok')
+    pipeline.COMPARISON_METHODS[kind]['train'](sub, p)
+    assert [n for n, _ in launched] == [f'{tag}_check']
+    assert launched[0][1][launched[0][1].index('--model') + 1] == model
+
+
+def test_peskavlp_fine_tuned_scores_with_its_checkpoint(tmp_path, monkeypatch):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job'])
+    launched = _record_runs(monkeypatch)
+    monkeypatch.setattr(pipeline, 'peskavlp_weights', lambda a, p, m='PeskaVLP': tmp_path / f'{m}.pth')
+    monkeypatch.setattr(pipeline.shutil, 'copy2', lambda src, dst: None)
     sub2 = [s for s in pipeline.experiment_plans(a) if s.kind == 'peskavlp_finetune'][0]
     pipeline.COMPARISON_METHODS['peskavlp_finetune']['predict'](sub2, pipeline.Paths(tmp_path, sub2.run_name),
                                                                   [('test', tmp_path / 't.csv')])
     score = [c for n, c in launched if n == 'peskavlp_test'][0]
     assert score[score.index('--checkpoint') + 1].endswith('peskavlp/best.pt')
+    assert score[score.index('--model') + 1] == 'PeskaVLP'
     assert not any(n.startswith('peskavlp_authorprompts') for n, _ in launched)
 
 
@@ -519,6 +559,50 @@ def test_phase_recognition_metrics_on_a_hand_example():
     assert all(math.isnan(x) for x in s['per_phase']['recall'][3:])         # phases absent from the video
 
 
+def test_phase_summary_uses_sample_standard_deviations_like_the_cholec80_script():
+    gt = np.array([0, 0, 1, 1])
+    t = pa.phase_tables({0: (gt, np.array([0, 0, 1, 1])), 1: (gt, np.array([0, 1, 1, 1]))})
+    s = pa.phase_summary(t)
+    assert s['accuracy'] == pytest.approx(0.875) and s['accuracy_std'] == pytest.approx(np.std([1, 0.75], ddof=1))
+    assert math.isnan(pa.std1([0.5, math.nan])) and pa.std1([1, 3, math.nan]) == pytest.approx(math.sqrt(2))
+
+
+def test_relaxed_phase_metrics_reproduce_the_cholec80_evaluation_script():
+    # Hand-computed with the MATLAB semantics of Evaluate.m (phases 1-based there; fps 0.2 -> 2-frame boundary).
+    # 1) a too-early transition at the END of a phase is not relaxed: the script's end-of-phase statement
+    #    indexes the first t frames (a logical mask of length t), which this port reproduces.
+    jac, prec, rec, acc = pa.relaxed_evaluate(np.array([0] * 5 + [1] * 5), np.array([0] * 4 + [1] * 6), 0.2)
+    assert acc == pytest.approx(90)
+    np.testing.assert_allclose(jac[:2], [80, 100 * 5 / 6]); np.testing.assert_allclose(prec[:2], [100, 100 * 5 / 6])
+    np.testing.assert_allclose(rec[:2], [80, 100])
+    assert np.isnan(jac[2:]).all() and np.isnan(prec[2:]).all() and np.isnan(rec[2:]).all()
+    # 2) a late transition (the previous phase still predicted at the start of the next) is relaxed; relaxed
+    #    true positives can exceed the frames of a phase (133 %), and Main.m clips to 100
+    gt, pred = np.array([0] * 3 + [1] * 5), np.array([0] * 4 + [1] * 4)
+    jac, prec, rec, acc = pa.relaxed_evaluate(gt, pred, 0.2)
+    assert acc == pytest.approx(100)
+    np.testing.assert_allclose(rec[:2], [400 / 3, 100]); np.testing.assert_allclose(prec[:2], [100, 125])
+    r = pa.relaxed_phase_metrics({0: (gt, pred)}, 0.2)
+    assert r['per_phase']['recall'][:2] == pytest.approx([1, 1]) and r['per_phase']['precision'][:2] == pytest.approx([1, 1])
+    # 3) Gallbladder dissection/packaging (4, 5) and cleaning/retraction (6, 7) also accept two phases away
+    gt, pred = np.array([4] * 6 + [5] * 6), np.array([4] * 6 + [3] * 1 + [5] * 5)  # dissection at the start of cleaning
+    assert pa.relaxed_evaluate(gt, pred, 0.2)[3] == pytest.approx(100)              # (-2 at the start of phase 6)
+    assert pa.relaxed_evaluate(gt + 0, np.array([4] * 6 + [3] * 3 + [5] * 3), 0.2)[3] == pytest.approx(100 * 11 / 12)
+    gt, pred = np.array([2] * 4 + [3] * 4), np.array([2] * 4 + [1] + [3] * 3)       # -2 is not relaxed for phase 4
+    assert pa.relaxed_evaluate(gt, pred, 0.2)[3] == pytest.approx(100 * 7 / 8)
+    # 4) a phase never predicted: precision inf (tp > 0 from relaxed frames) -> clipped to 100 by Main.m
+    gt, pred = np.array([0] * 3 + [1] * 2 + [2] * 3), np.array([0] * 5 + [2] * 3)
+    prec = pa.relaxed_evaluate(gt, pred, 0.2)[1]
+    assert np.isinf(prec[1]) and pa.relaxed_phase_metrics({0: (gt, pred)}, 0.2)['per_phase']['precision'][1] == 1
+    # 5) Main.m's means: Jaccard/recall plain mean over phases (NaN if a phase is in no video), precision nanmean
+    r = pa.relaxed_phase_metrics({0: (np.array([0, 0, 1, 1]), np.array([0, 0, 1, 1]))}, 1.0)
+    assert math.isnan(r['jaccard']) and r['precision'] == 1 and r['accuracy'] == 1
+    gt = np.repeat(np.arange(7), 3)
+    r = pa.relaxed_phase_metrics({0: (gt, gt), 1: (gt, np.roll(gt, 1))}, 0.2)
+    second = pa.relaxed_evaluate(gt, np.roll(gt, 1), 0.2)[3]
+    assert r['jaccard'] <= 1 and r['accuracy_std'] == pytest.approx(np.std([100, second], ddof=1) / 100)
+
+
 def test_holm_and_bootstrap_p_values():
     np.testing.assert_allclose(pa.holm([0.01, 0.04, 0.03, math.nan]), [0.03, 0.06, 0.06, math.nan])
     assert pa.bootstrap_p(np.ones(999)) == pytest.approx(2 / 1000)
@@ -547,7 +631,7 @@ def _write_results(root, d, plan, rng, quality, sets=('val', 'test'), para=None)
             df['evidence_uncertainty'] = rng.random(len(df))
         df.to_csv(results / f'proposed_{name}.csv', index=False)
         df[['video_id', 'text_query', 'frame_idx', 'label']].to_csv(results / f'{name}_reference.csv', index=False)
-        if name == 'test' and plan['kind'] == 'peskavlp_zeroshot':
+        if name == 'test' and plan['kind'] in protocol.SURGVLP_ZERO_SHOT:
             df.to_csv(results / 'authorprompts_test.csv', index=False)
         if name == 'test' and plan['kind'] == 'univtg':
             with open(results / 'native_segments_test.jsonl', 'w') as f:
@@ -588,12 +672,13 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     assert pa.main(['--root', str(root), '--bootstrap', '30']) == 0
     out = root / 'paper'
     text = (out / 'PAPER_RESULTS.md').read_text()
-    assert 'Runs finished: **14 of 15**' in text and 'paper_peskavlp_finetune_s42' in text
+    assert 'Runs finished: **18 of 19**' in text and 'paper_peskavlp_finetune_s42' in text
     for section in ('Main results', 'Paired significance', 'Temporal segments', 'phase recognition', 'Tool presence',
                     'Per-query AP', 'Ablations', 'seeds', 'unseen query wordings', 'Efficiency', 'Published results'):
         assert section.lower() in text.lower(), section
-    for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'tool_presence', 'per_query_ap',
-                  'breakdown', 'ablations', 'seeds', 'generalisation', 'efficiency', 'literature_template'):
+    for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'phase_recognition_relaxed',
+                  'tool_presence', 'per_query_ap', 'breakdown', 'ablations', 'seeds', 'generalisation', 'efficiency',
+                  'literature_template'):
         assert (out / 'tables' / f'{table}.csv').exists() and (out / 'tables' / f'{table}.tex').exists(), table
         assert '\\begin{tabular}' in (out / 'tables' / f'{table}.tex').read_text()
     for fig in ('reliability', 'risk_coverage', 'training_dynamics', 'per_query_ap', 'generalisation',
@@ -602,13 +687,27 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     report = json.loads((out / 'analysis.json').read_text())
     assert 'figure_error' not in report
     main = pd.read_csv(out / 'tables' / 'main_results.csv')
-    assert list(main.Method)[-2:] == ['Baseline (ours)', 'Advanced (ours)'] and len(main) == 6
+    assert list(main.Method)[-2:] == ['Baseline (ours)', 'Advanced (ours)'] and len(main) == 10
+    assert list(main.Method)[:4] == ['CLIP zero-shot', 'SurgVLP zero-shot', 'HecVL zero-shot', 'PeskaVLP zero-shot']
+    assert {'TeCNO (re-implementation)', 'Our backbone without language (closed-set)'} <= set(main.Method)
     seg = pd.read_csv(out / 'tables' / 'segment_results.csv')
     assert any('own windows' in m for m in seg.Method)
     phase = pd.read_csv(out / 'tables' / 'phase_recognition.csv')
-    assert any("authors' phase prompts" in m for m in phase.Method)
+    assert sum("authors' phase prompts" in m for m in phase.Method) == 3          # SurgVLP, HecVL, PeskaVLP
+    relaxed = pd.read_csv(out / 'tables' / 'phase_recognition_relaxed.csv')
+    assert list(relaxed.Method) == list(phase.Method)
+    for key, r in report['phase_recognition'].items():                 # relaxing the boundaries never hurts
+        assert r['relaxed']['accuracy'] >= r['accuracy'] - 1e-12, key
+    lit = pd.read_csv(out / 'tables' / 'literature_template.csv')
+    tecno = lit[lit.Method.str.startswith('TeCNO')].iloc[0]
+    assert tecno['Split'] == '40 / 8 / 32 (same)' and 'relaxed' in tecno['Ours (same protocol)']
+    assert lit[lit.Method.str.startswith('HecVL')].iloc[0]['Ours (same protocol)'] != 'n/a'
+    eff = pd.read_csv(out / 'tables' / 'efficiency.csv').set_index('Method')
+    assert eff.loc['HecVL zero-shot', 'Training (h)'] == '0 (zero-shot)'
     gen = pd.read_csv(out / 'tables' / 'generalisation.csv')
-    assert {'AP set A', 'AP set B', 'mAP set A'} <= set(gen.columns) and len(gen) == 2 + 4 + 4
+    # every method with a text input, except the unfinished run; never the closed-set models
+    assert {'AP set A', 'AP set B', 'mAP set A'} <= set(gen.columns) and len(gen) == 2 + 4 + 6
+    assert not any(m.startswith(('TeCNO', 'Our backbone without')) for m in gen.Method)
     seeds = pd.read_csv(out / 'tables' / 'seeds.csv')
     assert list(seeds.Seeds) == ['42, 43, 44', '42, 43, 44']
     m = report['methods']['paper_advanced_s42']['frame']

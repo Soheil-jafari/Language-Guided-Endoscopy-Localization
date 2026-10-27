@@ -1843,7 +1843,7 @@ def xclip_predict(a, p, sets):
             a, p, f'predict_{name}')
 
 
-# ----- PeskaVLP (zero-shot and fine-tuned), in its own environment
+# ----- SurgVLP, HecVL, PeskaVLP (CAMMA's surgical video-language models), in their own environment
 def peskavlp_prefix(p):
     if os.environ.get('LGEL_PESKAVLP_PREFIX'):
         return Path(os.environ['LGEL_PESKAVLP_PREFIX'])
@@ -1868,10 +1868,18 @@ def safe_extract(archive, target):
         zf.extractall(target)
 
 
-def peskavlp_weights(a, p):
-    folder = p.root / 'comparisons' / 'peskavlp'
-    download_path = folder / 'PeskaVLP.download'
-    download(protocol.PESKAVLP['weights_url'], download_path, a, p, 'peskavlp_weights')
+def surgvlp_model(kind):
+    """The SurgVLP-family model a comparison uses ('SurgVLP', 'HecVL' or 'PeskaVLP')."""
+    return protocol.COMPARISONS[kind]['model']
+
+
+def peskavlp_weights(a, p, model='PeskaVLP'):
+    """The model's public checkpoint, downloaded once into <root>/comparisons/<model> (shared by its runs)."""
+    if model not in protocol.SURGVLP['weights_urls']:
+        raise StageError(f'unknown SurgVLP-family model {model!r}')
+    folder = p.root / 'comparisons' / model.lower()
+    download_path = folder / f'{model}.download'
+    download(protocol.SURGVLP['weights_urls'][model], download_path, a, p, f'{model.lower()}_weights')
     if not zipfile.is_zipfile(download_path):
         return download_path                              # a plain checkpoint file
     unpacked = folder / 'unpacked'
@@ -1887,33 +1895,34 @@ def peskavlp_weights(a, p):
     found = sorted(f for f in unpacked.rglob('*') if f.suffix in ('.pth', '.pt', '.ckpt') and f.is_file()
                    and not f.name.startswith('._') and '__MACOSX' not in f.parts)      # (macOS archive extras)
     if len(found) != 1:
-        raise StageError(f'expected one checkpoint in the PeskaVLP download, found {[f.name for f in found]}')
+        raise StageError(f'expected one checkpoint in the {model} download, found {[f.name for f in found]}')
     return found[0]
 
 
-def peskavlp_setup(a, p):
+def peskavlp_setup(a, p, model='PeskaVLP'):
     prefix = peskavlp_prefix(p)
     if a.offline and not (prefix / '.lgel_peskavlp_ready').exists():
-        raise StageError(f'--offline: the PeskaVLP environment ({prefix}) has not been created yet.')
+        raise StageError(f'--offline: the SurgVLP environment ({prefix}) has not been created yet.')
     if not a.offline:
         run(['bash', 'comparison_models/peskavlp/setup_env.sh', prefix], a, p, 'peskavlp_setup',
             env=peskavlp_env(a, p, online=True))
-    weights = peskavlp_weights(a, p)
+    weights = peskavlp_weights(a, p, model)
     # One construction with the real weights (strict loading); it also fetches what the authors' model
-    # constructor needs: Bio_ClinicalBERT (Hugging Face) and the ImageNet ResNet-50 weights (torchvision).
-    run([prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'check', '--weights', weights],
-        a, p, 'peskavlp_check', env=peskavlp_env(a, p, online=not a.offline))
+    # constructor needs: Bio_ClinicalBERT (Hugging Face).
+    run([prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'check', '--weights', weights,
+         '--model', model], a, p, f'{model.lower()}_check', env=peskavlp_env(a, p, online=not a.offline))
     return prefix, weights
 
 
-def peskavlp_zeroshot_train(a, p):
-    peskavlp_setup(a, p)
-    log('PeskaVLP zero-shot: nothing to train')
+def surgvlp_zeroshot_train(a, p):
+    model = surgvlp_model(a.kind)
+    peskavlp_setup(a, p, model)
+    log(f'{model} zero-shot: nothing to train')
 
 
 def peskavlp_finetune_train(a, p):
     cfg = protocol.COMPARISONS['peskavlp_finetune']
-    prefix, weights = peskavlp_setup(a, p)
+    prefix, weights = peskavlp_setup(a, p, cfg['model'])
     out = p.run / 'peskavlp'
     if finished_marker(out).exists():
         log('PeskaVLP fine-tuning already finished')
@@ -1923,15 +1932,18 @@ def peskavlp_finetune_train(a, p):
     out.mkdir(parents=True, exist_ok=True)
     run([prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'finetune', '--train-order',
          train_order, '--train-labels', train_labels, '--val-order', val_order, '--val-labels', val_labels,
-         '--weights', weights, '--output', out, '--epochs', cfg['epochs'], '--lr', cfg['lr'], '--batch-size',
-         cfg['batch_size'], '--seed', a.seed, '--workers', score_workers(a)], a, p, 'train', env=peskavlp_env(a, p))
+         '--weights', weights, '--model', cfg['model'], '--output', out, '--epochs', cfg['epochs'], '--lr', cfg['lr'],
+         '--batch-size', cfg['batch_size'], '--seed', a.seed, '--workers', score_workers(a)], a, p, 'train',
+        env=peskavlp_env(a, p))
     if not (out / 'best.pt').exists():
         raise StageError('PeskaVLP fine-tuning ended without a best checkpoint')
     write_json(finished_marker(out), dict(finished=time.ctime(), epochs=cfg['epochs']))
 
 
 def peskavlp_predict(a, p, sets, checkpoint=None):
-    prefix, weights = peskavlp_prefix(p), peskavlp_weights(a, p)
+    model = surgvlp_model(a.kind)
+    prefix, weights = peskavlp_prefix(p), peskavlp_weights(a, p, model)
+    tag = model.lower()
     extra = []
     if checkpoint is None:
         # Also with the authors' own phase prompts (their zero-shot protocol), for the phase-recognition table.
@@ -1942,10 +1954,10 @@ def peskavlp_predict(a, p, sets, checkpoint=None):
         scores = p.run / 'work' / f'{name}.scores.npz'
         scores.unlink(missing_ok=True)
         cmd = [prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'score', '--work-order', order,
-               '--weights', weights, '--output', scores, '--workers', score_workers(a)]
+               '--weights', weights, '--model', model, '--output', scores, '--workers', score_workers(a)]
         if checkpoint is not None:
             cmd += ['--checkpoint', checkpoint]
-        run(cmd, a, p, f'peskavlp_{name}', env=peskavlp_env(a, p))
+        run(cmd, a, p, f'{tag}_{name}', env=peskavlp_env(a, p))
         output = p.results / (f'{name}.csv' if prompts else f'proposed_{name}.csv')
         assemble_scores(a, p, scores, manifest, output, prompts=prompts, name=f'assemble_{name}')
         shutil.copy2(str(scores) + '.manifest.json', str(output) + '.manifest.json')
@@ -1992,13 +2004,115 @@ def univtg_predict(a, p, sets):
              '--output', p.results / f'proposed_{name}.csv', '--segments', segments], a, p, f'predict_{name}')
 
 
+# ----- frame-wise closed-set models (no text input): one output per concept answers that concept's queries
+def scored_predictions(a, p, sets, tag, command):
+    """For each prediction set: a work order, the model's score matrix (command(order, scores) -> argv), and
+    the standard prediction CSV assembled from it."""
+    for name, manifest in sets:
+        order, _ = work_order(a, p, manifest, name)
+        scores = p.run / 'work' / f'{name}.scores.npz'
+        scores.unlink(missing_ok=True)
+        run(command(order, scores), a, p, f'{tag}_{name}')
+        assemble_scores(a, p, scores, manifest, p.results / f'proposed_{name}.csv', name=f'assemble_{name}')
+        shutil.copy2(str(scores) + '.manifest.json', p.results / f'proposed_{name}.csv.manifest.json')
+
+
+# ----- our model without language (closed set): comparison_models/closedset/closedset.py
+def closedset_train(a, p):
+    spec = protocol.COMPARISONS['closedset']
+    out = p.run / 'closedset'
+    if finished_marker(out).exists():
+        log('closed-set training already finished')
+        return
+    amp = a.amp_dtype
+    if amp == 'auto':
+        amp = 'bf16' if native_bf16() else 'fp16'
+    # Our model's own training configuration (same backbone weights, optimiser, schedule, epochs, crop, clip,
+    # augmentation, seed), with the closed-set batch.
+    cfg = train_config(a, p, score_workers(a), amp)
+    cfg['TRAIN'].update(BATCH_SIZE=spec['batch_size'], GRADIENT_ACCUMULATION_STEPS=spec['accum'])
+    config_file = p.run / 'closedset_config.json'
+    if config_file.exists():
+        saved = json.loads(config_file.read_text())
+        if a.train_workers is None:                     # node-dependent choices are frozen at the first launch
+            cfg['DATA']['NUM_WORKERS'] = saved['DATA']['NUM_WORKERS']
+        if a.amp_dtype == 'auto':
+            cfg['TRAIN']['AMP_DTYPE'] = saved['TRAIN']['AMP_DTYPE']
+        if cfg != saved and (out / 'latest.pt').exists():
+            raise StageError(f'Run "{a.run_name}" was started with different settings; restore them to resume it.')
+    p.run.mkdir(parents=True, exist_ok=True)
+    write_json(config_file, cfg)
+    train_order, train_labels = work_order(a, p, p.triplet_csv('train'), 'train', labels=True)
+    val_order, val_labels = work_order(a, p, p.triplet_csv('val'), 'val_labels', labels=True)
+    run([sys.executable, 'comparison_models/closedset/closedset.py', 'train', '--config', config_file,
+         '--train-order', train_order, '--train-labels', train_labels, '--val-order', val_order,
+         '--val-labels', val_labels, '--output', out, '--parameter-counts', p.run / 'parameter_counts.json',
+         '--workers', cfg['DATA']['NUM_WORKERS']], a, p, 'train', on_line=_epoch_progress(cfg['TRAIN']['NUM_EPOCHS']))
+    if not (out / 'best.pt').exists():
+        raise StageError('closed-set training ended without a best checkpoint')
+    write_json(finished_marker(out), dict(finished=time.ctime(), epochs=cfg['TRAIN']['NUM_EPOCHS']))
+
+
+def closedset_predict(a, p, sets):
+    checkpoint = p.run / 'closedset' / 'best.pt'
+    scored_predictions(a, p, sets, 'closedset', lambda order, scores: [
+        sys.executable, 'comparison_models/closedset/closedset.py', 'predict', '--checkpoint', checkpoint,
+        '--work-order', order, '--output', scores, '--workers', score_workers(a)])
+
+
+# ----- TeCNO (re-implementation): comparison_models/tecno/tecno.py
+TECNO = 'comparison_models/tecno/tecno.py'
+RESNET50_IMAGENET = 'resnet50-0676ba61.pth'                # torchvision ResNet50_Weights.IMAGENET1K_V1
+
+
+def tecno_train(a, p):
+    cfg = protocol.COMPARISONS['tecno']
+    cnn, features, tcn = p.run / 'tecno_cnn', p.run / 'tecno_features', p.run / 'tecno_tcn'
+    if finished_marker(tcn).exists():
+        log('TeCNO training already finished')
+        return
+    train_order, train_labels = work_order(a, p, p.triplet_csv('train'), 'train', labels=True)
+    val_order, val_labels = work_order(a, p, p.triplet_csv('val'), 'val_labels', labels=True)
+    common = ['--train-order', train_order, '--train-labels', train_labels, '--val-order', val_order,
+              '--val-labels', val_labels, '--patience', cfg['patience'], '--seed', a.seed]
+    if not finished_marker(cnn).exists():
+        imagenet = p.root / 'torch_cache' / 'hub' / 'checkpoints' / RESNET50_IMAGENET
+        if a.offline and not imagenet.exists() and not (cnn / 'latest.pt').exists():
+            raise StageError(f'--offline: the ImageNet ResNet-50 weights TeCNO starts from ({imagenet}) have not been '
+                             f'downloaded yet (torchvision downloads them on the first run with internet).')
+        run([sys.executable, TECNO, 'cnn', *common, '--output', cnn, '--epochs', cfg['cnn_epochs'],
+             '--min-epochs', cfg['cnn_min_epochs'], '--lr', cfg['cnn_lr'], '--batch-size', cfg['cnn_batch_size'],
+             '--input-size', cfg['input_size'], '--workers', score_workers(a)], a, p, 'train_cnn')
+        if not (cnn / 'best.pt').exists():
+            raise StageError('TeCNO stage 1 ended without a best checkpoint')
+        write_json(finished_marker(cnn), dict(finished=time.ctime()))
+    test_order, _ = work_order(a, p, p.triplet_csv('test'), 'test')
+    run([sys.executable, TECNO, 'extract', '--checkpoint', cnn / 'best.pt', '--work-order', train_order, val_order,
+         test_order, '--output', features, '--workers', score_workers(a)], a, p, 'tecno_features')
+    run([sys.executable, TECNO, 'tcn', *common, '--features', features, '--output', tcn, '--epochs', cfg['tcn_epochs'],
+         '--min-epochs', cfg['tcn_min_epochs'], '--lr', cfg['tcn_lr'], '--parameter-counts',
+         p.run / 'parameter_counts.json'], a, p, 'train_tcn')
+    if not (tcn / 'best.pt').exists():
+        raise StageError('TeCNO stage 2 ended without a best checkpoint')
+    write_json(finished_marker(tcn), dict(finished=time.ctime()))
+
+
+def tecno_predict(a, p, sets):
+    scored_predictions(a, p, sets, 'tecno', lambda order, scores: [
+        sys.executable, TECNO, 'predict', '--checkpoint', p.run / 'tecno_tcn' / 'best.pt', '--features',
+        p.run / 'tecno_features', '--work-order', order, '--output', scores])
+
+
 COMPARISON_METHODS = {
     'clip_zeroshot': dict(train=clip_train, predict=clip_predict),
     'xclip_finetune': dict(train=xclip_train, predict=xclip_predict),
-    'peskavlp_zeroshot': dict(train=peskavlp_zeroshot_train, predict=lambda a, p, sets: peskavlp_predict(a, p, sets)),
+    **{kind: dict(train=surgvlp_zeroshot_train, predict=lambda a, p, sets: peskavlp_predict(a, p, sets))
+       for kind in protocol.SURGVLP_ZERO_SHOT},
     'peskavlp_finetune': dict(train=peskavlp_finetune_train,
                               predict=lambda a, p, sets: peskavlp_predict(a, p, sets, p.run / 'peskavlp' / 'best.pt')),
     'univtg': dict(train=univtg_train, predict=univtg_predict),
+    'tecno': dict(train=tecno_train, predict=tecno_predict),
+    'closedset': dict(train=closedset_train, predict=closedset_predict),
 }
 
 

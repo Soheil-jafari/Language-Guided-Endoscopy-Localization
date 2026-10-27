@@ -1,4 +1,4 @@
-"""PeskaVLP in its own environment, with the official SurgVLP code (installed by
+"""SurgVLP, HecVL and PeskaVLP in their own environment, with the official SurgVLP code (installed by
 comparison_models/peskavlp/setup_env.sh). Runs only when that environment exists:
 
     LGEL_PESKAVLP_PYTHON=/path/to/envs/lgel-peskavlp/bin/python python -m pytest tests/test_peskavlp_env.py
@@ -124,3 +124,18 @@ def test_peskavlp_checks_scores_finetunes_and_resumes(tmp_path):
     df = fs.assemble(tmp_path / 'ap.npz', d['triplets']('test'), d['metadata'], d['annotations'], tmp_path / 'ap.csv',
                      prompts=prompts)
     assert set(df.text_query) == set(PHRASES)
+    # 6. SurgVLP and HecVL: the same package and architecture (their own model classes, the same state-dict
+    #    layout), selected with --model; a fine-tuned checkpoint is only accepted for the model it was made from
+    for model in ('SurgVLP', 'HecVL'):
+        assert f'{model} OK' in peska(['check', '--weights', weights, '--device', 'cpu', '--model', model], hf).stdout
+        peska(['score', '--work-order', tmp_path / 'test.json', '--weights', weights, '--model', model, '--output',
+               tmp_path / f'{model}.npz', '--device', 'cpu', '--workers', '0', '--batch-size', '4'], hf)
+        assert json.loads((tmp_path / f'{model}.npz.manifest.json').read_text())['model'] == f'{model} zero-shot'
+        wrong = peska(['score', '--work-order', tmp_path / 'test.json', '--weights', weights, '--model', model,
+                       '--checkpoint', ft / 'best.pt', '--output', tmp_path / 'y.npz', '--device', 'cpu', '--workers',
+                       '0'], hf, check=False)
+        assert wrong.returncode != 0 and f'does not match these {model} weights' in wrong.stderr
+    same = np.load(tmp_path / 'SurgVLP.npz')['scores']                 # same weights here: the same numbers
+    np.testing.assert_allclose(same, np.load(tmp_path / 'zs.npz')['scores'], rtol=1e-5, atol=1e-6)
+    unknown = peska(['check', '--weights', weights, '--device', 'cpu', '--model', 'CLIP'], hf, check=False)
+    assert unknown.returncode != 0

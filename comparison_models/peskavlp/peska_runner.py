@@ -1,11 +1,12 @@
-"""PeskaVLP comparison (runs in its own environment, see setup_env.sh; uses the official SurgVLP package).
+"""SurgVLP, HecVL and PeskaVLP comparisons (CAMMA's surgical video-language models; --model, default PeskaVLP).
+Runs in its own environment (see setup_env.sh) and uses the official SurgVLP package, which contains all three.
 
 check     build the model with the downloaded weights (strict), encode two sentences and one image: proves,
           before any long step, that the environment, the weights and the text encoder all work.
 score     every frame of a work order (comparison_models/frame_scores.py) against every query sentence.
           Zero-shot: score = (cosine similarity + 1) / 2, like CLIP. With --checkpoint (fine-tuned):
           score = sigmoid(scale * cosine + bias), as trained.
-finetune  train PeskaVLP's image encoder on our training videos with a frame-wise binary objective for the
+finetune  train the model's image encoder on our training videos with a frame-wise binary objective for the
           14 concepts (the text encoder stays frozen, so unseen query wordings remain meaningful); the best
           epoch is chosen by validation loss. Resumable at epoch boundaries (latest.pt), deterministic.
 
@@ -27,18 +28,28 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-# The official PeskaVLP model configuration (SurgVLP repository, tests/config_peskavlp.py, commit 85e8589),
-# with one change that does not alter the model: pretrained='random' instead of 'imagenet' for the ResNet-50.
-# 'imagenet' only makes the constructor download torchvision's ImageNet weights, which the PeskaVLP checkpoint
-# then overwrites completely (strict loading of every parameter and buffer), so that download is skipped.
-MODEL_CONFIG = dict(
-    type='PeskaVLP',
-    backbone_img=dict(type='img_backbones/ImageEncoder', num_classes=768, pretrained='random',
-                      backbone_name='resnet_50', img_norm=False),
-    backbone_text=dict(type='text_backbones/BertEncoder', text_bert_type='emilyalsentzer/Bio_ClinicalBERT',
-                       text_last_n_layers=4, text_aggregate_method='sum', text_norm=False, text_embedding_dim=768,
-                       text_freeze_bert=False, text_agg_tokens=True))
-SCHEMA = 'peskavlp-finetune-1'
+# The official model configurations (SurgVLP repository, tests/config_{surgvlp,hecvl,peskavlp}.py, commit
+# 85e8589): the three models share the same backbones and differ only in `type` and their weights. One change
+# that does not alter the models: pretrained='random' instead of 'imagenet' for the ResNet-50. 'imagenet' only
+# makes the constructor download torchvision's ImageNet weights, which the checkpoint then overwrites
+# completely (strict loading of every parameter and buffer), so that download is skipped.
+MODELS = ('SurgVLP', 'HecVL', 'PeskaVLP')
+
+
+def model_config(name):
+    if name not in MODELS:
+        raise ValueError(f'unknown model {name!r} (one of {MODELS})')
+    return dict(
+        type=name,
+        backbone_img=dict(type='img_backbones/ImageEncoder', num_classes=768, pretrained='random',
+                          backbone_name='resnet_50', img_norm=False),
+        backbone_text=dict(type='text_backbones/BertEncoder', text_bert_type='emilyalsentzer/Bio_ClinicalBERT',
+                           text_last_n_layers=4, text_aggregate_method='sum', text_norm=False, text_embedding_dim=768,
+                           text_freeze_bert=False, text_agg_tokens=True))
+
+
+MODEL_CONFIG = model_config('PeskaVLP')                 # (kept for callers of the earlier version)
+SCHEMA = 'surgvlp-family-finetune-1'
 
 
 def file_sha(path):
@@ -55,18 +66,18 @@ def atomic_torch_save(value, path):
     os.replace(tmp, path)
 
 
-def load_peskavlp(weights, device):
+def load_peskavlp(weights, device, name='PeskaVLP'):
     """What surgvlp.load() does (build the official model, strict state-dict load, the authors' image
     transform), except that the checkpoint is read onto the CPU first, so it also loads on a machine without
     the GPU it was saved from."""
     import surgvlp.surgvlp as official                  # (importing the package registers its model classes)
     from surgvlp.codes.models import build_algorithm
-    config = copy.deepcopy(MODEL_CONFIG)
-    model = build_algorithm(config)
+    config = model_config(name)
+    model = build_algorithm(copy.deepcopy(config))
     state = torch.load(str(weights), map_location='cpu', weights_only=False)
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
-    return model, official._transform(official._INPUT_RES[MODEL_CONFIG['type']])
+    return model, official._transform(official._INPUT_RES[name])
 
 
 @torch.no_grad()
@@ -123,13 +134,13 @@ def order_frames(order):
 # --------------------------------------------------------------------------- check
 @torch.no_grad()
 def check(args):
-    model, preprocess = load_peskavlp(args.weights, args.device)
+    model, preprocess = load_peskavlp(args.weights, args.device, args.model)
     text = encode_text(model, ['a grasper is present', 'Calot triangle dissection phase'], args.device)
     image = preprocess(Image.new('RGB', (854, 480), (150, 70, 60))).unsqueeze(0).to(args.device)
     cosine = image_cosine(model, image, text)
     if tuple(text.shape) != (2, 768) or tuple(cosine.shape) != (1, 2) or not bool(torch.isfinite(cosine).all()):
-        raise SystemExit(f'PeskaVLP CHECK FAILED: text {tuple(text.shape)}, similarity {tuple(cosine.shape)}')
-    print(f'PeskaVLP OK: weights {file_sha(args.weights)[:16]}, {sum(t.numel() for t in model.parameters()):,} '
+        raise SystemExit(f'{args.model} CHECK FAILED: text {tuple(text.shape)}, similarity {tuple(cosine.shape)}')
+    print(f'{args.model} OK: weights {file_sha(args.weights)[:16]}, {sum(t.numel() for t in model.parameters()):,} '
           f'parameters, embeddings {text.shape[1]}-d, test similarities {cosine.squeeze(0).tolist()}', flush=True)
 
 
@@ -140,12 +151,13 @@ def score(args):
         raise FileExistsError(args.output)
     device = args.device
     order = json.loads(Path(args.work_order).read_text())
-    model, preprocess = load_peskavlp(args.weights, device)
+    model, preprocess = load_peskavlp(args.weights, device, args.model)
     head = None
     if args.checkpoint:
         ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-        if ck.get('schema') != SCHEMA or ck.get('weights_sha256') != file_sha(args.weights):
-            raise ValueError('fine-tuned checkpoint does not match these PeskaVLP weights')
+        if ck.get('schema') != SCHEMA or ck.get('weights_sha256') != file_sha(args.weights) or \
+                ck.get('signature', {}).get('model') != args.model:
+            raise ValueError(f'fine-tuned checkpoint does not match these {args.model} weights')
         model.backbone_img.load_state_dict(ck['image_encoder'], strict=True)
         head = Head().to(device)
         head.load_state_dict(ck['head'], strict=True)
@@ -170,7 +182,7 @@ def score(args):
     os.replace(tmp, args.output)
     n = len(frame_idx)
     Path(args.output + '.manifest.json').write_text(json.dumps(dict(
-        model='PeskaVLP' + (' fine-tuned' if head is not None else ' zero-shot'), weights_sha256=file_sha(args.weights),
+        model=args.model + (' fine-tuned' if head is not None else ' zero-shot'), weights_sha256=file_sha(args.weights),
         checkpoint=args.checkpoint, parameters=sum(t.numel() for t in model.parameters()),
         score='sigmoid(scale * cosine + bias)' if head is not None else '(cosine + 1) / 2, uncalibrated',
         frames=n, seconds=round(time.time() - started, 1),
@@ -223,13 +235,13 @@ def finetune(args):
     seed_all(args.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    signature = dict(epochs=args.epochs, lr=args.lr, batch_size=args.batch_size, seed=args.seed,
+    signature = dict(model=args.model, epochs=args.epochs, lr=args.lr, batch_size=args.batch_size, seed=args.seed,
                      weights_sha256=file_sha(args.weights), train=file_sha(args.train_labels), val=file_sha(args.val_labels))
     train_paths, train_labels, canonical = frame_set(args.train_order, args.train_labels)
     val_paths, val_labels, canonical_val = frame_set(args.val_order, args.val_labels)
     if canonical != canonical_val:
         raise ValueError('train/validation concept lists differ')
-    model, preprocess = load_peskavlp(args.weights, device)
+    model, preprocess = load_peskavlp(args.weights, device, args.model)
     text = encode_text(model, canonical, device)               # frozen text encoder: fixed concept embeddings
     for p in model.backbone_text.parameters():
         p.requires_grad = False
@@ -307,6 +319,8 @@ def main():
         f.add_argument('--' + name, required=True)
     f.add_argument('--epochs', type=int, default=5); f.add_argument('--lr', type=float, default=1e-5)
     f.add_argument('--seed', type=int, default=42)
+    for q in (c, s, f):
+        q.add_argument('--model', choices=MODELS, default='PeskaVLP')
     for q in (s, f):
         q.add_argument('--batch-size', type=int, default=64); q.add_argument('--workers', type=int, default=8)
         q.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')

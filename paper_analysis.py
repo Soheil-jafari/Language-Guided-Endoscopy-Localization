@@ -17,7 +17,9 @@ Protocol (the same for every method):
   * segments: runs of frames at or above the threshold (the same post-processing for every method);
     ground truth: runs of annotated positive frames; unannotated frames are excluded from both;
   * phase recognition: per frame, the phase query with the highest score; the standard (non-relaxed) Cholec80
-    metrics - accuracy per video, then precision / recall / Jaccard per phase averaged over videos;
+    metrics - accuracy per video, then precision / recall / Jaccard per phase averaged over videos - and, next to
+    them, the relaxed-boundary metrics of the Cholec80/M2CAI evaluation script used by most phase-recognition
+    papers (a port of its Evaluate.m / Main.m, see relaxed_phase_metrics);
   * tool presence: AP per tool over all test frames, and their mean (mAP).
 
 Writes <output>/PAPER_RESULTS.md, tables/*.csv and *.tex, figures/*.png and *.pdf, analysis.json.
@@ -47,8 +49,8 @@ KEYS = ['video_id', 'text_query', 'frame_idx']
 IOUS = (0.3, 0.5, 0.7)
 BINS = 15
 # Main-table order: the comparison methods (weakest assumptions first), then ours.
-MAIN_ORDER = ('clip_zeroshot', 'peskavlp_zeroshot', 'xclip_finetune', 'peskavlp_finetune', 'univtg',
-              'baseline', 'advanced')
+MAIN_ORDER = ('clip_zeroshot', 'surgvlp_zeroshot', 'hecvl_zeroshot', 'peskavlp_zeroshot', 'xclip_finetune',
+              'peskavlp_finetune', 'univtg', 'tecno', 'closedset', 'baseline', 'advanced')
 
 
 def natural_key(s):
@@ -325,16 +327,110 @@ def phase_tables(per_video, n_phases=7):
 def phase_summary(t):
     if not len(t['videos']):
         return None
-    out = dict(accuracy=float(t['accuracy'].mean()), accuracy_std=float(t['accuracy'].std()),
+    out = dict(accuracy=float(t['accuracy'].mean()), accuracy_std=std1(t['accuracy']),
                f1_videowise=float(t['f1'].mean()))
     import warnings
     for key in ('precision', 'recall', 'jaccard'):
         with warnings.catch_warnings():                                # a phase absent from every video: NaN
             warnings.simplefilter('ignore', RuntimeWarning)
             per_phase = np.nanmean(t[key], axis=0)                     # over videos, per phase
-        out[key], out[key + '_std'] = float(np.nanmean(per_phase)), float(np.nanstd(per_phase))
+        out[key], out[key + '_std'] = float(np.nanmean(per_phase)), std1(per_phase)
         out.setdefault('per_phase', {})[key] = per_phase.tolist()
     return out
+
+
+def std1(values):
+    """Sample standard deviation (N - 1, as MATLAB's std/nanstd), ignoring NaN; NaN with fewer than two values."""
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    return float(v.std(ddof=1)) if len(v) > 1 else math.nan
+
+
+# Relaxed-boundary phase metrics: a line-by-line port of the evaluation script distributed with Cholec80 /
+# the M2CAI 2016 workflow challenge (Evaluate.m and Main.m; the copy in the TMRNet repository, MIT licence,
+# is the one used by TMRNet, Trans-SVNet and most later papers). Phases are numbered 1-7 as in the script.
+# Within the first and last 10 s of every ground-truth phase, a prediction of the neighbouring phase counts as
+# correct (for phases 4-7 also two phases away, as in the script). The script's statement for the END of a
+# phase indexes the first 10 s instead (MATLAB applies a logical mask of length t to the first t elements),
+# so in effect only late transitions are relaxed; this is reproduced exactly, so that the numbers can be
+# compared with the published ones. Values above 100 % (relaxed true positives may exceed the predicted or
+# true frames of a phase) are clipped to 100, as in Main.m.
+def relaxed_evaluate(gt, pred, fps):
+    """Evaluate.m for one video: gt / pred are 0-based phase ids per frame in time order (frames at `fps`).
+    Returns (jaccard, precision, recall) per phase in % (NaN for phases absent from the ground truth; precision
+    may be inf or NaN when a phase is never predicted) and the accuracy in %."""
+    gt = np.asarray(gt, dtype=np.int64) + 1
+    pred = np.asarray(pred, dtype=np.int64) + 1
+    n = len(gt)
+    ori_t = int(round(10 * fps))                                     # 10 seconds relaxed boundary
+    diff = pred - gt
+    updated = diff.copy()
+    for phase in range(1, 8):
+        inside = np.flatnonzero(gt == phase)
+        if not len(inside):
+            continue
+        breaks = np.flatnonzero(np.diff(inside) > 1)                 # bwconncomp: connected runs
+        for start, end in zip(np.r_[inside[0], inside[breaks + 1]], np.r_[inside[breaks], inside[-1]]):
+            cur = diff[start:end + 1].copy()
+            t = min(ori_t, len(cur))
+            if t > 0:
+                head = cur[:t]                                       # a view: assignments change cur
+                if phase in (4, 5):
+                    head[head == -1] = 0                             # late transition
+                    tail = cur[len(cur) - t:]
+                    head[(tail == 1) | (tail == 2)] = 0              # "early transition" (applied to the head)
+                elif phase in (6, 7):
+                    head[(head == -1) | (head == -2)] = 0
+                    tail = cur[len(cur) - t:]
+                    head[(tail == 1) | (tail == 2)] = 0
+                else:
+                    head[head == -1] = 0
+                    tail = cur[len(cur) - t:]
+                    head[tail == 1] = 0
+            updated[start:end + 1] = cur
+    jac, prec, rec = [], [], []
+    for phase in range(1, 8):
+        in_gt, in_pred = gt == phase, pred == phase
+        if not in_gt.any():
+            jac.append(math.nan); prec.append(math.nan); rec.append(math.nan)
+            continue
+        union = in_gt | in_pred
+        tp = float(np.sum(updated[union] == 0))
+        jac.append(100 * tp / union.sum())
+        sum_pred = int(in_pred.sum())
+        prec.append(100 * tp / sum_pred if sum_pred else (math.inf if tp else math.nan))
+        rec.append(100 * tp / in_gt.sum())
+    acc = 100 * float(np.sum(updated == 0)) / n
+    return np.asarray(jac), np.asarray(prec), np.asarray(rec), acc
+
+
+def relaxed_phase_metrics(per_video, fps):
+    """Main.m over the videos of `per_video` ({video: (true, predicted)}), as fractions (not %)."""
+    import warnings
+    videos = sorted(per_video)
+    if not videos:
+        return None
+    rows = [relaxed_evaluate(*per_video[v], fps) for v in videos]
+    jac = np.minimum(np.stack([r[0] for r in rows]), 100)          # (videos, 7); NaN stays NaN, inf -> 100
+    prec = np.minimum(np.stack([r[1] for r in rows]), 100)
+    rec = np.minimum(np.stack([r[2] for r in rows]), 100)
+    acc = np.asarray([r[3] for r in rows])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        jac_phase, prec_phase, rec_phase = (np.nanmean(x, axis=0) for x in (jac, prec, rec))
+    return dict(videos=np.asarray(videos, dtype=np.int64), accuracy_per_video=acc / 100,
+                accuracy=float(acc.mean()) / 100, accuracy_std=std_all(acc) / 100,
+                jaccard=float(jac_phase.mean()) / 100, jaccard_std=std_all(jac_phase) / 100,     # mean / std
+                precision=float(np.nanmean(prec_phase)) / 100, precision_std=std1(prec_phase) / 100,  # nanmean
+                recall=float(rec_phase.mean()) / 100, recall_std=std_all(rec_phase) / 100,
+                per_phase=dict(jaccard=(jac_phase / 100).tolist(), precision=(prec_phase / 100).tolist(),
+                               recall=(rec_phase / 100).tolist()))
+
+
+def std_all(values):
+    """MATLAB std (N - 1): NaN if any value is NaN."""
+    v = np.asarray(values, dtype=np.float64)
+    return float(v.std(ddof=1)) if len(v) > 1 else math.nan
 
 
 # --------------------------------------------------------------------------- loading
@@ -745,39 +841,62 @@ def main(argv=None):
     phase_rows, phase_stats = [], {}
     phase_q = protocol.phase_queries()
     candidates = [(m.name, m.label, scores[m.name]) for m in main_methods]
-    pz = by_short('peskavlp_zeroshot', 'comparison')
-    if pz is not None and (pz.results / 'authorprompts_test.csv').exists():
-        df = pd.read_csv(pz.results / 'authorprompts_test.csv', usecols=KEYS + ['score'])
+    author = {}                                         # SurgVLP-family zero-shot models with the authors' prompts
+    for kind in protocol.SURGVLP_ZERO_SHOT:
+        z = by_short(kind, 'comparison')
+        if z is None or not (z.results / 'authorprompts_test.csv').exists():
+            continue
+        df = pd.read_csv(z.results / 'authorprompts_test.csv', usecols=KEYS + ['score'])
         rows = pd.DataFrame(dict(video_id=[frames.video_ids[v] for v in frames.video],
                                  text_query=[frames.queries[q] for q in frames.query],
                                  frame_idx=frames.frame_idx, _row=np.arange(len(frames.video))))
         df = rows.merge(df, on=KEYS, how='left', validate='one_to_one')
         s = df.sort_values('_row')['score'].to_numpy(np.float64)
         if np.isfinite(s).all() and np.all((s >= 0) & (s <= 1)):
-            candidates.append((pz.name + ':author', pz.label + ' (authors\' phase prompts)', s))
+            candidates.append((z.name + ':author', z.label + ' (authors\' phase prompts)', s))
+            author[kind] = z.name + ':author'
         else:
-            log('(authorprompts_test.csv does not cover the test frames; left out)')
+            log(f'({z.name}: authorprompts_test.csv does not cover the test frames; left out)')
+    relaxed_rows = []
     for key, label, s in candidates:
-        tables = phase_tables(phase_recognition(frames, s, phase_q))
+        per_video = phase_recognition(frames, s, phase_q)
+        tables = phase_tables(per_video)
         res = phase_summary(tables)
         if res is None:
             continue
         w = counts[:, tables['videos']]
         res['accuracy_ci'] = percentile_ci((w @ tables['accuracy']) / w.sum(axis=1))
+        relaxed = relaxed_phase_metrics(per_video, a.sample_fps)
+        relaxed['accuracy_ci'] = percentile_ci((w @ relaxed.pop('accuracy_per_video')) / w.sum(axis=1))
+        relaxed.pop('videos')
+        res['relaxed'] = relaxed
         phase_stats[key] = res
         phase_rows.append({'Method': label, 'Accuracy': f"{with_ci(res['accuracy'], res['accuracy_ci'])} (± {pct(res['accuracy_std'])})",
                            'Precision': f"{pct(res['precision'])} ± {pct(res['precision_std'])}",
                            'Recall': f"{pct(res['recall'])} ± {pct(res['recall_std'])}",
                            'Jaccard': f"{pct(res['jaccard'])} ± {pct(res['jaccard_std'])}",
                            'F1 (video-wise)': pct(res['f1_videowise'])})
+        relaxed_rows.append({'Method': label,
+                             'Accuracy': f"{with_ci(relaxed['accuracy'], relaxed['accuracy_ci'])} (± {pct(relaxed['accuracy_std'])})",
+                             'Precision': f"{pct(relaxed['precision'])} ± {pct(relaxed['precision_std'])}",
+                             'Recall': f"{pct(relaxed['recall'])} ± {pct(relaxed['recall_std'])}",
+                             'Jaccard': f"{pct(relaxed['jaccard'])} ± {pct(relaxed['jaccard_std'])}"})
     if phase_rows:
         md += ['## 4. Surgical phase recognition (test videos)', '',
                write_table(out, 'phase_recognition', pd.DataFrame(phase_rows),
                            'Phase recognition from the seven phase queries (arg max per frame)',
                            'Standard non-relaxed Cholec80 metrics: accuracy per video (mean, bootstrap CI, ± std over '
                            'videos); precision/recall/Jaccard per phase averaged over videos (± std over phases); '
-                           'F1: macro F1 per video, averaged (the protocol of the PeskaVLP paper). Not trained as a '
-                           'classifier: a by-product of query scoring.'), '']
+                           'F1: macro F1 per video, averaged (the protocol of the PeskaVLP paper). TeCNO and the '
+                           'closed-set model are trained phase classifiers; for the language models phase '
+                           'recognition is a by-product of query scoring.'), '',
+               write_table(out, 'phase_recognition_relaxed', pd.DataFrame(relaxed_rows),
+                           'Phase recognition with relaxed boundaries (Cholec80 evaluation script)',
+                           'The relaxed-boundary metrics of the standard Cholec80/M2CAI evaluation script (Evaluate.m '
+                           'and Main.m, ported line by line; 10 s tolerance at phase transitions, values above 100 '
+                           'clipped), as reported by most phase-recognition papers: accuracy per video (mean, '
+                           'bootstrap CI, ± std over videos); Jaccard/precision/recall per phase averaged over videos '
+                           '(± std over phases). Same predictions as the table above.'), '']
     report['phase_recognition'] = phase_stats
     tool_rows = []
     tool_q = protocol.tool_queries()
@@ -928,23 +1047,35 @@ def main(argv=None):
                            'otherwise the wall time of the training stage. Throughput: video frames per second '
                            'for all 14 queries on the test videos, including frame loading. UniVTG works on '
                            'precomputed M2CRL features (feature extraction not included); its parameters exclude '
-                           'the frozen backbone.'), '']
+                           'the frozen backbone. TeCNO: both stages (ResNet-50 and TCN; its throughput includes the '
+                           'ResNet-50 pass).'), '']
 
     # ---- literature (template: values must be copied from the cited papers)
-    lit = pd.DataFrame([
-        {'Method': 'PeskaVLP zero-shot (Yuan et al., NeurIPS 2024)', 'Task': 'phase recognition', 'Split': 'test 49-80',
-         'Reported': 'fill in from the paper', 'Ours (same protocol)': pct(phase_stats.get(pz.name + ':author', {}).get('accuracy')) if pz else 'n/a'},
-        {'Method': 'SurgVLP / HecVL zero-shot (Yuan et al.)', 'Task': 'phase recognition', 'Split': 'test 49-80',
-         'Reported': 'fill in from the paper', 'Ours (same protocol)': '-'},
-        {'Method': 'Supervised phase recognition (e.g. TeCNO, Trans-SVNet)', 'Task': 'phase recognition',
-         'Split': '40 train / 40 test (differs)', 'Reported': 'fill in from the paper', 'Ours (same protocol)': '-'},
+    def phase_acc(key):
+        r = phase_stats.get(key) if key else None
+        if r is None:
+            return 'n/a'
+        return f"{pct(r['accuracy'])} (relaxed {pct(r['relaxed']['accuracy'])})"
+    tecno = by_short('tecno', 'comparison')
+    lit_rows = [{'Method': f'{protocol.COMPARISONS[k]["model"]} zero-shot (Yuan et al.)', 'Task': 'phase recognition',
+                 'Split': 'test 49-80 (same)', 'Reported': 'fill in from the paper',
+                 'Ours (same protocol)': phase_acc(author.get(k))} for k in protocol.SURGVLP_ZERO_SHOT]
+    lit_rows += [
+        {'Method': 'TeCNO (Czempiel et al., MICCAI 2020)', 'Task': 'phase recognition',
+         'Split': '40 / 8 / 32 (same)', 'Reported': 'fill in from the paper (state whether relaxed)',
+         'Ours (same protocol)': phase_acc(tecno.name if tecno else None) + ' (our re-implementation)'},
+        {'Method': 'Trans-SVNet (Gao et al., MICCAI 2021)', 'Task': 'phase recognition',
+         'Split': '40 train / 40 test (differs: its test set includes our validation videos)',
+         'Reported': 'fill in from the paper (relaxed)', 'Ours (same protocol)': '-'},
         {'Method': 'Supervised tool presence (e.g. EndoNet)', 'Task': 'tool presence mAP', 'Split': 'differs',
          'Reported': 'fill in from the paper', 'Ours (same protocol)': '-'},
-    ])
+    ]
     md += ['## 11. Published results (template)', '',
-           write_table(out, 'literature_template', lit, 'Published Cholec80 results for context (to be completed)',
-                       'Copy the numbers from the cited papers and state their protocol (split, relaxed or not); '
-                       'only the PeskaVLP row is directly comparable (same test videos, the authors\' prompts).'), '']
+           write_table(out, 'literature_template', pd.DataFrame(lit_rows),
+                       'Published Cholec80 results for context (to be completed)',
+                       'Copy the numbers from the cited papers and state their protocol (split, relaxed or not). '
+                       'Directly comparable: the SurgVLP/HecVL/PeskaVLP rows (same test videos, the authors\' '
+                       'prompts) and TeCNO (same split; our re-implementation). "Ours": accuracy, strict and relaxed.'), '']
 
     # ---- figures
     figs = []
@@ -1003,7 +1134,7 @@ def efficiency(m, root):
         marker = root / 'state' / f'train.{m.name}.done.json'
         if marker.exists():
             seconds = float(json.loads(marker.read_text()).get('seconds', 0))
-    if m.kind in ('clip_zeroshot', 'peskavlp_zeroshot'):
+    if m.kind in protocol.ZERO_SHOT:
         row['Training (h)'] = '0 (zero-shot)'
         row['Trainable (M)'] = '0'
     elif seconds:
@@ -1029,7 +1160,8 @@ def efficiency(m, root):
 
 # --------------------------------------------------------------------------- figures
 def palette(n):
-    base = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B3', '#937860', '#DA8BC3', '#8C8C8C']
+    base = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B3', '#937860', '#DA8BC3', '#8C8C8C', '#CCB974',
+            '#64B5CD', '#1B9E77', '#E7298A']
     return [base[i % len(base)] for i in range(n)]
 
 
@@ -1146,7 +1278,7 @@ def training_figure(plt, out, methods):
 
 
 def per_query_figure(plt, out, frames, stats, methods):
-    fig, ax = plt.subplots(figsize=(10, 3.4))
+    fig, ax = plt.subplots(figsize=(12, 3.6))
     width = 0.8 / max(1, len(methods))
     x = np.arange(len(frames.queries))
     for i, (m, c) in enumerate(zip(methods, palette(len(methods)))):

@@ -26,10 +26,13 @@ workflow and troubleshooting. The sections below describe the individual tools t
 
 **The paper's experiments** (`--preset paper`, defined in `paper_protocol.py`): on the standard
 Cholec80 split (40/8/32 videos), our baseline and advanced models with three seeds, one ablation per
-add-on, five comparison methods (CLIP zero-shot, PeskaVLP zero-shot and fine-tuned, X-CLIP
-fine-tuned, the official UniVTG model on the same M2CRL features), two sets of unseen query
+add-on, nine comparison methods (CLIP zero-shot; the surgical video-language models SurgVLP, HecVL and
+PeskaVLP zero-shot, and PeskaVLP fine-tuned; X-CLIP fine-tuned; the official UniVTG model on the same
+M2CRL features; TeCNO, a specialised Cholec80 phase-recognition model, re-implemented; and our own
+backbone and temporal head without language, as a closed-set classifier), two sets of unseen query
 wordings, and `paper_analysis.py`, which writes every table (CSV + LaTeX) and figure with bootstrap
-confidence intervals and paired significance tests. One resumable command; see README_HPC.md.
+confidence intervals and paired significance tests, and reports phase recognition with both the strict
+and the relaxed-boundary Cholec80 metrics. One resumable command; see README_HPC.md.
 
 ## Environment
 
@@ -176,8 +179,14 @@ original licence:
   [pytorch-image-models](https://github.com/huggingface/pytorch-image-models) (Apache 2.0).
 - `comparison_models/univtg/official/` is copied unmodified from
   [UniVTG](https://github.com/showlab/UniVTG) (MIT; see `VENDORED.md` there).
-- PeskaVLP is not included: `comparison_models/peskavlp/setup_env.sh` installs the official
-  [SurgVLP](https://github.com/CAMMA-public/SurgVLP) code at a fixed commit into its own environment, and the
-  pipeline downloads the authors' public weights (CC BY-NC-SA 4.0, research use).
-- Pretrained models (the M2CRL backbone checkpoint, CLIP, X-CLIP, PeskaVLP) and the Cholec80
-  dataset are **not** distributed here and are subject to their owners' terms.
+- SurgVLP, HecVL and PeskaVLP are not included: `comparison_models/peskavlp/setup_env.sh` installs the
+  official [SurgVLP](https://github.com/CAMMA-public/SurgVLP) code at a fixed commit into its own environment,
+  and the pipeline downloads the authors' public weights (CC BY-NC-SA 4.0, research use).
+- `comparison_models/tecno/tecno.py` is a re-implementation of
+  [TeCNO](https://github.com/tobiascz/TeCNO) (Czempiel et al., MICCAI 2020) from the paper and the authors'
+  configuration; none of their (GPL-3.0) code is included.
+- `paper_analysis.py` contains a Python port of the relaxed-boundary Cholec80 phase evaluation
+  (`Evaluate.m`/`Main.m`, as distributed with [TMRNet](https://github.com/YuemingJin/TMRNet), MIT).
+- Pretrained models (the M2CRL backbone checkpoint, CLIP, X-CLIP, SurgVLP, HecVL, PeskaVLP, the ImageNet
+  ResNet-50 TeCNO starts from) and the Cholec80 dataset are **not** distributed here and are subject to
+  their owners' terms.
