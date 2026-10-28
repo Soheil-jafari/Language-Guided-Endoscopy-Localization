@@ -1,4 +1,5 @@
-"""Our model without language: a closed-set comparison (paper protocol, run `paper_closedset_s42`).
+"""Our model without language: closed-set comparisons (paper protocol, runs `paper_closedset_s42` and
+`paper_closedset_matched_s42`).
 
 The same pretrained M2CRL video backbone and the same Transformer temporal head as our baseline, but with a
 fixed output per concept (7 phases + 7 tools, a multi-label classifier) instead of the text query. Everything
@@ -12,12 +13,21 @@ precision, temporal smoothness weight, seed) and model selection is the same (lo
                                                                                      -> temporal head (14)
 
 Loss, as ours without its add-ons: BCE(per-frame output) + BCE(temporal head) over the observed labels,
-plus TEMPORAL_LOSS_WEIGHT x mean |p(t+1) - p(t)| over consecutive observed frames. Each training window
-carries all 14 concepts at once (ours: one query per window), so an epoch has 14x fewer windows; batch
-8 x 2 accumulation keeps the number of optimiser steps per epoch close to ours (8 x 24 windows).
+plus TEMPORAL_LOSS_WEIGHT x mean |p(t+1) - p(t)| over consecutive observed frames.
 
-train    resumable at epoch boundaries (latest.pt), deterministic; writes best.pt, training_metrics.jsonl
-         and parameter_counts.json.
+Training exposure. Ours sees every training window once per query (14 times per epoch, each time with its own
+augmentation) in batches of 8 x 24 windows. A closed-set window carries all 14 labels at once, so two
+versions are trained:
+  * compute-efficient (--repeats 1, batch 8 x 2): every window once per epoch; about as many optimiser steps
+    as ours, but 14x fewer backbone passes and augmentation draws;
+  * exposure-matched (--repeats 14, batch 8 x 24): every window 14 times per epoch, each with its own
+    augmentation; the same number of backbone passes and optimiser steps as ours.
+Every journal row records the clips processed and the optimiser steps of the epoch.
+
+train    resumable at epoch boundaries (latest.pt; best.pt is only replaced after latest.pt has recorded it);
+         writes best.pt, training_metrics.jsonl and parameter_counts.json. The augmentation of a sample is
+         drawn from (seed, epoch, position), so it does not depend on the number of loader processes; on a
+         GPU, replaying an interrupted epoch can still differ in the last bits.
 predict  scores every frame of a work order (comparison_models/frame_scores.py): the temporal head's
          sigmoid, windows as in our validation/prediction (non-overlapping plus the overlapping tail,
          overlaps averaged). A query is answered by the output of its concept (it has no text input).
@@ -67,6 +77,9 @@ class ClosedSetModel(nn.Module):
         from models import TemporalHead, build_vision_backbone
         if cfg.MODEL.TEMPORAL_HEAD_TYPE != 'TRANSFORMER' or cfg.MODEL.USE_UNCERTAINTY:
             raise ValueError('the closed-set comparison mirrors the baseline (Transformer temporal head, no add-ons)')
+        if getattr(cfg.TRAIN, 'USE_LORA_BACKBONE', False):
+            raise ValueError('the closed-set comparison trains the whole backbone, as our baseline does; '
+                             'USE_LORA_BACKBONE is not supported here')
         self.config = cfg
         self.vision_backbone = build_vision_backbone(cfg, initialize_backbone)
         dim = self.vision_backbone.embed_dim
@@ -160,6 +173,27 @@ class Windows(Dataset):
         return clip, target, torch.arange(self.length) < n, v, start
 
 
+def sample_seed(seed, epoch, index):
+    """The random augmentation of one sample in one epoch: a function of these three numbers only."""
+    return (int(seed) * 1_000_003 + int(epoch) * 10_007 + int(index)) % (2 ** 63)
+
+
+class EpochWindows(Dataset):
+    """One training epoch: the windows `indices` (a window may appear several times), each sample augmented
+    with its own seed (seed, epoch, position), independent of the loader's processes."""
+
+    def __init__(self, windows, indices, seed):
+        self.windows, self.indices, self.seed, self.epoch = windows, list(indices), int(seed), 0
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(sample_seed(self.seed, self.epoch, i))
+            return self.windows[self.indices[i]]
+
+
 @torch.no_grad()
 def predict_videos(model, videos, cfg, device, workers, amp_dtype):
     """{video index: (n, 14) probabilities}, overlaps averaged."""
@@ -221,7 +255,8 @@ def parameter_counts(model):
 
 
 def train(args):
-    from checkpoint_utils import atomic_save, config_dict, restore_rng, rng_state
+    from checkpoint_utils import (atomic_save, atomic_write_text, commit_best, config_dict, pending_best_path,
+                                  restore_rng, rng_state)
     from dataset import image_transform
     from project_config import config as cfg
     overrides = json.loads(Path(args.config).read_text())
@@ -236,9 +271,12 @@ def train(args):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     settings = config_dict(cfg)
+    if args.repeats < 1:
+        raise ValueError('--repeats must be at least 1')
     signature = dict(config={k: v for k, v in settings.items() if k not in ('DATA',)},
                      data={k: v for k, v in settings['DATA'].items() if k != 'NUM_WORKERS'},
                      train=file_sha(args.train_labels), val=file_sha(args.val_labels),
+                     train_order=file_sha(args.train_order), val_order=file_sha(args.val_order), repeats=args.repeats,
                      weights=os.path.getsize(cfg.MODEL.M2CRL_WEIGHTS_PATH) if cfg.MODEL.M2CRL_WEIGHTS_PATH else None)
     _, train_videos = load_order(args.train_order, args.train_labels)
     _, val_videos = load_order(args.val_order, args.val_labels)
@@ -246,6 +284,7 @@ def train(args):
     resume = torch.load(latest, map_location='cpu', weights_only=False) if latest.exists() else None
     if resume is not None and (resume.get('schema') != SCHEMA or resume.get('signature') != signature):
         raise ValueError(f'{latest} was made with different settings or data; use a new output folder')
+    commit_best(out / 'best.pt', resume.get('best_epoch') if resume is not None else None)
     model = ClosedSetModel(cfg, initialize_backbone=resume is None).to(device)
     Path(args.parameter_counts or out / 'parameter_counts.json').write_text(json.dumps(parameter_counts(model), indent=2))
     stride = cfg.DATA.TRAIN_WINDOW_STRIDE
@@ -256,7 +295,7 @@ def train(args):
     indices = list(range(len(train_set)))
     if cfg.TRAIN.SUBSET_RATIO < 1:                                 # as dataset.create_dataloaders
         indices = random.Random(cfg.TRAIN.SEED).sample(indices, max(1, int(len(indices) * cfg.TRAIN.SUBSET_RATIO)))
-    train_set = torch.utils.data.Subset(train_set, indices)
+    train_set = EpochWindows(train_set, indices * args.repeats, cfg.TRAIN.SEED)
     batch, accumulation = cfg.TRAIN.BATCH_SIZE, cfg.TRAIN.GRADIENT_ACCUMULATION_STEPS
     batches = math.ceil(len(train_set) / batch)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.TRAIN.LEARNING_RATE,
@@ -274,14 +313,14 @@ def train(args):
     on_cuda = torch.device(device).type == 'cuda'
     scaler = torch.amp.GradScaler('cuda', enabled=on_cuda and amp_dtype == torch.float16)
     pos_weight = torch.tensor(float(cfg.TRAIN.BCE_POS_WEIGHT), device=device)
-    start, best = 0, float('inf')
+    start, best, best_epoch = 0, float('inf'), None
     if resume is not None:
         model.load_state_dict(resume['model'], strict=True)
         optimizer.load_state_dict(resume['optimizer'])
         scheduler.load_state_dict(resume['scheduler'])
         scaler.load_state_dict(resume['scaler'])
         restore_rng(resume['rng'])
-        start, best = resume['epoch'], resume['best_val_nll']
+        start, best, best_epoch = resume['epoch'], resume['best_val_nll'], resume.get('best_epoch')
         print(f'resuming after epoch {start}', flush=True)
     journal = out / 'training_metrics.jsonl'
     if journal.exists():                    # keep the rows of finished epochs only (an interrupted job is redone)
@@ -293,12 +332,13 @@ def train(args):
                 continue
             if isinstance(r, dict) and isinstance(r.get('epoch'), int) and r['epoch'] <= start:
                 rows[r['epoch']] = r
-        journal.write_text(''.join(json.dumps(rows[e]) + '\n' for e in sorted(rows)))
+        atomic_write_text(journal, ''.join(json.dumps(rows[e]) + '\n' for e in sorted(rows)))
     workers = args.workers
     for epoch in range(start, cfg.TRAIN.NUM_EPOCHS):
         model.train()
         if on_cuda:
             torch.cuda.reset_peak_memory_stats()
+        train_set.epoch = epoch                                    # (the loader's processes copy the dataset)
         loader = DataLoader(train_set, batch_size=batch, shuffle=True, num_workers=workers,
                             generator=torch.Generator().manual_seed(cfg.TRAIN.SEED * 1000 + epoch),
                             pin_memory=on_cuda)
@@ -333,15 +373,19 @@ def train(args):
             raise ValueError('training epoch has no observed targets')
         trained = time.time()
         val_nll = frame_nll(predict_videos(model, val_videos, cfg, device, workers, amp_dtype), val_videos)
+        improved = val_nll < best
+        if improved:
+            best, best_epoch = val_nll, epoch + 1
         state = dict(schema=SCHEMA, signature=signature, config=settings, model=model.state_dict(), epoch=epoch + 1,
-                     best_val_nll=min(best, val_nll))
-        if val_nll < best:
-            best = val_nll
-            atomic_save(state, out / 'best.pt')
+                     best_val_nll=best, best_epoch=best_epoch)
+        if improved:
+            atomic_save(state, pending_best_path(out / 'best.pt', epoch + 1))
         atomic_save(dict(state, optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
                          scaler=scaler.state_dict(), rng=rng_state()), latest)
+        commit_best(out / 'best.pt', best_epoch)
         row = dict(epoch=epoch + 1, train_loss=weighted / observed, val_frame_nll=val_nll,
-                   train_seconds=round(trained - started, 1), val_seconds=round(time.time() - trained, 1))
+                   train_seconds=round(trained - started, 1), val_seconds=round(time.time() - trained, 1),
+                   train_clips=len(train_set), optimizer_steps=steps)
         if on_cuda:
             row['peak_gpu_memory_gb'] = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
         with journal.open('a') as f:
@@ -399,6 +443,7 @@ def main():
     for name in ['config', 'train-order', 'train-labels', 'val-order', 'val-labels', 'output']:
         t.add_argument('--' + name, required=True)
     t.add_argument('--parameter-counts', help='where to write the parameter counts (default: in --output)')
+    t.add_argument('--repeats', type=int, default=1, help='passes over every training window per epoch')
     s = sub.add_parser('predict')
     for name in ['checkpoint', 'work-order', 'output']:
         s.add_argument('--' + name, required=True)

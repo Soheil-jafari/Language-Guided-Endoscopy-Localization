@@ -50,6 +50,7 @@ sys.path.insert(0, str(HERE / 'official'))          # the official `model` and `
 from data_contract import AnnotationIndex, load_video_metadata, sample_indices, window_positions  # noqa: E402
 from comparison_models.frame_scores import manifest_pairs  # noqa: E402
 from metrics import temporal_ap  # noqa: E402
+from checkpoint_utils import commit_best, pending_best_path  # noqa: E402
 
 SCHEMA = 'univtg-adapter-2'
 # Official QVHighlights fine-tuning settings (scripts/qvhl_pretrain.sh, main/config.py defaults), except as noted above.
@@ -395,7 +396,7 @@ def train(args):
     model, criterion, opt = build(settings, args.device)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=opt.wd)
     scheduler = WarmupStepLR(optimizer, warmup_steps=opt.lr_warmup, step_size=opt.lr_drop, gamma=opt.lr_gamma)
-    start, best = 0, -1.0
+    start, best, best_epoch = 0, -1.0, None
     latest = out / 'latest.pt'
     if latest.exists():
         ck = torch.load(latest, map_location='cpu', weights_only=False)
@@ -405,8 +406,9 @@ def train(args):
         optimizer.load_state_dict(ck['optimizer'])
         scheduler.load_state_dict(ck['scheduler'])
         restore_rng(ck['rng'])
-        start, best = ck['epoch'], ck['best_val_map']
+        start, best, best_epoch = ck['epoch'], ck['best_val_map'], ck.get('best_epoch')
         print(f'resuming after epoch {start}', flush=True)
+    commit_best(out / 'best.pt', best_epoch)              # best.pt only holds an epoch that latest.pt committed
     weights = criterion.weight_dict
     for epoch in range(start, args.epochs):
         started = time.time()
@@ -435,11 +437,13 @@ def train(args):
             val_map = window_map(model, val_samples, args.device, args.batch_size, opt)
             row['val_window_map'] = val_map
             if val_map > best:
-                best = val_map
+                best, best_epoch = val_map, epoch + 1
                 atomic_save(dict(signature=signature, model=model.state_dict(), epoch=epoch + 1, val_window_map=val_map,
-                                 settings=settings), out / 'best.pt')
+                                 settings=settings), pending_best_path(out / 'best.pt', epoch + 1))
         atomic_save(dict(signature=signature, model=model.state_dict(), optimizer=optimizer.state_dict(),
-                         scheduler=scheduler.state_dict(), rng=rng_state(), epoch=epoch + 1, best_val_map=best), latest)
+                         scheduler=scheduler.state_dict(), rng=rng_state(), epoch=epoch + 1, best_val_map=best,
+                         best_epoch=best_epoch), latest)
+        commit_best(out / 'best.pt', best_epoch)
         with open(out / 'training_metrics.jsonl', 'a') as f:
             f.write(json.dumps(row) + '\n')
         print(json.dumps(row), flush=True)

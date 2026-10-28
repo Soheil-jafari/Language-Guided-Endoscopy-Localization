@@ -150,22 +150,28 @@ def test_the_paper_protocol_end_to_end(tmp_path):
         assert (root / 'runs' / n / 'training_metrics.jsonl').read_text() == content, n
     assert all((root / 'results' / n / 'proposed_test_metrics.json').exists() for n in names)
     text = (paper / 'PAPER_RESULTS.md').read_text()
-    assert 'Runs finished: **19 of 19**' in text
+    assert 'Runs finished: **20 of 20**' in text
     report = json.loads((paper / 'analysis.json').read_text())
-    assert 'figure_error' not in report and len(report['methods']) == 19
+    assert 'figure_error' not in report and len(report['methods']) == 20
     for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'phase_recognition_relaxed',
-                  'tool_presence', 'ablations', 'seeds', 'generalisation', 'efficiency'):
+                  'phase_recognition_relaxed_symmetric', 'tool_presence', 'ablations', 'seeds', 'generalisation',
+                  'efficiency'):
         assert (paper / 'tables' / f'{table}.tex').exists(), table
     main = pd.read_csv(paper / 'tables' / 'main_results.csv')
-    assert len(main) == 11
+    assert len(main) == 12
+    assert {r['test'] for r in report['significance'] if r['metric'] == 'mAP'} == {'permutation (primary)'}
     phase = pd.read_csv(paper / 'tables' / 'phase_recognition.csv')
     assert sum("authors' phase prompts" in m for m in phase.Method) == 3
     seg = pd.read_csv(paper / 'tables' / 'segment_results.csv')
     assert any('own windows' in m for m in seg.Method)
     assert len(pd.read_csv(paper / 'tables' / 'generalisation.csv')) == 13       # every method with a text input
     eff = pd.read_csv(paper / 'tables' / 'efficiency.csv').set_index('Method')
-    for label in ('TeCNO (re-implementation)', 'Our backbone without language (closed-set)'):
+    for label in ('TeCNO (re-implementation)', 'Closed-set, our backbone (compute-efficient)',
+                  'Closed-set, our backbone (exposure-matched)'):
         assert eff.loc[label, 'Training (h)'] != 'n/a' and eff.loc[label, 'Trainable (M)'] != 'n/a', label
+    clips = {k: int(float(str(eff.loc[k, 'Training clips']).replace(',', ''))) for k in ('Baseline (ours)',
+             'Closed-set, our backbone (compute-efficient)', 'Closed-set, our backbone (exposure-matched)')}
+    assert clips['Closed-set, our backbone (exposure-matched)'] > 5 * clips['Closed-set, our backbone (compute-efficient)']
     for key in ('baseline_s42', 'advanced_s42'):
         done = json.loads((paper / 'explanations' / key / 'done.json').read_text())
         assert done['figures'] and (paper / 'explanations' / key / f'explanation_{done["figures"][0]}.png').exists()
@@ -174,6 +180,7 @@ def test_the_paper_protocol_end_to_end(tmp_path):
     assert 'Method: **TeCNO (re-implementation)**' in (root / 'results' / 'paper_tecno_s42' / 'SUMMARY.md').read_text()
     assert 'Training (tecno_tcn)' in (root / 'results' / 'paper_tecno_s42' / 'SUMMARY.md').read_text()
     assert 'Training (closedset)' in (root / 'results' / 'paper_closedset_s42' / 'SUMMARY.md').read_text()
+    assert 'Training (closedset)' in (root / 'results' / 'paper_closedset_matched_s42' / 'SUMMARY.md').read_text()
     assert 'Model: **baseline + Mamba temporal head**' in \
         (root / 'results' / 'paper_ablation_mamba_s42' / 'SUMMARY.md').read_text()
     assert 'Unseen query wordings' in (root / 'results' / 'paper_advanced_s43' / 'SUMMARY.md').read_text()

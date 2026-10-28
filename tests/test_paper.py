@@ -26,9 +26,10 @@ REPO = Path(pipeline.__file__).resolve().parent
 def test_the_protocol_lists_every_run_once_in_priority_order():
     plans = protocol.plans('paper')
     names = [p['name'] for p in plans]
-    assert len(names) == len(set(names)) == 19
+    assert len(names) == len(set(names)) == 20
     assert names[:2] == ['paper_baseline_s42', 'paper_advanced_s42']           # the main comparison first
-    assert names[-4:] == ['paper_baseline_s43', 'paper_advanced_s43', 'paper_baseline_s44', 'paper_advanced_s44']
+    assert names[-5:-1] == ['paper_baseline_s43', 'paper_advanced_s43', 'paper_baseline_s44', 'paper_advanced_s44']
+    assert names[-1] == 'paper_closedset_matched_s42'                           # the longest comparison runs last
     assert {p['kind'] for p in plans} - {'proposed'} == set(pipeline.COMPARISON_METHODS) == set(protocol.COMPARISONS)
     assert protocol.ADVANCED == pipeline.ADVANCED_FLAGS                          # one definition of "advanced"
     ablations = [p for p in plans if p['group'] == 'ablation']
@@ -44,7 +45,8 @@ def test_the_protocol_lists_every_run_once_in_priority_order():
     comparisons = [p for p in plans if p['group'] == 'comparison']
     assert [p['kind'] for p in comparisons] == list(protocol.ZERO_SHOT + protocol.TRAINED)
     # models without a text input are not asked in other words; every other method is
-    assert {p['kind'] for p in comparisons if not p['paraphrases']} == set(protocol.CLOSED_SET) == {'tecno', 'closedset'}
+    assert {p['kind'] for p in comparisons if not p['paraphrases']} == set(protocol.CLOSED_SET) == \
+        {'tecno', 'closedset', 'closedset_matched'}
     assert {protocol.COMPARISONS[k]['model'] for k in protocol.SURGVLP_ZERO_SHOT} == set(protocol.SURGVLP['weights_urls'])
     assert [p['name'] for p in protocol.plans('x')][0] == 'x_baseline_s42'
 
@@ -114,7 +116,7 @@ def test_paper_preset_settings_and_runs(tmp_path):
 def test_paper_dry_run_lists_the_protocol(tmp_path, capsys):
     assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path / 'r'), '--dry-run']) == 0
     out = capsys.readouterr().out
-    assert 'paper protocol: 19 runs' in out and 'paper_peskavlp_finetune_s42' in out and 'unseen wordings' in out
+    assert 'paper protocol: 20 runs' in out and 'paper_peskavlp_finetune_s42' in out and 'unseen wordings' in out
     assert 'paper_tecno_s42' in out and 'paper_closedset_s42' in out and 'paper_hecvl_zeroshot' in out
     assert not (tmp_path / 'r').exists()
 
@@ -144,7 +146,7 @@ def test_a_failed_run_stops_the_protocol_only_if_others_are_affected(tmp_path, m
     assert rc == 1
     names = [p['name'] for p in protocol.plans('paper')]
     if continues:
-        assert calls == names and outputs == [19]
+        assert calls == names and outputs == [20]
     else:
         assert calls == names[:names.index('paper_clip_zeroshot') + 1]
 
@@ -603,10 +605,86 @@ def test_relaxed_phase_metrics_reproduce_the_cholec80_evaluation_script():
     assert r['jaccard'] <= 1 and r['accuracy_std'] == pytest.approx(np.std([100, second], ddof=1) / 100)
 
 
+def test_relaxed_metrics_keep_annotation_gaps_on_the_time_grid():
+    # fps 0.2 -> a 2-frame boundary. Phase 1 (0-based 0) for 6 frames, then phase 2; the prediction switches 1 frame
+    # late (relaxed). Unknown frames (-1) inside, between and around phases must never be merged away.
+    gt = np.array([0] * 6 + [1] * 6)
+    pred = np.array([0] * 7 + [1] * 5)
+    assert pa.relaxed_evaluate(gt, pred, 0.2)[3] == pytest.approx(100)
+    # a 3-frame gap at the transition: the late frame is now the first frame of phase 2 AFTER the gap - still the
+    # first 2 frames of that run, so still relaxed; nothing else changes and the gap is not counted
+    gt_gap = np.r_[gt[:6], [-1] * 3, gt[6:]]
+    pred_gap = np.r_[pred[:6], [0] * 3, pred[6:]]
+    jac, prec, rec, acc = pa.relaxed_evaluate(gt_gap, pred_gap, 0.2)
+    assert acc == pytest.approx(100) and rec[1] == pytest.approx(100)
+    # a gap inside a phase splits it into two runs: an error right after the gap is "late" for the second run
+    gt_in = np.array([1] * 4 + [-1] * 3 + [1] * 4)
+    pred_in = np.array([1] * 4 + [1] * 3 + [0] + [1] * 3)               # phase 1 predicted as phase 0 after the gap
+    assert pa.relaxed_evaluate(gt_in, pred_in, 0.2)[3] == pytest.approx(100)     # 0 - 1 = -1: late, relaxed
+    # unknown frames at the start and the end are ignored completely
+    a = pa.relaxed_evaluate(np.r_[[-1] * 2, gt, [-1] * 2], np.r_[[3] * 2, pred, [5] * 2], 0.2)
+    b = pa.relaxed_evaluate(gt, pred, 0.2)
+    for x, z in zip(a, b):
+        np.testing.assert_allclose(x, z, equal_nan=True)
+    # phase_recognition keeps the grid position of every annotated frame; the metrics use it
+    per_video = {0: (gt, pred, np.r_[np.arange(6), np.arange(9, 15)])}
+    assert pa.phase_gaps(per_video) == {0: 3}
+    r = pa.relaxed_phase_metrics(per_video, 0.2)
+    assert r['accuracy'] == pytest.approx(1)
+
+
+def test_symmetric_relaxation_also_forgives_early_transitions():
+    gt, pred = np.array([0] * 5 + [1] * 5), np.array([0] * 4 + [1] * 6)    # phase 2 predicted 1 frame early
+    assert pa.relaxed_evaluate(gt, pred, 0.2)[3] == pytest.approx(90)               # legacy script: not forgiven
+    assert pa.relaxed_evaluate(gt, pred, 0.2, legacy=False)[3] == pytest.approx(100)  # as intended: forgiven
+    late = np.array([0] * 6 + [1] * 4)                                               # late transitions: both forgive
+    assert pa.relaxed_evaluate(gt, late, 0.2)[3] == pa.relaxed_evaluate(gt, late, 0.2, legacy=False)[3] == 100
+
+
 def test_holm_and_bootstrap_p_values():
     np.testing.assert_allclose(pa.holm([0.01, 0.04, 0.03, math.nan]), [0.03, 0.06, 0.06, math.nan])
-    assert pa.bootstrap_p(np.ones(999)) == pytest.approx(2 / 1000)
-    assert pa.bootstrap_p(np.r_[np.ones(500), -np.ones(500)]) == 1.0
+    # null-centred: the bootstrap distribution shifted to 0 is compared with the observed difference
+    rng = np.random.default_rng(0)
+    assert pa.bootstrap_p(rng.normal(0.5, 0.1, 999), 0.5) == pytest.approx(1 / 1000)     # 5 SE away: never reached
+    assert pa.bootstrap_p(rng.normal(0.05, 0.1, 999), 0.05) > 0.5                       # half an SE: not significant
+    assert pa.bootstrap_p(np.r_[np.ones(500), -np.ones(500)], 0.0) == 1.0
+    assert math.isnan(pa.bootstrap_p([], 0.1))
+
+
+def _synthetic_frames(n_videos=8, frames=60, seed=0):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for v in range(n_videos):
+        for q in PHRASES:
+            y = (rng.random(frames) < 0.3).astype(int)
+            for i in range(frames):
+                rows.append(dict(video_id=f'CHOLEC80__video{v + 1:02d}', text_query=q, frame_idx=25 * i, label=y[i]))
+    df = pd.DataFrame(rows).sort_values(['video_id', 'text_query', 'frame_idx'])
+    df['_q'] = df.text_query.map({q: i for i, q in enumerate(PHRASES)})
+    df = df.sort_values(['video_id', '_q', 'frame_idx'], kind='mergesort').reset_index(drop=True)
+    return pa.Frames(df)
+
+
+def test_paired_permutation_test_of_the_map_difference():
+    frames = _synthetic_frames()
+    rng = np.random.default_rng(1)
+    y = frames.label.astype(float)
+    good = np.clip(0.5 * y + 0.5 * rng.random(len(y)), 0, 1)              # informative scores
+    noise = rng.random(len(y))                                             # chance level
+    twin_a = np.clip(good + rng.normal(0, 0.2, len(y)), 0, 1)            # two equally good methods
+    twin_b = np.clip(good + rng.normal(0, 0.2, len(y)), 0, 1)
+    scores = dict(good=good, noise=noise, twin_a=twin_a, twin_b=twin_b, same=good.copy())
+    pairs = [('good', 'noise'), ('good', 'same'), ('twin_a', 'twin_b')]
+    res = pa.permutation_map_tests(frames, scores, pairs, 200, seed=3)
+    stats = {k: pa.frame_summary(frames, v, 0.5) for k, v in scores.items()}
+    for x, z in pairs:                                                    # the observed difference is the mAP difference
+        assert res[(x, z)][0] == pytest.approx(stats[x]['macro_map'] - stats[z]['macro_map'])
+    # only swapping none or all of the 8 videos reaches |d_obs| (2 of 256 patterns): p near 1/201 + 2/256
+    assert res[('good', 'noise')][1] < 0.05
+    assert res[('good', 'same')] == (0.0, 1.0)                            # identical methods
+    assert res[('twin_a', 'twin_b')][1] > 0.05
+    # the same numbers with several processes (each pair has its own random stream)
+    assert pa.permutation_map_tests(frames, scores, pairs, 200, seed=3, workers=2) == res
 
 
 def _write_results(root, d, plan, rng, quality, sets=('val', 'test'), para=None):
@@ -647,7 +725,7 @@ def _write_results(root, d, plan, rng, quality, sets=('val', 'test'), para=None)
     if plan['kind'] == 'proposed':
         (run / 'training_metrics.jsonl').write_text(''.join(json.dumps(dict(
             epoch=e, train_loss=1 / e, val_frame_nll=0.5 + abs(e - 2) / 10, average_precision=0.8, train_seconds=60,
-            val_seconds=10, peak_gpu_memory_gb=12.5)) + '\n' for e in (1, 2, 3)))
+            val_seconds=10, peak_gpu_memory_gb=12.5, train_clips=10000, optimizer_steps=100)) + '\n' for e in (1, 2, 3)))
         (run / 'parameter_counts.json').write_text(json.dumps(dict(vision_backbone=dict(total=86e6, trainable=1e6))))
         man = dict(frame_scores=1000, seconds=10, parameters=150e6)
     else:
@@ -669,16 +747,16 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
             continue                                                   # a run that has not finished yet
         _write_results(root, d, p, rng, quality=3.0 if p['kind'] == 'proposed' else 1.0,
                        para=para if p['paraphrases'] else None)
-    assert pa.main(['--root', str(root), '--bootstrap', '30']) == 0
+    assert pa.main(['--root', str(root), '--bootstrap', '30', '--permutations', '20']) == 0
     out = root / 'paper'
     text = (out / 'PAPER_RESULTS.md').read_text()
-    assert 'Runs finished: **18 of 19**' in text and 'paper_peskavlp_finetune_s42' in text
+    assert 'Runs finished: **19 of 20**' in text and 'paper_peskavlp_finetune_s42' in text
     for section in ('Main results', 'Paired significance', 'Temporal segments', 'phase recognition', 'Tool presence',
                     'Per-query AP', 'Ablations', 'seeds', 'unseen query wordings', 'Efficiency', 'Published results'):
         assert section.lower() in text.lower(), section
     for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'phase_recognition_relaxed',
-                  'tool_presence', 'per_query_ap', 'breakdown', 'ablations', 'seeds', 'generalisation', 'efficiency',
-                  'literature_template'):
+                  'phase_recognition_relaxed_symmetric', 'tool_presence', 'per_query_ap', 'breakdown', 'ablations',
+                  'seeds', 'generalisation', 'efficiency', 'literature_template'):
         assert (out / 'tables' / f'{table}.csv').exists() and (out / 'tables' / f'{table}.tex').exists(), table
         assert '\\begin{tabular}' in (out / 'tables' / f'{table}.tex').read_text()
     for fig in ('reliability', 'risk_coverage', 'training_dynamics', 'per_query_ap', 'generalisation',
@@ -687,9 +765,10 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     report = json.loads((out / 'analysis.json').read_text())
     assert 'figure_error' not in report
     main = pd.read_csv(out / 'tables' / 'main_results.csv')
-    assert list(main.Method)[-2:] == ['Baseline (ours)', 'Advanced (ours)'] and len(main) == 10
+    assert list(main.Method)[-2:] == ['Baseline (ours)', 'Advanced (ours)'] and len(main) == 11
     assert list(main.Method)[:4] == ['CLIP zero-shot', 'SurgVLP zero-shot', 'HecVL zero-shot', 'PeskaVLP zero-shot']
-    assert {'TeCNO (re-implementation)', 'Our backbone without language (closed-set)'} <= set(main.Method)
+    assert {'TeCNO (re-implementation)', 'Closed-set, our backbone (compute-efficient)',
+            'Closed-set, our backbone (exposure-matched)'} <= set(main.Method)
     seg = pd.read_csv(out / 'tables' / 'segment_results.csv')
     assert any('own windows' in m for m in seg.Method)
     phase = pd.read_csv(out / 'tables' / 'phase_recognition.csv')
@@ -698,26 +777,36 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     assert list(relaxed.Method) == list(phase.Method)
     for key, r in report['phase_recognition'].items():                 # relaxing the boundaries never hurts
         assert r['relaxed']['accuracy'] >= r['accuracy'] - 1e-12, key
+        assert r['relaxed_symmetric']['accuracy'] >= r['accuracy'] - 1e-12, key
+    assert report['phase_annotation_gaps']['videos_with_gaps'] == []
+    assert 'No test video has a frame without a phase annotation' in text
     lit = pd.read_csv(out / 'tables' / 'literature_template.csv')
     tecno = lit[lit.Method.str.startswith('TeCNO')].iloc[0]
-    assert tecno['Split'] == '40 / 8 / 32 (same)' and 'relaxed' in tecno['Ours (same protocol)']
-    assert lit[lit.Method.str.startswith('HecVL')].iloc[0]['Ours (same protocol)'] != 'n/a'
+    assert '40 / 8 / 32' in tecno['What matches'] and 'legacy relaxed' in tecno['Ours: accuracy on our frames']
+    assert lit[lit.Method.str.startswith('HecVL')].iloc[0]['Ours: accuracy on our frames'] != 'n/a'
     eff = pd.read_csv(out / 'tables' / 'efficiency.csv').set_index('Method')
     assert eff.loc['HecVL zero-shot', 'Training (h)'] == '0 (zero-shot)'
+    assert eff.loc['Baseline (ours)', 'Training clips'] == '30,000'           # 3 epochs x 10,000 clips
+    assert int(eff.loc['Baseline (ours)', 'Optimiser steps']) == 300
     gen = pd.read_csv(out / 'tables' / 'generalisation.csv')
     # every method with a text input, except the unfinished run; never the closed-set models
     assert {'AP set A', 'AP set B', 'mAP set A'} <= set(gen.columns) and len(gen) == 2 + 4 + 6
-    assert not any(m.startswith(('TeCNO', 'Our backbone without')) for m in gen.Method)
+    assert not any(m.startswith(('TeCNO', 'Closed-set')) for m in gen.Method)
     seeds = pd.read_csv(out / 'tables' / 'seeds.csv')
     assert list(seeds.Seeds) == ['42, 43, 44', '42, 43, 44']
     m = report['methods']['paper_advanced_s42']['frame']
     assert m['average_precision'] > 0.8 and 'evidence_uncertainty_aurc' in m
     sig = report['significance']
     assert {r['metric'] for r in sig} == {'AP', 'mAP', 'F1', 'Segment mAP@0.5'}
+    assert {r['test'] for r in sig if r['metric'] == 'mAP'} == {'permutation (primary)'}
+    assert {r['test'] for r in sig if r['metric'] != 'mAP'} == {'bootstrap (secondary)'}
+    primary = [r for r in sig if r['metric'] == 'mAP']
+    assert len(primary) == 1 + 2 * 9 + 4             # adv vs base, ours vs the 9 finished comparisons, ablations
+    assert all(1 / 21 - 1e-9 <= r['p'] <= 1 for r in primary) and report['permutations'] == 20
     # a missing input of a finished run is an error, not a silently smaller table
     (root / 'results' / 'paper_clip_zeroshot' / 'test_reference.csv').write_text('video_id,text_query,frame_idx,label\n')
     with pytest.raises(ValueError):
-        pa.main(['--root', str(root), '--bootstrap', '5'])
+        pa.main(['--root', str(root), '--bootstrap', '5', '--permutations', '5'])
 
 
 def test_the_analysis_of_a_root_without_finished_runs_is_a_short_note(tmp_path):

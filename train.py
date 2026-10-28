@@ -14,8 +14,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from project_config import config
-from checkpoint_utils import (SCHEMA_VERSION, atomic_save, config_dict, file_hash,
-    load_model_state, read_checkpoint, rng_state, restore_rng)
+from checkpoint_utils import (SCHEMA_VERSION, atomic_save, commit_best, config_dict, file_hash,
+    load_model_state, pending_best_path, read_checkpoint, rng_state, restore_rng)
 from dataset import create_dataloaders
 from losses import MasterLoss, EvidentialLoss
 from metrics import binary_metrics, deduplicate_frame_rows, validation_threshold
@@ -149,10 +149,12 @@ def main(args):
     dtype=torch.bfloat16 if config.TRAIN.AMP_DTYPE=='bf16' else torch.float16
     scaler=torch.amp.GradScaler('cuda',enabled=config.TRAIN.DEVICE.startswith('cuda') and dtype==torch.float16)
     criterion=MasterLoss(config).to(config.TRAIN.DEVICE)
-    start=0; best=float('inf')
+    start=0; best=float('inf'); best_epoch=None
     if args.resume_from:
         ckpt=load_checkpoint(args.resume_from,model,optimizer,scheduler,scaler,expected_provenance=provenance)
-        start=ckpt['epoch']; best=ckpt['best_val_loss']
+        start=ckpt['epoch']; best=ckpt['best_val_loss']; best_epoch=ckpt.get('best_epoch')
+    # best_model.pth only ever holds an epoch that latest_model.pth has committed (see checkpoint_utils)
+    commit_best(output/'best_model.pth',best_epoch)
     (output/'run_config.json').write_text(json.dumps(config_dict(config),indent=2))
     print(f'Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
     parameter_counts={name:dict(total=sum(p.numel() for p in module.parameters()),trainable=sum(p.numel() for p in module.parameters() if p.requires_grad))
@@ -167,12 +169,14 @@ def main(args):
         val,auc,ap,acc,f1,threshold,chosen=validate_one_epoch(model,val_loader,criterion,config.TRAIN.DEVICE)
         validated=time.time()
         improved=val<best
-        if improved: best=val
-        extra=dict(provenance=provenance,validation_threshold=threshold)
-        if improved: save_checkpoint(model,optimizer,scheduler,scaler,epoch+1,best,output/'best_model.pth',extra)
+        if improved: best=val; best_epoch=epoch+1
+        extra=dict(provenance=provenance,validation_threshold=threshold,best_epoch=best_epoch)
+        if improved: save_checkpoint(model,optimizer,scheduler,scaler,epoch+1,best,pending_best_path(output/'best_model.pth',epoch+1),extra)
         save_checkpoint(model,optimizer,scheduler,scaler,epoch+1,best,output/'latest_model.pth',extra)
+        commit_best(output/'best_model.pth',best_epoch)
         row=dict(epoch=epoch+1,train_loss=loss,val_frame_nll=val,auroc=auc,average_precision=ap,accuracy=acc,validation_f1=f1,validation_threshold=threshold,
-                 train_seconds=round(trained-started,1),val_seconds=round(validated-trained,1))  # wall time, for planning job lengths
+                 train_seconds=round(trained-started,1),val_seconds=round(validated-trained,1),  # wall time, for planning job lengths
+                 train_clips=len(train_loader.dataset),optimizer_steps=steps)   # training exposure (efficiency table)
         if torch.cuda.is_available(): row['peak_gpu_memory_gb']=round(torch.cuda.max_memory_allocated()/1024**3,2)  # efficiency table
         with (output/'training_metrics.jsonl').open('a') as f: f.write(json.dumps(row,allow_nan=False)+'\n')
         print(json.dumps(row))

@@ -46,6 +46,52 @@ def atomic_save(value, path):
             temp.unlink()
 
 
+# --------------------------------------------------------------------------- best checkpoint, committed with latest
+# A training loop keeps two files: latest (everything needed to resume) and best (the model selected on
+# validation). Each is replaced atomically, but a stop between the two replacements must not leave a best file
+# from an epoch that the resumed job will redo (and, on a GPU, may redo with slightly different numbers). So an
+# improved model is first written as a pending candidate, latest then records `best_epoch`, and only then does
+# the candidate replace best. On start-up, commit_best() finishes or discards whatever a stop left behind, so best
+# always belongs to the history latest describes.
+def pending_best_path(best, epoch):
+    best = Path(best)
+    return best.with_name(f'{best.stem}.pending-e{int(epoch)}{best.suffix}')
+
+
+def save_best_candidate(value, best, epoch, save=atomic_save):
+    save(value, pending_best_path(best, epoch))
+
+
+def commit_best(best, committed_epoch):
+    """The candidate of `committed_epoch` (the best epoch recorded in latest) replaces best; candidates of any
+    other epoch were never committed and are deleted. Returns the epoch committed now, or None."""
+    best = Path(best)
+    prefix = f'{best.stem}.pending-e'
+    done = None
+    for f in sorted(best.parent.glob(f'{prefix}*{best.suffix}')) if best.parent.exists() else []:
+        try:
+            epoch = int(f.name[len(prefix):len(f.name) - len(best.suffix)])
+        except ValueError:
+            continue
+        if committed_epoch is not None and epoch == int(committed_epoch):
+            os.replace(f, best)
+            done = epoch
+        else:
+            f.unlink()
+    return done
+
+
+def atomic_write_text(path, text):
+    """Replace a small text file (e.g. a training journal) atomically."""
+    path = Path(path)
+    temp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    with open(temp, 'w') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+
+
 def rng_state():
     return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
                 cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)

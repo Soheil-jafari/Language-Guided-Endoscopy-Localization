@@ -102,6 +102,10 @@ def test_peskavlp_checks_scores_finetunes_and_resumes(tmp_path):
     assert refused.returncode != 0 and 'different settings' in refused.stderr
     peska(base + ['--epochs', '2'], hf)                                       # finished: a no-op
     assert len((ft / 'training_metrics.jsonl').read_text().splitlines()) == 2
+    import torch
+    latest = torch.load(ft / 'latest.pt', map_location='cpu', weights_only=False)
+    assert torch.load(ft / 'best.pt', map_location='cpu', weights_only=False)['epoch'] == latest['best_epoch']
+    assert not list(ft.glob('*.pending-*'))                                   # best.pt committed after latest.pt
     # 4. scores of the fine-tuned model, and the checkpoint must match the weights
     peska(['score', '--work-order', tmp_path / 'test.json', '--weights', weights, '--checkpoint', ft / 'best.pt',
            '--output', tmp_path / 'ft.npz', '--device', 'cpu', '--workers', '0'], hf)

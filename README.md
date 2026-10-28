@@ -26,13 +26,15 @@ workflow and troubleshooting. The sections below describe the individual tools t
 
 **The paper's experiments** (`--preset paper`, defined in `paper_protocol.py`): on the standard
 Cholec80 split (40/8/32 videos), our baseline and advanced models with three seeds, one ablation per
-add-on, nine comparison methods (CLIP zero-shot; the surgical video-language models SurgVLP, HecVL and
+add-on, ten comparison methods (CLIP zero-shot; the surgical video-language models SurgVLP, HecVL and
 PeskaVLP zero-shot, and PeskaVLP fine-tuned; X-CLIP fine-tuned; the official UniVTG model on the same
 M2CRL features; TeCNO, a specialised Cholec80 phase-recognition model, re-implemented; and our own
-backbone and temporal head without language, as a closed-set classifier), two sets of unseen query
-wordings, and `paper_analysis.py`, which writes every table (CSV + LaTeX) and figure with bootstrap
-confidence intervals and paired significance tests, and reports phase recognition with both the strict
-and the relaxed-boundary Cholec80 metrics. One resumable command; see README_HPC.md.
+backbone and temporal head without language, as a closed-set classifier, once compute-efficient and once
+with the same training exposure as ours), two sets of unseen query wordings, and `paper_analysis.py`,
+which writes every table (CSV + LaTeX) and figure with bootstrap confidence intervals and paired tests
+(a permutation test for the primary endpoint, the 14-query mAP), and reports phase recognition with the
+strict, the legacy relaxed-boundary and the symmetric relaxed Cholec80 metrics. One resumable command;
+see README_HPC.md.
 
 ## Environment
 

@@ -12,14 +12,17 @@ Protocol (the same for every method):
     annotation (-100) are left out, never counted as negatives;
   * the operating threshold of each method is the one selected on the validation videos (evaluate.py);
   * 95 % confidence intervals: percentile bootstrap over test videos (resampled with replacement, the same
-    resamples for every method, so differences are paired); p-values: paired bootstrap (two-sided) and the
-    Wilcoxon signed-rank test on per-video AP; Holm correction within each table;
+    resamples for every method, so differences are paired);
+  * tests: primary endpoint = the 14-query mAP, paired permutation test (the two methods' scores swapped
+    within random test videos) with Holm correction over all its comparisons; secondary endpoints (pooled AP,
+    F1, segment mAP@0.5): paired bootstrap test centred at the null, Holm within each; plus the Wilcoxon
+    signed-rank test on per-video AP;
   * segments: runs of frames at or above the threshold (the same post-processing for every method);
     ground truth: runs of annotated positive frames; unannotated frames are excluded from both;
   * phase recognition: per frame, the phase query with the highest score; the standard (non-relaxed) Cholec80
     metrics - accuracy per video, then precision / recall / Jaccard per phase averaged over videos - and, next to
-    them, the relaxed-boundary metrics of the Cholec80/M2CAI evaluation script used by most phase-recognition
-    papers (a port of its Evaluate.m / Main.m, see relaxed_phase_metrics);
+    them, the relaxed-boundary metrics of the legacy Cholec80/M2CAI evaluation script (an exact port of its
+    Evaluate.m / Main.m, see relaxed_evaluate) and the same relaxation applied as intended (both ends);
   * tool presence: AP per tool over all test frames, and their mean (mAP).
 
 Writes <output>/PAPER_RESULTS.md, tables/*.csv and *.tex, figures/*.png and *.pdf, analysis.json.
@@ -44,13 +47,13 @@ sys.path.insert(0, str(REPO))
 import paper_protocol as protocol  # noqa: E402
 from metrics import binary_metrics, temporal_iou  # noqa: E402
 
-VERSION = 'paper-analysis-1'
+VERSION = 'paper-analysis-2'
 KEYS = ['video_id', 'text_query', 'frame_idx']
 IOUS = (0.3, 0.5, 0.7)
 BINS = 15
 # Main-table order: the comparison methods (weakest assumptions first), then ours.
 MAIN_ORDER = ('clip_zeroshot', 'surgvlp_zeroshot', 'hecvl_zeroshot', 'peskavlp_zeroshot', 'xclip_finetune',
-              'peskavlp_finetune', 'univtg', 'tecno', 'closedset', 'baseline', 'advanced')
+              'peskavlp_finetune', 'univtg', 'tecno', 'closedset', 'closedset_matched', 'baseline', 'advanced')
 
 
 def natural_key(s):
@@ -123,14 +126,76 @@ def percentile_ci(values, level=0.95):
     return (float(lo), float(hi))
 
 
-def bootstrap_p(differences):
-    """Two-sided p-value of a paired bootstrap: how often the resampled difference falls on the other side of 0."""
+def bootstrap_p(differences, observed):
+    """Two-sided paired-bootstrap test of "no difference": the bootstrap distribution of the difference is
+    shifted to be centred at 0 (the null hypothesis) and compared with the observed difference,
+    p = (1 + #{|d_b - d_obs| >= |d_obs|}) / (B + 1) (Efron & Tibshirani 1993, sec. 16.4)."""
     d = np.asarray(differences, dtype=np.float64)
     d = d[np.isfinite(d)]
-    if not len(d):
+    if not len(d) or not np.isfinite(observed):
         return math.nan
-    below, above = (np.sum(d <= 0) + 1) / (len(d) + 1), (np.sum(d >= 0) + 1) / (len(d) + 1)
-    return float(min(1.0, 2 * min(below, above)))
+    return float(min(1.0, (np.sum(np.abs(d - observed) >= abs(observed) - 1e-12) + 1) / (len(d) + 1)))
+
+
+def fast_ap(y, scores):
+    """Unweighted AP (= sklearn average_precision_score, ties as one threshold)."""
+    order = np.argsort(-scores)                         # order within ties is irrelevant (tie_ends)
+    return weighted_ap(y[order], np.ones(len(y)), tie_ends(scores[order]))
+
+
+_PERMUTATION = {}
+
+
+def _permutation_chunk(task):
+    """Permutation replicates of the mAP difference for one pair (runs in a worker process)."""
+    pair, seed, n = task
+    per_q = _PERMUTATION['queries']
+    sx, sy = _PERMUTATION['scores'][pair[0]], _PERMUTATION['scores'][pair[1]]
+    n_v = _PERMUTATION['n_videos']
+    rng = np.random.default_rng(seed)
+    out = np.empty(n)
+    for b in range(n):
+        swap = rng.random(n_v) < 0.5
+        ax, ay = [], []
+        for y, v, rows in per_q:
+            s = swap[v]
+            a, c = sx[rows], sy[rows]
+            ax.append(fast_ap(y, np.where(s, c, a)))
+            ay.append(fast_ap(y, np.where(s, a, c)))
+        out[b] = np.nanmean(ax) - np.nanmean(ay)
+    return out
+
+
+def permutation_map_tests(frames, scores, pairs, n_perm, seed=0, workers=1):
+    """Paired permutation tests (approximate randomisation) of the 14-query mAP difference for every pair:
+    under the null hypothesis the two methods are exchangeable within a test video, so each permutation swaps
+    the two methods' scores on a random subset of the videos (each video with probability 1/2, the same for all
+    queries). Two-sided p = (1 + #{|d_perm| >= |d_obs|}) / (n_perm + 1). Returns {pair: (d_obs, p)}."""
+    import warnings
+    obs = frames.observed
+    per_q = []
+    for qi in range(len(frames.queries)):
+        rows = np.flatnonzero(obs & (frames.query == qi))
+        per_q.append((frames.label[rows].astype(np.float64), frames.video[rows], rows))
+    _PERMUTATION.update(queries=per_q, scores=scores, n_videos=len(frames.video_ids))
+    tasks = [(pair, seed + 7919 * i, n_perm) for i, pair in enumerate(pairs)]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        if workers > 1 and len(tasks) > 1:
+            import multiprocessing as mp
+            with mp.get_context('fork').Pool(min(workers, len(tasks))) as pool:
+                reps = pool.map(_permutation_chunk, tasks)
+        else:
+            reps = [_permutation_chunk(t) for t in tasks]
+        out = {}
+        for pair, d in zip(pairs, reps):
+            sx, sy = scores[pair[0]], scores[pair[1]]
+            d_obs = float(np.nanmean([fast_ap(y, sx[r]) for y, _, r in per_q]) -
+                          np.nanmean([fast_ap(y, sy[r]) for y, _, r in per_q]))
+            p = float((np.sum(np.abs(d) >= abs(d_obs) - 1e-12) + 1) / (len(d) + 1)) if np.isfinite(d_obs) else math.nan
+            out[pair] = (d_obs, p)
+    _PERMUTATION.clear()
+    return out
 
 
 def holm(pvalues):
@@ -272,7 +337,8 @@ def pooled_ap(hits, weights, total):
 
 # --------------------------------------------------------------------------- phase recognition
 def phase_recognition(frames, scores, phase_queries):
-    """Per frame: predicted phase = arg max of the 7 phase-query scores. {video: (true, predicted)}."""
+    """Per frame: predicted phase = arg max of the 7 phase-query scores.
+    {video: (true, predicted, position of each annotated frame on the video's sampling grid)}."""
     q_index = {q: i for i, q in enumerate(frames.queries)}
     wanted = [q_index[q] for q in phase_queries]
     per_video = {}
@@ -288,12 +354,12 @@ def phase_recognition(frames, scores, phase_queries):
         observed = (y != -100).all(axis=1)
         if np.any((y != -100).any(axis=1) & ~observed):
             raise ValueError(f'{frames.video_ids[v]}: partially annotated phase frames')
-        y, s = y[observed], s[observed]
+        y, s, pos = y[observed], s[observed], np.flatnonzero(observed)
         if len(y) == 0:
             continue
         if not np.all((y == 1).sum(axis=1) == 1):
             raise ValueError(f'{frames.video_ids[v]}: a frame does not have exactly one phase')
-        per_video[v] = (np.argmax(y, axis=1), np.argmax(s, axis=1))
+        per_video[v] = (np.argmax(y, axis=1), np.argmax(s, axis=1), pos)   # pos: place on the sampling grid
     return per_video
 
 
@@ -304,7 +370,7 @@ def phase_tables(per_video, n_phases=7):
     videos = sorted(per_video)
     acc, f1, prec, rec, jac = [], [], [], [], []
     for v in videos:
-        gt, pred = per_video[v]
+        gt, pred = per_video[v][:2]
         acc.append(float(np.mean(gt == pred)))
         f1.append(float(f1_score(gt, pred, average='macro')))
         p_row, r_row, j_row = [], [], []
@@ -348,20 +414,31 @@ def std1(values):
 
 # Relaxed-boundary phase metrics: a line-by-line port of the evaluation script distributed with Cholec80 /
 # the M2CAI 2016 workflow challenge (Evaluate.m and Main.m; the copy in the TMRNet repository, MIT licence,
-# is the one used by TMRNet, Trans-SVNet and most later papers). Phases are numbered 1-7 as in the script.
-# Within the first and last 10 s of every ground-truth phase, a prediction of the neighbouring phase counts as
-# correct (for phases 4-7 also two phases away, as in the script). The script's statement for the END of a
-# phase indexes the first 10 s instead (MATLAB applies a logical mask of length t to the first t elements),
-# so in effect only late transitions are relaxed; this is reproduced exactly, so that the numbers can be
-# compared with the published ones. Values above 100 % (relaxed true positives may exceed the predicted or
-# true frames of a phase) are clipped to 100, as in Main.m.
-def relaxed_evaluate(gt, pred, fps):
-    """Evaluate.m for one video: gt / pred are 0-based phase ids per frame in time order (frames at `fps`).
-    Returns (jaccard, precision, recall) per phase in % (NaN for phases absent from the ground truth; precision
-    may be inf or NaN when a phase is never predicted) and the accuracy in %."""
+# is the one used by TMRNet, Trans-SVNet and many later papers). Phases are numbered 1-7 as in the script.
+#
+# What the script INTENDS: within the first and last 10 s of every ground-truth phase, a prediction of the
+# neighbouring phase counts as correct (for phases 4-7 also two phases away).
+# What it COMPUTES (legacy=True, the default here, reproduced exactly so that numbers can be compared with
+# published ones): the statement for the end of a phase, curDiff(curDiff(end-t+1:end)==1) = 0, indexes with a
+# logical mask of length t, which MATLAB applies to the FIRST t elements. So the end-of-phase condition, tested
+# on the last 10 s, zeroes errors in the first 10 s; a too-early transition at the end of a phase is not
+# relaxed. legacy=False applies the end condition to the last 10 s, as intended ("symmetric").
+# Values above 100 % (relaxed true positives can exceed the predicted or true frames of a phase) are clipped to
+# 100, as in Main.m.
+#
+# The script assumes one label per frame on a regular time grid. Here, frames without a phase annotation are
+# kept on the grid as unknown (-1): they break a phase into separate runs and are left out of every count, so
+# an annotation gap is never compressed into adjacent frames (frames on the 1 fps grid are 1 s apart).
+def relaxed_evaluate(gt, pred, fps, legacy=True):
+    """Evaluate.m for one video: gt / pred are 0-based phase ids per frame on the sampling grid, in time order
+    (frames at `fps`); gt -1 = not annotated (left out). Returns (jaccard, precision, recall) per phase in %
+    (NaN for phases absent from the ground truth; precision may be inf or NaN when a phase is never predicted)
+    and the accuracy in %."""
     gt = np.asarray(gt, dtype=np.int64) + 1
     pred = np.asarray(pred, dtype=np.int64) + 1
-    n = len(gt)
+    known = gt >= 1
+    if not known.any():
+        raise ValueError('no annotated frame')
     ori_t = int(round(10 * fps))                                     # 10 seconds relaxed boundary
     diff = pred - gt
     updated = diff.copy()
@@ -374,23 +451,16 @@ def relaxed_evaluate(gt, pred, fps):
             cur = diff[start:end + 1].copy()
             t = min(ori_t, len(cur))
             if t > 0:
-                head = cur[:t]                                       # a view: assignments change cur
-                if phase in (4, 5):
-                    head[head == -1] = 0                             # late transition
-                    tail = cur[len(cur) - t:]
-                    head[(tail == 1) | (tail == 2)] = 0              # "early transition" (applied to the head)
-                elif phase in (6, 7):
-                    head[(head == -1) | (head == -2)] = 0
-                    tail = cur[len(cur) - t:]
-                    head[(tail == 1) | (tail == 2)] = 0
-                else:
-                    head[head == -1] = 0
-                    tail = cur[len(cur) - t:]
-                    head[tail == 1] = 0
+                head = cur[:t]                                       # views: assignments change cur
+                late = (head == -1) | (head == -2) if phase in (6, 7) else head == -1
+                head[late] = 0                                       # late transition
+                tail = cur[len(cur) - t:]
+                early = (tail == 1) | (tail == 2) if phase in (4, 5, 6, 7) else tail == 1
+                (head if legacy else tail)[early] = 0                # early transition (legacy: applied to the head)
             updated[start:end + 1] = cur
     jac, prec, rec = [], [], []
     for phase in range(1, 8):
-        in_gt, in_pred = gt == phase, pred == phase
+        in_gt, in_pred = gt == phase, (pred == phase) & known
         if not in_gt.any():
             jac.append(math.nan); prec.append(math.nan); rec.append(math.nan)
             continue
@@ -400,17 +470,29 @@ def relaxed_evaluate(gt, pred, fps):
         sum_pred = int(in_pred.sum())
         prec.append(100 * tp / sum_pred if sum_pred else (math.inf if tp else math.nan))
         rec.append(100 * tp / in_gt.sum())
-    acc = 100 * float(np.sum(updated == 0)) / n
+    acc = 100 * float(np.sum(updated[known] == 0)) / int(known.sum())
     return np.asarray(jac), np.asarray(prec), np.asarray(rec), acc
 
 
-def relaxed_phase_metrics(per_video, fps):
-    """Main.m over the videos of `per_video` ({video: (true, predicted)}), as fractions (not %)."""
+def on_grid(entry):
+    """(gt, pred) of a phase_recognition entry on the full sampling grid, unknown frames as -1."""
+    gt, pred = entry[0], entry[1]
+    if len(entry) < 3 or entry[2] is None:
+        return gt, pred
+    pos = np.asarray(entry[2], dtype=np.int64)
+    full_gt = np.full(int(pos.max()) + 1, -1, dtype=np.int64)
+    full_pred = np.full(int(pos.max()) + 1, -1, dtype=np.int64)
+    full_gt[pos], full_pred[pos] = gt, pred
+    return full_gt, full_pred
+
+
+def relaxed_phase_metrics(per_video, fps, legacy=True):
+    """Main.m over the videos of `per_video` ({video: (true, predicted[, grid positions])}), as fractions."""
     import warnings
     videos = sorted(per_video)
     if not videos:
         return None
-    rows = [relaxed_evaluate(*per_video[v], fps) for v in videos]
+    rows = [relaxed_evaluate(*on_grid(per_video[v]), fps, legacy=legacy) for v in videos]
     jac = np.minimum(np.stack([r[0] for r in rows]), 100)          # (videos, 7); NaN stays NaN, inf -> 100
     prec = np.minimum(np.stack([r[1] for r in rows]), 100)
     rec = np.minimum(np.stack([r[2] for r in rows]), 100)
@@ -425,6 +507,16 @@ def relaxed_phase_metrics(per_video, fps):
                 recall=float(rec_phase.mean()) / 100, recall_std=std_all(rec_phase) / 100,
                 per_phase=dict(jaccard=(jac_phase / 100).tolist(), precision=(prec_phase / 100).tolist(),
                                recall=(rec_phase / 100).tolist()))
+
+
+def phase_gaps(per_video):
+    """Frames without a phase annotation between the first and the last annotated frame, per video."""
+    out = {}
+    for v, entry in per_video.items():
+        if len(entry) >= 3 and entry[2] is not None and len(entry[2]):
+            pos = np.asarray(entry[2])
+            out[v] = int(pos.max() - pos.min() + 1 - len(pos))
+    return out
 
 
 def std_all(values):
@@ -650,7 +742,12 @@ def main(argv=None):
     ap.add_argument('--sample-fps', type=float, default=1.0)
     ap.add_argument('--bootstrap', type=int, default=1000)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--permutations', type=int, default=1000, help='random swaps per paired permutation test')
+    ap.add_argument('--workers', type=int, default=None, help='processes for the permutation tests')
     a = ap.parse_args(argv)
+    if a.workers is None:
+        import os
+        a.workers = max(1, min(16, (os.cpu_count() or 2) - 1))
     root = Path(a.root).resolve()
     out = Path(a.output).resolve() if a.output else root / 'paper'
     out.mkdir(parents=True, exist_ok=True)
@@ -669,6 +766,7 @@ def main(argv=None):
     missing = [m.name for m in methods.values() if not m.finished]
     log(f'{len(finished)} of {len(methods)} runs finished' + (f'; missing: {missing}' if missing else ''))
     report = dict(version=VERSION, generated=time.ctime(), root=str(root), prefix=a.prefix, bootstrap=a.bootstrap,
+                  permutations=a.permutations,
                   seed=a.seed, finished=[m.name for m in finished], missing=missing, methods={})
     md = ['# Paper results', '', f'Generated {time.ctime()} by `paper_analysis.py` ({VERSION}) from `{root}`.', '',
           f'Runs finished: **{len(finished)} of {len(methods)}**.' + (
@@ -772,8 +870,11 @@ def main(argv=None):
         md += ['## 1. Main results (test videos)', '',
                write_table(out, 'main_results', pd.DataFrame(main_rows),
                            'Language-guided temporal localization on the Cholec80 test videos',
-                           'AP: frame-level average precision over all frames and queries; mAP: mean of the 14 per-query APs; '
-                           'F1 at the threshold selected on validation; seed 42 for trained methods.'), '']
+                           'AP: frame-level average precision over all frames and queries; mAP: mean of the 14 per-query APs '
+                           '(the primary endpoint); F1 at the threshold selected on validation; seed 42 for trained methods. '
+                           'TeCNO: phase queries from its temporal network, tool queries from the auxiliary tool head '
+                           'of its stage-1 CNN (TeCNO itself predicts phases only). Closed-set models: one output per '
+                           'concept, no text input.'), '']
 
     # ---- significance
     sig_rows = []
@@ -785,35 +886,51 @@ def main(argv=None):
         pairs_to_test += [(o, c) for c in main_methods if c.group == 'comparison']
     base = by_short('baseline', 'main')
     pairs_to_test += [(m, base) for m in finished if m.group == 'ablation' and base is not None]
-    for metric, label in (('average_precision', 'AP'), ('macro_map', 'mAP'), ('f1', 'F1'), ('seg_map50', 'Segment mAP@0.5')):
+    # Primary endpoint: the 14-query mAP (every concept counts equally), tested with paired permutation tests
+    # and Holm-corrected over all of its comparisons. Secondary endpoints (pooled AP, F1, segment mAP@0.5):
+    # null-centred paired-bootstrap tests, Holm-corrected within each endpoint.
+    t0 = time.time()
+    permuted = permutation_map_tests(frames, scores, [(x.name, y.name) for x, y in pairs_to_test], a.permutations,
+                                     a.seed, a.workers) if pairs_to_test else {}
+    if pairs_to_test:
+        log(f'permutation tests: {len(pairs_to_test)} pairs x {a.permutations} ({time.time() - t0:.0f} s)')
+    for metric, label in (('macro_map', 'mAP'), ('average_precision', 'AP'), ('f1', 'F1'), ('seg_map50', 'Segment mAP@0.5')):
         rows = []
         for x, y in pairs_to_test:
             point_x = stats[x.name][metric] if metric != 'seg_map50' else seg[x.name]['mAP@0.5']
             point_y = stats[y.name][metric] if metric != 'seg_map50' else seg[y.name]['mAP@0.5']
             d = reps[x.name][metric] - reps[y.name][metric]
             ci = percentile_ci(d)
-            p_boot = bootstrap_p(d)
+            if metric == 'macro_map':
+                p_boot, test = permuted[(x.name, y.name)][1], 'permutation (primary)'
+            else:
+                p_boot, test = bootstrap_p(d, point_x - point_y), 'bootstrap (secondary)'
             p_w = math.nan
             if metric == 'average_precision':
                 xa, ya = np.asarray(stats[x.name]['per_video_ap']), np.asarray(stats[y.name]['per_video_ap'])
                 ok = np.isfinite(xa) & np.isfinite(ya)
                 if ok.sum() >= 5 and np.any(xa[ok] != ya[ok]):
                     p_w = float(wilcoxon(xa[ok], ya[ok]).pvalue)
-            rows.append(dict(metric=label, a=x.label, b=y.label,
-                             delta=point_x - point_y, ci=ci, p_boot=p_boot, p_wilcoxon=p_w))
-        adj = holm([r['p_boot'] for r in rows])
+            rows.append(dict(metric=label, a=x.label, b=y.label, test=test,
+                             delta=point_x - point_y, ci=ci, p=p_boot, p_wilcoxon=p_w))
+        adj = holm([r['p'] for r in rows])
         adj_w = holm([r['p_wilcoxon'] for r in rows])
         for r, h, hw in zip(rows, adj, adj_w):
             sig_rows.append({'Metric': r['metric'], 'A': r['a'], 'B': r['b'], 'A - B': pct(r['delta']),
-                             '95% CI': f'[{pct(r["ci"][0])}, {pct(r["ci"][1])}]', 'p (bootstrap)': fmt_p(r['p_boot']),
-                             'p (Holm)': fmt_p(h), 'p (Wilcoxon, per-video AP)': fmt_p(r['p_wilcoxon']),
+                             '95% CI': f'[{pct(r["ci"][0])}, {pct(r["ci"][1])}]', 'Test': r['test'],
+                             'p': fmt_p(r['p']), 'p (Holm)': fmt_p(h), 'p (Wilcoxon, per-video AP)': fmt_p(r['p_wilcoxon']),
                              'p (Wilcoxon, Holm)': fmt_p(hw)})
             report.setdefault('significance', []).append(dict(r, p_holm=h, p_wilcoxon_holm=hw))
     if sig_rows:
         md += ['## 2. Paired significance tests (test videos)', '',
                write_table(out, 'significance', pd.DataFrame(sig_rows), 'Paired comparisons on the test videos',
-                           'Differences in percentage points; paired bootstrap over test videos (two-sided); Holm '
-                           'correction within each metric; Wilcoxon signed-rank test on the 32 per-video APs.'), '']
+                           f'Differences in percentage points, with 95 % paired-bootstrap CIs over test videos. Primary '
+                           f'endpoint: 14-query mAP, two-sided paired permutation test ({a.permutations} random swaps of '
+                           f'the two methods\' scores within test videos), Holm correction over its {len(pairs_to_test)} '
+                           f'comparisons. Secondary endpoints (pooled AP, F1, segment mAP@0.5): two-sided paired '
+                           f'bootstrap test with the bootstrap distribution centred at the null, Holm correction within '
+                           f'each endpoint. Wilcoxon signed-rank test on the per-video APs. One training seed (42); '
+                           f'the variation over seeds is in section 8.'), '']
 
     # ---- segments table
     seg_rows = []
@@ -857,46 +974,66 @@ def main(argv=None):
             author[kind] = z.name + ':author'
         else:
             log(f'({z.name}: authorprompts_test.csv does not cover the test frames; left out)')
-    relaxed_rows = []
+    relaxed_rows = {'relaxed': [], 'relaxed_symmetric': []}
+    gaps = None
     for key, label, s in candidates:
         per_video = phase_recognition(frames, s, phase_q)
+        if gaps is None:                                 # the same for every method: a property of the labels
+            gaps = {frames.video_ids[v]: n for v, n in phase_gaps(per_video).items()}
         tables = phase_tables(per_video)
         res = phase_summary(tables)
         if res is None:
             continue
         w = counts[:, tables['videos']]
         res['accuracy_ci'] = percentile_ci((w @ tables['accuracy']) / w.sum(axis=1))
-        relaxed = relaxed_phase_metrics(per_video, a.sample_fps)
-        relaxed['accuracy_ci'] = percentile_ci((w @ relaxed.pop('accuracy_per_video')) / w.sum(axis=1))
-        relaxed.pop('videos')
-        res['relaxed'] = relaxed
+        for name, legacy in (('relaxed', True), ('relaxed_symmetric', False)):
+            relaxed = relaxed_phase_metrics(per_video, a.sample_fps, legacy=legacy)
+            relaxed['accuracy_ci'] = percentile_ci((w @ relaxed.pop('accuracy_per_video')) / w.sum(axis=1))
+            relaxed.pop('videos')
+            res[name] = relaxed
+            relaxed_rows[name].append({
+                'Method': label,
+                'Accuracy': f"{with_ci(relaxed['accuracy'], relaxed['accuracy_ci'])} (± {pct(relaxed['accuracy_std'])})",
+                'Precision': f"{pct(relaxed['precision'])} ± {pct(relaxed['precision_std'])}",
+                'Recall': f"{pct(relaxed['recall'])} ± {pct(relaxed['recall_std'])}",
+                'Jaccard': f"{pct(relaxed['jaccard'])} ± {pct(relaxed['jaccard_std'])}"})
         phase_stats[key] = res
         phase_rows.append({'Method': label, 'Accuracy': f"{with_ci(res['accuracy'], res['accuracy_ci'])} (± {pct(res['accuracy_std'])})",
                            'Precision': f"{pct(res['precision'])} ± {pct(res['precision_std'])}",
                            'Recall': f"{pct(res['recall'])} ± {pct(res['recall_std'])}",
                            'Jaccard': f"{pct(res['jaccard'])} ± {pct(res['jaccard_std'])}",
                            'F1 (video-wise)': pct(res['f1_videowise'])})
-        relaxed_rows.append({'Method': label,
-                             'Accuracy': f"{with_ci(relaxed['accuracy'], relaxed['accuracy_ci'])} (± {pct(relaxed['accuracy_std'])})",
-                             'Precision': f"{pct(relaxed['precision'])} ± {pct(relaxed['precision_std'])}",
-                             'Recall': f"{pct(relaxed['recall'])} ± {pct(relaxed['recall_std'])}",
-                             'Jaccard': f"{pct(relaxed['jaccard'])} ± {pct(relaxed['jaccard_std'])}"})
+    gaps = gaps or {}
+    report['phase_annotation_gaps'] = dict(frames_without_phase_inside_annotated_span=gaps,
+                                           videos_with_gaps=sorted(v for v, n in gaps.items() if n))
+    gap_note = (' No test video has a frame without a phase annotation between its first and last annotated frame.'
+                if not any(gaps.values()) else
+                f' {sum(1 for n in gaps.values() if n)} test video(s) have frames without a phase annotation inside the '
+                f'annotated span ({sum(gaps.values())} frames, listed in analysis.json); they are kept on the time grid '
+                f'as unknown and excluded from every count, never merged into neighbouring frames.')
     if phase_rows:
         md += ['## 4. Surgical phase recognition (test videos)', '',
                write_table(out, 'phase_recognition', pd.DataFrame(phase_rows),
                            'Phase recognition from the seven phase queries (arg max per frame)',
                            'Standard non-relaxed Cholec80 metrics: accuracy per video (mean, bootstrap CI, ± std over '
                            'videos); precision/recall/Jaccard per phase averaged over videos (± std over phases); '
-                           'F1: macro F1 per video, averaged (the protocol of the PeskaVLP paper). TeCNO and the '
-                           'closed-set model are trained phase classifiers; for the language models phase '
+                           'F1: macro F1 per video, averaged (the video-wise F1 of the PeskaVLP paper). TeCNO and the '
+                           'closed-set models are trained phase classifiers; for the language models phase '
                            'recognition is a by-product of query scoring.'), '',
-               write_table(out, 'phase_recognition_relaxed', pd.DataFrame(relaxed_rows),
-                           'Phase recognition with relaxed boundaries (Cholec80 evaluation script)',
-                           'The relaxed-boundary metrics of the standard Cholec80/M2CAI evaluation script (Evaluate.m '
-                           'and Main.m, ported line by line; 10 s tolerance at phase transitions, values above 100 '
-                           'clipped), as reported by most phase-recognition papers: accuracy per video (mean, '
-                           'bootstrap CI, ± std over videos); Jaccard/precision/recall per phase averaged over videos '
-                           '(± std over phases). Same predictions as the table above.'), '']
+               write_table(out, 'phase_recognition_relaxed', pd.DataFrame(relaxed_rows['relaxed']),
+                           'Phase recognition, relaxed boundaries (legacy Cholec80 evaluation script)',
+                           'The Cholec80/M2CAI evaluation script (Evaluate.m and Main.m) ported line by line, '
+                           'including its behaviour: errors in the first 10 s of a ground-truth phase are forgiven '
+                           'when the previous phase (for cleaning/retraction also the one before) is predicted; its '
+                           'end-of-phase rule tests the last 10 s but, through MATLAB logical indexing, also acts on '
+                           'the first 10 s, so a too-early transition is not forgiven. Values above 100 clipped as in '
+                           'the script. Accuracy per video (mean, bootstrap CI, ± std over videos); Jaccard/precision/'
+                           'recall per phase averaged over videos (± std over phases). Comparable with papers that '
+                           'used this script.' + gap_note), '',
+               write_table(out, 'phase_recognition_relaxed_symmetric', pd.DataFrame(relaxed_rows['relaxed_symmetric']),
+                           'Phase recognition, relaxed boundaries applied as intended (both ends)',
+                           'As the legacy table, but the end-of-phase rule is applied to the last 10 s of each phase, '
+                           'so that a too-early transition into the next phase is forgiven as the script describes.'), '']
     report['phase_recognition'] = phase_stats
     tool_rows = []
     tool_q = protocol.tool_queries()
@@ -907,7 +1044,8 @@ def main(argv=None):
     if tool_rows:
         md += ['## 5. Tool presence (test videos)', '',
                write_table(out, 'tool_presence', pd.DataFrame(tool_rows), 'Tool presence detection: AP per tool',
-                           'AP over all test frames per tool (the standard Cholec80 tool-presence metric) and their mean.'), '']
+                           'AP over all test frames per tool (the standard Cholec80 tool-presence metric) and their mean. '
+                           'TeCNO: the auxiliary tool head of its stage-1 CNN (not its temporal network).'), '']
 
     # ---- per query and breakdowns
     try:
@@ -960,7 +1098,7 @@ def main(argv=None):
             d = reps[m.name]['average_precision'] - reps[base.name]['average_precision']
             ci = percentile_ci(d)
             row['AP vs baseline'] = f"{pct(st['average_precision'] - stats[base.name]['average_precision'])} " \
-                                    f"[{pct(ci[0])}, {pct(ci[1])}], p={fmt_p(bootstrap_p(d))}"
+                                    f"[{pct(ci[0])}, {pct(ci[1])}], p={fmt_p(bootstrap_p(d, st['average_precision'] - stats[base.name]['average_precision']))}"
         else:
             row['AP vs baseline'] = '-'
         abl_rows.append(row)
@@ -1037,14 +1175,19 @@ def main(argv=None):
                            'bootstrap CI. Same frames, labels and threshold as with the training wording.'), '']
 
     # ---- efficiency
-    eff_rows = []
+    eff_rows, missing_rows = [], {}
     for m in main_methods + [x for x in finished if x.group == 'ablation']:
-        eff_rows.append(efficiency(m, root))
+        eff_rows.append(efficiency(m, root, missing_rows))
+    report['journal_epochs_without_a_row'] = missing_rows
     if eff_rows:
         md += ['## 10. Efficiency', '',
                write_table(out, 'efficiency', pd.DataFrame(eff_rows), 'Model size and compute',
                            'Training time: sum of the logged epoch times (train + validation) where available, '
-                           'otherwise the wall time of the training stage. Throughput: video frames per second '
+                           'otherwise the wall time of the training stage' + (
+                               ' (some epochs have no logged row, so these times are lower bounds; see analysis.json)'
+                               if missing_rows else '') + '. Training clips: training windows (clips of the clip '
+                           'length) passed through the video backbone (ours: one per window and query; closed set: one '
+                           'per window and repeat); optimiser steps: the parameter updates they made. Throughput: video frames per second '
                            'for all 14 queries on the test videos, including frame loading. UniVTG works on '
                            'precomputed M2CRL features (feature extraction not included); its parameters exclude '
                            'the frozen backbone. TeCNO: both stages (ResNet-50 and TCN; its throughput includes the '
@@ -1055,27 +1198,31 @@ def main(argv=None):
         r = phase_stats.get(key) if key else None
         if r is None:
             return 'n/a'
-        return f"{pct(r['accuracy'])} (relaxed {pct(r['relaxed']['accuracy'])})"
+        return f"{pct(r['accuracy'])} (legacy relaxed {pct(r['relaxed']['accuracy'])}; video-wise F1 {pct(r['f1_videowise'])})"
     tecno = by_short('tecno', 'comparison')
+    ours_col = 'Ours: accuracy on our frames'
     lit_rows = [{'Method': f'{protocol.COMPARISONS[k]["model"]} zero-shot (Yuan et al.)', 'Task': 'phase recognition',
-                 'Split': 'test 49-80 (same)', 'Reported': 'fill in from the paper',
-                 'Ours (same protocol)': phase_acc(author.get(k))} for k in protocol.SURGVLP_ZERO_SHOT]
+                 'What matches': 'weights, authors\' prompts and image transform, test videos 49-80',
+                 'What differs': 'our 1 fps frame extraction and labels; their own evaluation frames and script',
+                 'Reported': 'fill in from the paper', ours_col: phase_acc(author.get(k))} for k in protocol.SURGVLP_ZERO_SHOT]
     lit_rows += [
         {'Method': 'TeCNO (Czempiel et al., MICCAI 2020)', 'Task': 'phase recognition',
-         'Split': '40 / 8 / 32 (same)', 'Reported': 'fill in from the paper (state whether relaxed)',
-         'Ours (same protocol)': phase_acc(tecno.name if tecno else None) + ' (our re-implementation)'},
-        {'Method': 'Trans-SVNet (Gao et al., MICCAI 2021)', 'Task': 'phase recognition',
-         'Split': '40 train / 40 test (differs: its test set includes our validation videos)',
-         'Reported': 'fill in from the paper (relaxed)', 'Ours (same protocol)': '-'},
-        {'Method': 'Supervised tool presence (e.g. EndoNet)', 'Task': 'tool presence mAP', 'Split': 'differs',
-         'Reported': 'fill in from the paper', 'Ours (same protocol)': '-'},
+         'What matches': 'split 40 / 8 / 32, architecture, losses, optimisers, epochs, 1 fps',
+         'What differs': 'our re-implementation (see tecno.py: logits CE, epoch selection, augmentation library)',
+         'Reported': 'fill in from the paper (state whether relaxed)', ours_col: phase_acc(tecno.name if tecno else None)},
+        {'Method': 'Trans-SVNet (Gao et al., MICCAI 2021)', 'Task': 'phase recognition', 'What matches': '-',
+         'What differs': 'split 40 train / 40 test (its test set includes our validation videos)',
+         'Reported': 'fill in from the paper (relaxed)', ours_col: '-'},
+        {'Method': 'Supervised tool presence (e.g. EndoNet)', 'Task': 'tool presence mAP', 'What matches': '-',
+         'What differs': 'split and frames', 'Reported': 'fill in from the paper', ours_col: '-'},
     ]
     md += ['## 11. Published results (template)', '',
            write_table(out, 'literature_template', pd.DataFrame(lit_rows),
                        'Published Cholec80 results for context (to be completed)',
-                       'Copy the numbers from the cited papers and state their protocol (split, relaxed or not). '
-                       'Directly comparable: the SurgVLP/HecVL/PeskaVLP rows (same test videos, the authors\' '
-                       'prompts) and TeCNO (same split; our re-implementation). "Ours": accuracy, strict and relaxed.'), '']
+                       'Copy the numbers from the cited papers and state their protocol (split, frames, relaxed or '
+                       'not). Our numbers are reproductions on our own extracted 1 fps frames and labels, with our '
+                       'metric code; they are close to, but not the same as, the authors\' evaluation, so differences '
+                       'of a few points need not indicate a different model.'), '']
 
     # ---- figures
     figs = []
@@ -1109,9 +1256,11 @@ def main(argv=None):
 
 
 # --------------------------------------------------------------------------- efficiency
-def efficiency(m, root):
+def efficiency(m, root, missing=None):
+    """One row of the efficiency table. `missing` (a dict) receives {journal: epochs without a row}."""
     row = {'Method': m.label, 'Parameters (M)': 'n/a', 'Trainable (M)': 'n/a', 'Training (h)': 'n/a',
-           'Throughput (frames/s)': 'n/a', 'Peak training memory (GB)': 'n/a'}
+           'Training clips': 'n/a', 'Optimiser steps': 'n/a', 'Throughput (frames/s)': 'n/a',
+           'Peak training memory (GB)': 'n/a'}
     run = m.run
     counts = run / 'parameter_counts.json'
     if counts.exists():
@@ -1119,17 +1268,26 @@ def efficiency(m, root):
         row['Parameters (M)'] = f"{sum(v['total'] for v in c.values()) / 1e6:.1f}"
         row['Trainable (M)'] = f"{sum(v['trainable'] for v in c.values()) / 1e6:.1f}"
     journals = [run / 'training_metrics.jsonl'] + sorted(run.glob('*/training_metrics.jsonl'))
-    seconds, memory = 0.0, []
+    seconds, memory, clips, steps = 0.0, [], 0, 0
     for j in journals:
         if j.exists():
+            epochs = set()
             for line in j.read_text().splitlines():
                 try:
                     r = json.loads(line)
                 except ValueError:
                     continue
+                if isinstance(r.get('epoch'), int):
+                    epochs.add(r['epoch'])
                 seconds += float(r.get('train_seconds', 0) or 0) + float(r.get('val_seconds', 0) or 0)
                 if r.get('peak_gpu_memory_gb') is not None:
                     memory.append(float(r['peak_gpu_memory_gb']))
+                if r.get('train_clips') is not None:           # clips through the backbone (ours, closed set)
+                    clips += int(r['train_clips'])
+                    steps += int(r.get('optimizer_steps') or 0)
+            gaps = sorted(set(range(1, max(epochs) + 1)) - epochs) if epochs else []
+            if gaps and missing is not None:
+                missing[str(j.relative_to(root))] = gaps
     if seconds == 0:
         marker = root / 'state' / f'train.{m.name}.done.json'
         if marker.exists():
@@ -1141,6 +1299,9 @@ def efficiency(m, root):
         row['Training (h)'] = f'{seconds / 3600:.1f}'
     if memory:
         row['Peak training memory (GB)'] = f'{max(memory):.1f}'
+    if clips:
+        row['Training clips'] = f'{clips:,}'
+        row['Optimiser steps'] = f'{steps:,}'
     manifest = m.results / 'proposed_test.csv.manifest.json'
     if manifest.exists():
         man = json.loads(manifest.read_text())

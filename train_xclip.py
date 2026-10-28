@@ -13,7 +13,7 @@ import torch
 from torch.nn import functional as F
 from benchmark import prepare_pairs
 from data_contract import sample_indices,window_positions
-from checkpoint_utils import atomic_save,file_hash,rng_state,restore_rng,load_model_state,read_checkpoint
+from checkpoint_utils import atomic_save,commit_best,file_hash,pending_best_path,rng_state,restore_rng,load_model_state,read_checkpoint
 
 
 def multi_positive_loss(logits,concepts,positive_mask=None,observed_mask=None):
@@ -60,12 +60,13 @@ def main():
         datasets.append(records)
     signature={k:v for k,v in vars(a).items() if k not in ['resume_from']}
     provenance={k:file_hash(getattr(a,k)) for k in ['train_triplets','val_triplets','metadata','annotations']}
-    start=0; best=float('inf')
+    start=0; best=float('inf'); best_epoch=None
     if a.resume_from:
         ckpt=read_checkpoint(a.resume_from,require_metadata=False)
         if ckpt.get('baseline_schema')!=2 or ckpt.get('arguments')!=signature or ckpt.get('provenance')!=provenance: raise ValueError('Incompatible X-CLIP resume')
         load_model_state(model,ckpt); optimizer.load_state_dict(ckpt['optimizer']); restore_rng(ckpt['rng'])
-        start=ckpt['epoch']; best=ckpt['best']
+        start=ckpt['epoch']; best=ckpt['best']; best_epoch=ckpt.get('best_epoch')
+    commit_best(out/'best.pt',best_epoch)       # best.pt only holds an epoch that latest.pt committed
     for epoch in range(start,a.epochs):
         losses=[]
         for split,records in enumerate(datasets):
@@ -95,10 +96,12 @@ def main():
             losses.append(total/count)
         improved=losses[1]<best
         best=min(best,losses[1])
+        if improved: best_epoch=epoch+1
         ckpt=dict(baseline_schema=2,model_state_dict=model.state_dict(),optimizer=optimizer.state_dict(),epoch=epoch+1,best=best,
-            model_name=a.model_name,sample_fps=a.sample_fps,arguments=signature,provenance=provenance,rng=rng_state())
-        if improved: atomic_save(ckpt,out/'best.pt')
+            best_epoch=best_epoch,model_name=a.model_name,sample_fps=a.sample_fps,arguments=signature,provenance=provenance,rng=rng_state())
+        if improved: atomic_save(ckpt,pending_best_path(out/'best.pt',epoch+1))
         atomic_save(ckpt,out/'latest.pt')
+        commit_best(out/'best.pt',best_epoch)
         print(f'Epoch {epoch+1}: train={losses[0]:.5f} validation={losses[1]:.5f}')
     for bundle in bundles: bundle[2].close()
 

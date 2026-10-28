@@ -2,8 +2,8 @@
 
 Re-implemented from the paper and the authors' code and configuration (github.com/tobiascz/TeCNO:
 modules/cnn/config/config_feature_extract.yml, modules/mstcn/config/config_tcn.yml, models/*.py). Their code
-is GPL-3.0 and needs pytorch-lightning 0.8 / albumentations, so it is not vendored; the architecture and every
-setting below follow it.
+is GPL-3.0 and needs pytorch-lightning 0.8 / albumentations, so it is not vendored. The architecture, losses,
+optimisers, batch size, epochs and early-stopping rules follow it; the differences are listed at the end.
 
 Stage 1 (`cnn`): ImageNet ResNet-50 with two heads on the 2048-d pooled feature - phase (7, cross-entropy with
     the authors' Cholec80 class weights) and tool presence (7, binary cross-entropy) - balanced by learned
@@ -16,14 +16,27 @@ Stage 2 (`tcn`): causal multi-stage temporal convolutional network on the featur
     residual layers, 32 feature maps, dropout 0.5; later stages refine the softmax of the previous one), one
     video per batch, Adam lr 7e-5, weighted cross-entropy averaged over the stages, at most 16 / at least 12
     epochs, early stopping with patience 3 on validation accuracy of the last stage; the best epoch is kept.
-    (Deliberate difference: the authors' code applies the cross-entropy to softmax outputs; here it is applied
-    to the logits, as the paper describes.)
-`predict`: phase queries are answered by the last stage's softmax (online/causal, as TeCNO), tool queries by
-    the stage-1 tool head's sigmoid. Writes a score matrix for comparison_models/frame_scores.py.
+`predict`: phase queries are answered by the last stage's softmax (online/causal, as TeCNO); tool queries by
+    the sigmoid of the stage-1 CNN's auxiliary tool head (TeCNO's temporal network predicts phases only).
+    Writes a score matrix for comparison_models/frame_scores.py.
 
-Same split as TeCNO's (videos 1-40 train, 41-48 validation, 49-80 test). Frames without a phase label (-100)
-are left out of the phase loss, unobserved tools out of the tool loss. Every stage resumes at epoch
-boundaries (latest.pt) and is deterministic for a given seed.
+Same split as TeCNO's (videos 1-40 train, 41-48 validation, 49-80 test).
+
+Differences from the authors' code (deliberate, so this is a re-implementation, not a reproduction):
+  * stage-2 loss: their code applies the cross-entropy to softmax outputs; here it is applied to the logits,
+    as the paper describes;
+  * stage-2 model selection: their monitored "val_acc" is a stateful metric that is never reset - the running
+    accuracy after each validation video, accumulated over all epochs so far, averaged over the videos. Here the
+    best epoch (and early stopping) uses the validation frame accuracy of that epoch; their quantity is logged
+    next to it in every row (`val_acc_reference`) so the two selections can be compared;
+  * augmentation: torchvision RandomAffine with the parameters of their albumentations ShiftScaleRotate
+    (shift 0.1, scale 0.8-1.5, rotation 15 degrees, black border, p = 0.7); interpolation details differ;
+  * frames without a phase label (-100) are left out of the phase loss, unobserved tools out of the tool loss
+    (their dataframe has labels for every frame).
+
+Every stage resumes at epoch boundaries (latest.pt; the best model is only replaced after latest.pt has
+recorded it). Augmentation is drawn per sample from (seed, epoch, index), so it does not depend on the number
+of loader processes; on a GPU, replaying an interrupted epoch can still differ in the last bits.
 """
 import argparse
 import json
@@ -155,9 +168,15 @@ def image_transform(size, training):
     return T.Compose(ops + [T.ToDtype(torch.float32, scale=True), T.Normalize(NORM_MEAN, NORM_STD)])
 
 
+def sample_seed(seed, epoch, index):
+    """The random augmentation of one sample in one epoch: a function of these three numbers only."""
+    return (int(seed) * 1_000_003 + int(epoch) * 10_007 + int(index)) % (2 ** 63)
+
+
 class FrameSet(Dataset):
-    def __init__(self, paths, phase, tools, transform):
+    def __init__(self, paths, phase, tools, transform, seed=None):
         self.paths, self.phase, self.tools, self.transform = paths, phase, tools, transform
+        self.seed, self.epoch = seed, 0
 
     def __len__(self):
         return len(self.paths)
@@ -166,7 +185,13 @@ class FrameSet(Dataset):
         from PIL import Image
         from torchvision.transforms.v2 import functional as VF
         with Image.open(self.paths[i]) as image:
-            x = self.transform(VF.pil_to_tensor(image.convert('RGB')))
+            x = VF.pil_to_tensor(image.convert('RGB'))
+        if self.seed is None:
+            x = self.transform(x)
+        else:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(sample_seed(self.seed, self.epoch, i))
+                x = self.transform(x)
         return x, int(self.phase[i]), torch.from_numpy(self.tools[i].astype(np.float32))
 
 
@@ -215,6 +240,16 @@ def atomic_save(value, path):
     os.replace(tmp, path)
 
 
+def commit_best(best, epoch):
+    from checkpoint_utils import commit_best as commit
+    return commit(best, epoch)
+
+
+def pending_best(best, epoch):
+    from checkpoint_utils import pending_best_path
+    return pending_best_path(best, epoch)
+
+
 def write_json(path, value):
     tmp = Path(path).with_name(Path(path).name + f'.{os.getpid()}.tmp')
     tmp.write_text(json.dumps(value, indent=2))
@@ -233,7 +268,8 @@ def clean_journal(journal, finished):
             continue
         if isinstance(r, dict) and isinstance(r.get('epoch'), int) and r['epoch'] <= finished:
             rows[r['epoch']] = r
-    journal.write_text(''.join(json.dumps(rows[e]) + '\n' for e in sorted(rows)))
+    from checkpoint_utils import atomic_write_text
+    atomic_write_text(journal, ''.join(json.dumps(rows[e]) + '\n' for e in sorted(rows)))
 
 
 class EarlyStopping:
@@ -301,11 +337,13 @@ def train_cnn(args):
     torch.backends.cudnn.deterministic = True
     signature = dict(epochs=args.epochs, min_epochs=args.min_epochs, patience=args.patience, lr=args.lr,
                      batch_size=args.batch_size, input_size=args.input_size, seed=args.seed,
-                     train=file_sha(args.train_labels), val=file_sha(args.val_labels))
+                     train=file_sha(args.train_labels), val=file_sha(args.val_labels),
+                     train_order=file_sha(args.train_order), val_order=file_sha(args.val_order))
     latest = out / 'latest.pt'
     resume = torch.load(latest, map_location='cpu', weights_only=False) if latest.exists() else None
     if resume is not None and (resume.get('schema') != SCHEMA or resume.get('signature') != signature):
         raise ValueError(f'{latest} was made with different settings or data; use a new output folder')
+    commit_best(out / 'best.pt', resume['early_stopping']['best_epoch'] if resume is not None else None)
     if resume is not None and resume['early_stopping']['stopped']:
         print(f'stage 1 already finished (best epoch {resume["early_stopping"]["best_epoch"]})', flush=True)
         return
@@ -324,7 +362,7 @@ def train_cnn(args):
         print(f'resuming stage 1 after epoch {start}', flush=True)
     clean_journal(out / 'training_metrics.jsonl', start)
     ce = nn.CrossEntropyLoss(weight=torch.tensor(CLASS_WEIGHTS, device=device), ignore_index=IGNORE)
-    train_set = FrameSet(*frame_arrays(train_videos, True), image_transform(args.input_size, True))
+    train_set = FrameSet(*frame_arrays(train_videos, True), image_transform(args.input_size, True), seed=args.seed)
     val_loader = DataLoader(FrameSet(*frame_arrays(val_videos, True), image_transform(args.input_size, False)),
                             batch_size=args.batch_size, num_workers=args.workers, shuffle=False)
     on_cuda = torch.device(device).type == 'cuda'
@@ -332,6 +370,7 @@ def train_cnn(args):
         model.train()
         if on_cuda:
             torch.cuda.reset_peak_memory_stats()
+        train_set.epoch = epoch                                 # (the loader's processes copy the dataset)
         loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
                             generator=torch.Generator().manual_seed(args.seed * 1000 + epoch), pin_memory=on_cuda)
         started, total, batches = time.time(), 0.0, 0
@@ -352,11 +391,13 @@ def train_cnn(args):
         improved = stopper.update(epoch + 1, acc)
         state = dict(schema=SCHEMA, signature=signature, model=model.state_dict(), epoch=epoch + 1)
         if improved:
-            atomic_save(dict(state, val_acc_phase=acc), out / 'best.pt')
+            atomic_save(dict(state, val_acc_phase=acc), pending_best(out / 'best.pt', epoch + 1))
         atomic_save(dict(state, optimizer=optimizer.state_dict(), rng=rng_state(), early_stopping=stopper.state()),
                     latest)
+        commit_best(out / 'best.pt', stopper.best_epoch)
         row = dict(epoch=epoch + 1, train_loss=total / max(batches, 1), val_acc_phase=acc,
-                   train_seconds=round(trained - started, 1), val_seconds=round(time.time() - trained, 1))
+                   train_seconds=round(trained - started, 1), val_seconds=round(time.time() - trained, 1),
+                   train_frames=len(train_set), optimizer_steps=batches)
         if on_cuda:
             row['peak_gpu_memory_gb'] = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
         with open(out / 'training_metrics.jsonl', 'a') as f:
@@ -439,17 +480,26 @@ def tcn_loss(outputs, target, ce):
 
 
 @torch.no_grad()
-def tcn_accuracy(model, sequences, device):
+def tcn_accuracy(model, sequences, device, reference=None):
+    """Validation frame accuracy of the last stage (used for model selection here), and TeCNO's own monitored
+    quantity: their AccuracyStages state is never reset, so after each validation video they log the running
+    accuracy over every validation pass so far (all epochs), and the epoch value is the mean of those logs.
+    `reference` ({'correct', 'total'}) carries that state across epochs; it is updated in place."""
     model.eval()
-    correct, total = 0, 0
+    correct, total, logged = 0, 0, []
     for feats, target in sequences:
         pred = model(torch.from_numpy(feats).T.unsqueeze(0).to(device))[-1, 0].argmax(0).cpu().numpy()
         keep = target != IGNORE
-        correct += int((pred[keep] == target[keep]).sum())
-        total += int(keep.sum())
+        c, n = int((pred[keep] == target[keep]).sum()), int(keep.sum())
+        correct += c
+        total += n
+        if reference is not None:
+            reference['correct'] += c
+            reference['total'] += n
+            logged.append(reference['correct'] / max(reference['total'], 1))
     if not total:
         raise ValueError('validation videos have no phase labels')
-    return correct / total
+    return correct / total, (float(np.mean(logged)) if logged else None)
 
 
 def sequences(folder, videos, sha):
@@ -470,11 +520,12 @@ def train_tcn(args):
     sha = json.loads((Path(args.features) / 'done.json').read_text())['cnn_sha']
     signature = dict(epochs=args.epochs, min_epochs=args.min_epochs, patience=args.patience, lr=args.lr,
                      seed=args.seed, cnn_sha=sha, train=file_sha(args.train_labels), val=file_sha(args.val_labels),
-                     **TCN)
+                     train_order=file_sha(args.train_order), val_order=file_sha(args.val_order), **TCN)
     latest = out / 'latest.pt'
     resume = torch.load(latest, map_location='cpu', weights_only=False) if latest.exists() else None
     if resume is not None and (resume.get('schema') != SCHEMA or resume.get('signature') != signature):
         raise ValueError(f'{latest} was made with different settings or data; use a new output folder')
+    commit_best(out / 'best.pt', resume['early_stopping']['best_epoch'] if resume is not None else None)
     model = MultiStageTCN(**TCN).to(device)
     if args.parameter_counts:
         write_json(args.parameter_counts, dict(resnet50_two_heads=counts(TwoHeadResNet50(pretrained=False)),
@@ -486,13 +537,13 @@ def train_tcn(args):
     val_seq = sequences(args.features, load_order(args.val_order, args.val_labels)[1], sha)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     stopper = EarlyStopping(args.patience, args.min_epochs, args.epochs)
-    start = 0
+    start, reference = 0, dict(correct=0, total=0)
     if resume is not None:
         model.load_state_dict(resume['model'], strict=True)
         optimizer.load_state_dict(resume['optimizer'])
         restore_rng(resume['rng'])
         stopper = EarlyStopping(args.patience, args.min_epochs, args.epochs, resume['early_stopping'])
-        start = resume['epoch']
+        start, reference = resume['epoch'], dict(resume['reference_metric_state'])
         print(f'resuming stage 2 after epoch {start}', flush=True)
     clean_journal(out / 'training_metrics.jsonl', start)
     ce = nn.CrossEntropyLoss(weight=torch.tensor(CLASS_WEIGHTS, device=device), ignore_index=IGNORE)
@@ -513,15 +564,17 @@ def train_tcn(args):
             total += float(loss)
             n += 1
         trained = time.time()
-        acc = tcn_accuracy(model, val_seq, device)
+        acc, acc_reference = tcn_accuracy(model, val_seq, device, reference)
         improved = stopper.update(epoch + 1, acc)
         state = dict(schema=SCHEMA, signature=signature, model=model.state_dict(), epoch=epoch + 1, cnn_sha=sha)
         if improved:
-            atomic_save(dict(state, val_acc=acc), out / 'best.pt')
-        atomic_save(dict(state, optimizer=optimizer.state_dict(), rng=rng_state(), early_stopping=stopper.state()),
-                    latest)
-        row = dict(epoch=epoch + 1, train_loss=total / max(n, 1), val_acc=acc,
-                   train_seconds=round(trained - started, 1), val_seconds=round(time.time() - trained, 1))
+            atomic_save(dict(state, val_acc=acc), pending_best(out / 'best.pt', epoch + 1))
+        atomic_save(dict(state, optimizer=optimizer.state_dict(), rng=rng_state(), early_stopping=stopper.state(),
+                         reference_metric_state=dict(reference)), latest)
+        commit_best(out / 'best.pt', stopper.best_epoch)
+        row = dict(epoch=epoch + 1, train_loss=total / max(n, 1), val_acc=acc, val_acc_reference=acc_reference,
+                   train_seconds=round(trained - started, 1), val_seconds=round(time.time() - trained, 1),
+                   train_videos=len(train_seq), optimizer_steps=n)
         with open(out / 'training_metrics.jsonl', 'a') as f:
             f.write(json.dumps(row) + '\n')
         print(json.dumps(row), flush=True)
@@ -553,7 +606,7 @@ def predict(args):
         z = load_features(args.features, video, grid, ck['cnn_sha'])
         phase = F.softmax(model(torch.from_numpy(z['features'].astype(np.float32)).T.unsqueeze(0).to(device))[-1, 0],
                           dim=0).T.float().cpu().numpy()                       # (T, 7), causal
-        tools = 1 / (1 + np.exp(-z['tool_logits'].astype(np.float64)))      # (T, 7), stage-1 tool head
+        tools = torch.sigmoid(torch.from_numpy(z['tool_logits'].astype(np.float64))).numpy()  # (T, 7), stage-1 head
         both = np.concatenate([phase, tools], axis=1)
         blocks.append(np.stack([both[:, int(q['concept_id']) + (0 if q['kind'] == 'phase' else 7)]
                                 for q in order['queries']], axis=1).astype(np.float32))

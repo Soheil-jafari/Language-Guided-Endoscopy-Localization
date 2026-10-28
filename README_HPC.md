@@ -92,15 +92,16 @@ bash code/hpc/submit.sh paper --repeat 6
 
 This runs the complete experimental protocol of `paper_protocol.py` in its own folder,
 `/mnt/scratch/users/daiz1/soheil/lgel_paper/`, on the **standard Cholec80 split** (videos 1-40 train,
-41-48 validation, 49-80 test; `protocol/cholec80_split_40_8_32.json`). Nineteen runs, in this order:
+41-48 validation, 49-80 test; `protocol/cholec80_split_40_8_32.json`). Twenty runs, in this order:
 
 | # | runs | what |
 |---|---|---|
 | 1-2 | `paper_baseline_s42`, `paper_advanced_s42` | our two models (10 epochs each) |
 | 3-6 | `paper_clip_zeroshot`, `paper_surgvlp_zeroshot`, `paper_hecvl_zeroshot`, `paper_peskavlp_zeroshot` | comparison methods without training |
-| 7-11 | `paper_xclip_finetune_s42`, `paper_peskavlp_finetune_s42`, `paper_univtg_s42`, `paper_tecno_s42`, `paper_closedset_s42` | trained comparison methods (TeCNO: a specialised Cholec80 phase model; closed set: our backbone and temporal head without language) |
+| 7-11 | `paper_xclip_finetune_s42`, `paper_peskavlp_finetune_s42`, `paper_univtg_s42`, `paper_tecno_s42`, `paper_closedset_s42` | trained comparison methods (TeCNO: a specialised Cholec80 phase model; closed set: our backbone and temporal head without language, every training window once per epoch) |
 | 12-15 | `paper_ablation_{mamba,bilevel,uncertainty,fusion}_s42` | the baseline plus one add-on each |
 | 16-19 | `paper_{baseline,advanced}_s{43,44}` | two more training seeds of both models |
+| 20 | `paper_closedset_matched_s42` | the closed-set model with the same training exposure as ours (every window 14 times per epoch, batch 8 x 24; about one GPU day, so it runs last) |
 
 Every run is evaluated on the same test frames with its own threshold chosen on the validation
 videos; the main, comparison and seed runs are also evaluated with two sets of query wordings never
@@ -114,8 +115,12 @@ bundle in `lgel_paper/outbox/` includes them.
 * **Nothing is downloaded twice.** The first job reuses the Cholec80 videos already unpacked in
   `lgel/raw/extracted` and the M2CRL weights file the earlier runs used (`submit.sh` prints both); the
   frames are extracted again for the new folder (a few hours). The earlier `lgel/` runs are not touched.
-* **Time:** about 12 days of GPU time in total, dominated by the nine trainings of our model (TeCNO,
-  the closed-set model and the SurgVLP/HecVL scoring add a few hours).
+* **Time:** about 13 days of GPU time in total: the ten trainings of our model (two main models, four
+  ablations, four extra seeds) and the exposure-matched closed-set model take about a day each; the other
+  comparison methods add several hours.
+* **Early check:** the first job also trains the closed-set model and TeCNO for two steps at full size
+  (about a minute, random weights) and logs their peak GPU memory, so a memory problem shows in the first
+  report rather than days later. It never stops the job.
   Each job runs up to 72 h and the next one continues where it stopped, so `--repeat 6` queues enough
   jobs; a job that starts when everything is already finished only redoes the summaries and the
   analysis (about 20 minutes).

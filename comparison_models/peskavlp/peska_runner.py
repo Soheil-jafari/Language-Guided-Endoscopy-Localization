@@ -60,6 +60,27 @@ def file_sha(path):
     return h.hexdigest()
 
 
+def pending_best_path(best, epoch):
+    """As checkpoint_utils.pending_best_path (this script runs in its own environment, without the repository)."""
+    best = Path(best)
+    return best.with_name(f'{best.stem}.pending-e{int(epoch)}{best.suffix}')
+
+
+def commit_best(best, committed_epoch):
+    """As checkpoint_utils.commit_best: best.pt is only replaced after latest.pt has recorded that epoch."""
+    best = Path(best)
+    prefix = f'{best.stem}.pending-e'
+    for f in sorted(best.parent.glob(f'{prefix}*{best.suffix}')) if best.parent.exists() else []:
+        try:
+            epoch = int(f.name[len(prefix):len(f.name) - len(best.suffix)])
+        except ValueError:
+            continue
+        if committed_epoch is not None and epoch == int(committed_epoch):
+            os.replace(f, best)
+        else:
+            f.unlink()
+
+
 def atomic_torch_save(value, path):
     tmp = Path(path).with_name(Path(path).name + f'.{os.getpid()}.tmp')
     torch.save(value, tmp)
@@ -249,7 +270,7 @@ def finetune(args):
     params = [dict(params=[p for p in model.backbone_img.parameters()], lr=args.lr),
               dict(params=list(head.parameters()), lr=args.lr * 100)]
     optimizer = torch.optim.AdamW(params, weight_decay=0.01)
-    start, best = 0, float('inf')
+    start, best, best_epoch = 0, float('inf'), None
     latest = out / 'latest.pt'
     if latest.exists():
         ck = torch.load(latest, map_location='cpu', weights_only=False)
@@ -259,8 +280,9 @@ def finetune(args):
         head.load_state_dict(ck['head'], strict=True)
         optimizer.load_state_dict(ck['optimizer'])
         restore_rng(ck['rng'])
-        start, best = ck['epoch'], ck['best_val_loss']
+        start, best, best_epoch = ck['epoch'], ck['best_val_loss'], ck.get('best_epoch')
         print(f'resuming after epoch {start}', flush=True)
+    commit_best(out / 'best.pt', best_epoch)
     train_set = Frames(train_paths, preprocess, train_labels)
     val_loader = DataLoader(Frames(val_paths, preprocess, val_labels), batch_size=args.batch_size,
                             num_workers=args.workers, shuffle=False)
@@ -291,13 +313,16 @@ def finetune(args):
                 vtotal += float(loss) * n
                 vcount += n
         val_loss = vtotal / max(vcount, 1)
+        improved = val_loss < best
+        if improved:
+            best, best_epoch = val_loss, epoch + 1
         state = dict(schema=SCHEMA, signature=signature, weights_sha256=signature['weights_sha256'],
                      image_encoder=model.backbone_img.state_dict(), head=head.state_dict(), epoch=epoch + 1,
-                     best_val_loss=min(best, val_loss), canonical=canonical)
-        if val_loss < best:
-            best = val_loss
-            atomic_torch_save(state, out / 'best.pt')
+                     best_val_loss=best, best_epoch=best_epoch, canonical=canonical)
+        if improved:                                   # best.pt is replaced only after latest.pt has recorded it
+            atomic_torch_save(state, pending_best_path(out / 'best.pt', epoch + 1))
         atomic_torch_save(dict(state, optimizer=optimizer.state_dict(), rng=rng_state()), latest)
+        commit_best(out / 'best.pt', best_epoch)
         row = dict(epoch=epoch + 1, train_loss=total / max(count, 1), val_loss=val_loss,
                    train_seconds=round(trained - started, 1), val_seconds=round(time.time() - trained, 1))
         with open(out / 'training_metrics.jsonl', 'a') as f:

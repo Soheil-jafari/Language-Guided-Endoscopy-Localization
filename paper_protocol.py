@@ -69,10 +69,16 @@ COMPARISONS = {
     'tecno': dict(label='TeCNO (re-implementation)', cnn_epochs=15, cnn_min_epochs=6, cnn_lr=5e-4,
                   cnn_batch_size=80, input_size=224, tcn_epochs=16, tcn_min_epochs=12, tcn_lr=7e-5, patience=3),
     # Our model without language: the same pretrained M2CRL backbone and temporal head, with a fixed output
-    # per concept instead of the text query (a closed-set multi-label classifier). Same optimiser,
-    # learning rate, schedule, epochs and model selection as ours; batch 8 x 2 so that an epoch has about as
-    # many optimiser steps as ours (each window carries all 14 concepts instead of one).
-    'closedset': dict(label='Our backbone without language (closed-set)', batch_size=8, accum=2),
+    # per concept instead of the text query (a closed-set multi-label classifier); our optimiser, learning
+    # rate, schedule, epochs, augmentation and model selection. A window carries all 14 labels at once (ours:
+    # one query per window), so two versions (comparison_models/closedset/closedset.py):
+    #   compute-efficient: every window once per epoch, batch 8 x 2 - about as many optimiser steps as ours,
+    #                      14x fewer backbone passes;
+    #   exposure-matched:  every window 14 times per epoch (own augmentation each time), batch 8 x 24 - the same
+    #                      backbone passes and optimiser steps as ours. Run last (about one GPU day).
+    'closedset': dict(label='Closed-set, our backbone (compute-efficient)', batch_size=8, accum=2, repeats=1),
+    'closedset_matched': dict(label='Closed-set, our backbone (exposure-matched)', batch_size=8, accum=24,
+                              repeats=14),
 }
 
 # The surgical video-language models: one package (SurgVLP, fixed commit), three public weight files.
@@ -118,8 +124,9 @@ def tool_queries():
 
 
 ZERO_SHOT = ('clip_zeroshot', 'surgvlp_zeroshot', 'hecvl_zeroshot', 'peskavlp_zeroshot')
-TRAINED = ('xclip_finetune', 'peskavlp_finetune', 'univtg', 'tecno', 'closedset')
-CLOSED_SET = ('tecno', 'closedset')                     # a fixed output per concept, no text input
+TRAINED = ('xclip_finetune', 'peskavlp_finetune', 'univtg', 'tecno', 'closedset', 'closedset_matched')
+CLOSED_SET = ('tecno', 'closedset', 'closedset_matched')   # a fixed output per concept, no text input
+LAST = ('closedset_matched',)                           # trained after everything else (the longest comparison)
 SURGVLP_ZERO_SHOT = ('surgvlp_zeroshot', 'hecvl_zeroshot', 'peskavlp_zeroshot')
 
 
@@ -137,13 +144,16 @@ def plans(prefix='paper'):
         add(key, key, 'comparison', COMPARISONS[key]['label'])
     for key in TRAINED:
         # Models without a text input cannot be asked in other words: no unseen-wording test for them.
-        add(f'{key}_s{MAIN_SEED}', key, 'comparison', COMPARISONS[key]['label'], paraphrases=key not in CLOSED_SET)
+        if key not in LAST:
+            add(f'{key}_s{MAIN_SEED}', key, 'comparison', COMPARISONS[key]['label'], paraphrases=key not in CLOSED_SET)
     for key, (label, flags) in ADDONS.items():
         add(f'ablation_{key}_s{MAIN_SEED}', 'proposed', 'ablation', f'Baseline + {label}', flags=flags,
             paraphrases=False)
     for seed in SEEDS[1:]:
         add(f'baseline_s{seed}', 'proposed', 'seed', 'Baseline (ours)', seed=seed)
         add(f'advanced_s{seed}', 'proposed', 'seed', 'Advanced (ours)', seed=seed, flags=ADVANCED)
+    for key in LAST:
+        add(f'{key}_s{MAIN_SEED}', key, 'comparison', COMPARISONS[key]['label'], paraphrases=key not in CLOSED_SET)
     names = [p['name'] for p in out]
     assert len(names) == len(set(names)), names
     return out

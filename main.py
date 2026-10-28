@@ -728,6 +728,11 @@ def stage_preflight(a, p, selected):
                 f'CUDA_VISIBLE_DEVICES={pinned} (request a single GPU to avoid reserving idle ones)')
     free = gb(shutil.disk_usage(p.root).free)
     info['free_disk_gb'] = round(free, 1)
+    if os.path.isdir('/dev/shm'):                       # DataLoader processes pass batches through shared memory
+        info['shm_free_gb'] = round(gb(shutil.disk_usage('/dev/shm').free), 1)
+        if info['shm_free_gb'] < 4 and 'train' in selected:
+            log(f'note: only {info["shm_free_gb"]} GB free in /dev/shm, through which the data-loader processes pass '
+                f'their batches; a "bus error" or "shared memory" failure of a training step would point to this.')
     for mod in ['cv2', 'pandas', 'sklearn', 'transformers', 'einops', 'PIL']:
         try:
             __import__(mod)
@@ -1103,6 +1108,42 @@ def stage_check_advanced(a, p):
                              f'internet access (without --offline).')
         raise
     _ADVANCED_CHECKED = True
+    if getattr(a, 'preset', None) == 'paper':
+        rehearse_comparisons(a, p)
+
+
+def rehearse_comparisons(a, p):
+    """Paper preset: once per GPU type, two training steps of the closed-set model and of TeCNO at the size the
+    protocol trains them (comparison_models/rehearsal.py, about a minute), so that a memory problem shows in
+    the first report instead of days later. Never stops the job: a run that cannot train fails on its own (and
+    is retried by the next job); here it is only reported early."""
+    import torch
+    if not torch.cuda.is_available():
+        return None
+    gpu = torch.cuda.get_device_name(0)
+    record = p.state / 'comparison_rehearsal.json'
+    try:
+        done = json.loads(record.read_text()) if record.exists() else {}
+    except ValueError:
+        done = {}
+    if done.get('gpu') == gpu and all(v.get('ok') for v in done.values() if isinstance(v, dict)):
+        log(f'closed-set / TeCNO rehearsal already passed on this GPU type ({gpu})')
+        return done
+    amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
+    p.tmp.mkdir(parents=True, exist_ok=True)
+    cfg_path = p.tmp / 'rehearsal.json'
+    write_json(cfg_path, dict(MODEL=dict(M2CRL_WEIGHTS_PATH=''), TRAIN=dict(AMP_DTYPE=amp)))   # our crop and clip
+    tecno_cfg = protocol.COMPARISONS['tecno']
+    try:
+        run([sys.executable, 'comparison_models/rehearsal.py', '--config', cfg_path, '--output', record,
+             '--closedset-batch', protocol.COMPARISONS['closedset']['batch_size'], '--tecno-batch',
+             tecno_cfg['cnn_batch_size'], '--tecno-size', tecno_cfg['input_size']], a, p, 'rehearse_comparisons')
+    except StageError as e:
+        log(f'!! the real-size rehearsal of the closed-set / TeCNO models failed on this GPU ({e}); the main runs '
+            f'continue, and the comparison runs concerned will report their own error. See '
+            f'logs/rehearse_comparisons.log and {record.name}.')
+        return None
+    return json.loads(record.read_text()) if record.exists() else None
 
 
 def _check_advanced(cfg_path):
@@ -1596,6 +1637,23 @@ def repair_metrics_journal(p, done):
     return missing
 
 
+def reconcile_best(best, latest):
+    """Finish (or discard) a best-model candidate that a stop left between the two checkpoint writes, so that the
+    best model always belongs to the history the latest checkpoint describes (see checkpoint_utils.commit_best)."""
+    best = Path(best)
+    if not best.parent.exists() or not any(best.parent.glob(f'{best.stem}.pending-e*{best.suffix}')):
+        return None
+    from checkpoint_utils import commit_best
+    committed = None
+    if Path(latest).exists():
+        import torch
+        committed = torch.load(latest, map_location='cpu', weights_only=False).get('best_epoch')
+    done = commit_best(best, committed)
+    log(f'{best.parent.name}: ' + (f'completed the interrupted save of the best model (epoch {done})' if done else
+                                   'discarded a best-model candidate of an epoch that was not committed'))
+    return done
+
+
 def recover_unresumable_run(p):
     """No latest_model.pth: the job died before the first epoch finished saving. Nothing can be
     resumed, so the run starts again; a folder holding checkpoint files is kept aside, never deleted."""
@@ -1641,6 +1699,7 @@ def stage_train(a, p):
     else:
         write_json(p.run_cfg, cfg)
     recover_unresumable_run(p)
+    reconcile_best(p.run / 'best_model.pth', p.run / 'latest_model.pth')
     done = completed_epochs(p)
     repair_metrics_journal(p, done)
     if done >= cfg['TRAIN']['NUM_EPOCHS']:
@@ -2019,7 +2078,7 @@ def scored_predictions(a, p, sets, tag, command):
 
 # ----- our model without language (closed set): comparison_models/closedset/closedset.py
 def closedset_train(a, p):
-    spec = protocol.COMPARISONS['closedset']
+    spec = protocol.COMPARISONS[a.kind]
     out = p.run / 'closedset'
     if finished_marker(out).exists():
         log('closed-set training already finished')
@@ -2038,7 +2097,10 @@ def closedset_train(a, p):
             cfg['DATA']['NUM_WORKERS'] = saved['DATA']['NUM_WORKERS']
         if a.amp_dtype == 'auto':
             cfg['TRAIN']['AMP_DTYPE'] = saved['TRAIN']['AMP_DTYPE']
-        if cfg != saved and (out / 'latest.pt').exists():
+        def comparable(c):                              # the loader process count does not change the training
+            return {k: ({kk: vv for kk, vv in v.items() if kk != 'NUM_WORKERS'} if k == 'DATA' else v)
+                    for k, v in c.items()}
+        if comparable(cfg) != comparable(saved) and (out / 'latest.pt').exists():
             raise StageError(f'Run "{a.run_name}" was started with different settings; restore them to resume it.')
     p.run.mkdir(parents=True, exist_ok=True)
     write_json(config_file, cfg)
@@ -2047,7 +2109,8 @@ def closedset_train(a, p):
     run([sys.executable, 'comparison_models/closedset/closedset.py', 'train', '--config', config_file,
          '--train-order', train_order, '--train-labels', train_labels, '--val-order', val_order,
          '--val-labels', val_labels, '--output', out, '--parameter-counts', p.run / 'parameter_counts.json',
-         '--workers', cfg['DATA']['NUM_WORKERS']], a, p, 'train', on_line=_epoch_progress(cfg['TRAIN']['NUM_EPOCHS']))
+         '--repeats', spec['repeats'], '--workers', cfg['DATA']['NUM_WORKERS']], a, p, 'train',
+        on_line=_epoch_progress(cfg['TRAIN']['NUM_EPOCHS']))
     if not (out / 'best.pt').exists():
         raise StageError('closed-set training ended without a best checkpoint')
     write_json(finished_marker(out), dict(finished=time.ctime(), epochs=cfg['TRAIN']['NUM_EPOCHS']))
@@ -2113,6 +2176,7 @@ COMPARISON_METHODS = {
     'univtg': dict(train=univtg_train, predict=univtg_predict),
     'tecno': dict(train=tecno_train, predict=tecno_predict),
     'closedset': dict(train=closedset_train, predict=closedset_predict),
+    'closedset_matched': dict(train=closedset_train, predict=closedset_predict),
 }
 
 
