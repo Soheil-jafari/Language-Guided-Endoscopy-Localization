@@ -74,8 +74,10 @@ COMPARISONS = {
     # one query per window), so two versions (comparison_models/closedset/closedset.py):
     #   compute-efficient: every window once per epoch, batch 8 x 2 - about as many optimiser steps as ours,
     #                      14x fewer backbone passes;
-    #   exposure-matched:  every window 14 times per epoch (own augmentation each time), batch 8 x 24 - the same
-    #                      backbone passes and optimiser steps as ours. Run last (about one GPU day).
+    #   exposure-matched:  every window 14 times per epoch (own augmentation each time), batch 8 x 24 - about the
+    #                      same backbone passes and optimiser steps as ours (exactly when every window has an
+    #                      observed label for every concept; the efficiency table reports both). Run last (about
+    #                      one GPU day).
     'closedset': dict(label='Closed-set, our backbone (compute-efficient)', batch_size=8, accum=2, repeats=1),
     'closedset_matched': dict(label='Closed-set, our backbone (exposure-matched)', batch_size=8, accum=24,
                               repeats=14),

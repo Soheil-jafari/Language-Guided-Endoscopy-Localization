@@ -745,9 +745,16 @@ def main(argv=None):
     ap.add_argument('--permutations', type=int, default=1000, help='random swaps per paired permutation test')
     ap.add_argument('--workers', type=int, default=None, help='processes for the permutation tests')
     a = ap.parse_args(argv)
-    if a.workers is None:
+    if a.workers is None:                                # the CPUs this job may use (Slurm allocation, affinity)
         import os
-        a.workers = max(1, min(16, (os.cpu_count() or 2) - 1))
+        try:
+            n = len(os.sched_getaffinity(0))
+        except AttributeError:
+            n = os.cpu_count() or 2
+        slurm = os.environ.get('SLURM_CPUS_PER_TASK', '')
+        if slurm.isdigit() and int(slurm) > 0:
+            n = min(n, int(slurm))
+        a.workers = max(1, min(16, n - 1))
     root = Path(a.root).resolve()
     out = Path(a.output).resolve() if a.output else root / 'paper'
     out.mkdir(parents=True, exist_ok=True)
@@ -927,7 +934,9 @@ def main(argv=None):
                            f'Differences in percentage points, with 95 % paired-bootstrap CIs over test videos. Primary '
                            f'endpoint: 14-query mAP, two-sided paired permutation test ({a.permutations} random swaps of '
                            f'the two methods\' scores within test videos), Holm correction over its {len(pairs_to_test)} '
-                           f'comparisons. Secondary endpoints (pooled AP, F1, segment mAP@0.5): two-sided paired '
+                           f'comparisons (null hypothesis: within every test video the two methods\' score vectors are '
+                           f'exchangeable, which is stronger than equal mAP). Secondary endpoints (pooled AP, F1, '
+                           f'segment mAP@0.5): two-sided paired '
                            f'bootstrap test with the bootstrap distribution centred at the null, Holm correction within '
                            f'each endpoint. Wilcoxon signed-rank test on the per-video APs. One training seed (42); '
                            f'the variation over seeds is in section 8.'), '']

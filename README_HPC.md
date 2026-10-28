@@ -101,7 +101,7 @@ This runs the complete experimental protocol of `paper_protocol.py` in its own f
 | 7-11 | `paper_xclip_finetune_s42`, `paper_peskavlp_finetune_s42`, `paper_univtg_s42`, `paper_tecno_s42`, `paper_closedset_s42` | trained comparison methods (TeCNO: a specialised Cholec80 phase model; closed set: our backbone and temporal head without language, every training window once per epoch) |
 | 12-15 | `paper_ablation_{mamba,bilevel,uncertainty,fusion}_s42` | the baseline plus one add-on each |
 | 16-19 | `paper_{baseline,advanced}_s{43,44}` | two more training seeds of both models |
-| 20 | `paper_closedset_matched_s42` | the closed-set model with the same training exposure as ours (every window 14 times per epoch, batch 8 x 24; about one GPU day, so it runs last) |
+| 20 | `paper_closedset_matched_s42` | the closed-set model with about the same training exposure as ours (every window 14 times per epoch, batch 8 x 24; about one GPU day, so it runs last) |
 
 Every run is evaluated on the same test frames with its own threshold chosen on the validation
 videos; the main, comparison and seed runs are also evaluated with two sets of query wordings never

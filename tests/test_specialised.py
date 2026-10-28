@@ -445,19 +445,20 @@ def test_augmentation_does_not_depend_on_the_number_of_loader_processes(tmp_path
 
 
 # --------------------------------------------------------------------------- real-size rehearsal
-def test_the_rehearsal_trains_both_models_for_two_steps(tmp_path):
+def test_the_rehearsal_trains_each_model_for_two_steps_in_its_own_process(tmp_path):
     env = env_for(tmp_path)                              # (tiny backbone and crop through the test hook)
     cfg = tmp_path / 'cfg.json'
     cfg.write_text(json.dumps(dict(MODEL=dict(M2CRL_WEIGHTS_PATH=''), TRAIN=dict(AMP_DTYPE='bf16'))))
-    out = tmp_path / 'rehearsal.json'
-    run([REPO / 'comparison_models' / 'rehearsal.py', '--config', cfg, '--output', out, '--device', 'cpu',
-         '--closedset-batch', 2, '--tecno-batch', 4, '--tecno-size', 32, '--tcn-steps', 300], env, tmp_path)
-    result = json.loads(out.read_text())
-    steps = {k: v for k, v in result.items() if isinstance(v, dict)}
-    assert len(steps) == 3 and all(v['ok'] for v in steps.values()), result
+    for part in pipeline.REHEARSAL_PARTS:
+        out = tmp_path / f'{part}.json'
+        run([REPO / 'comparison_models' / 'rehearsal.py', '--part', part, '--config', cfg, '--output', out,
+             '--device', 'cpu', '--closedset-batch', 2, '--tecno-batch', 4, '--tecno-size', 32, '--tcn-steps', 300],
+            env, tmp_path)
+        result = json.loads(out.read_text())
+        assert list(result) == [part] and result[part]['ok'], result
 
 
-def test_the_rehearsal_runs_once_per_gpu_type_and_never_stops_the_job(tmp_path, monkeypatch):
+def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_the_job(tmp_path, monkeypatch):
     sub = _plans(tmp_path)['baseline']
     p = pipeline.Paths(tmp_path, sub.run_name)
     p.state.mkdir(parents=True, exist_ok=True)
@@ -467,19 +468,109 @@ def test_the_rehearsal_runs_once_per_gpu_type_and_never_stops_the_job(tmp_path, 
     calls = []
 
     def ok(cmd, a, p_, name, **k):
-        calls.append([str(c) for c in cmd])
-        out = cmd[cmd.index('--output') + 1]
-        Path(out).write_text(json.dumps({'gpu': 'NVIDIA A100-SXM4-80GB', 'closed-set': dict(ok=True, peak_gb=20.0)}))
+        calls.append(([str(c) for c in cmd], k))
+        part = cmd[cmd.index('--part') + 1]
+        Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({part: dict(ok=True, peak_gb=20.0)}))
     monkeypatch.setattr(pipeline, 'run', ok)
-    assert pipeline.rehearse_comparisons(sub, p)['closed-set']['ok']
-    cmd = calls[0]
+    record = pipeline.rehearse_comparisons(sub, p)
+    assert [c[c.index('--part') + 1] for c, _ in calls] == list(pipeline.REHEARSAL_PARTS)   # one process each
+    assert all(k['timeout'] == pipeline.REHEARSAL_TIMEOUT for _, k in calls)                 # each with a deadline
+    cmd = calls[0][0]
     assert cmd[1].endswith('rehearsal.py') and cmd[cmd.index('--tecno-batch') + 1] == '80'
     assert cmd[cmd.index('--closedset-batch') + 1] == '8'
+    assert record['gpu'] == 'NVIDIA A100-SXM4-80GB' and all(record[x]['ok'] for x in pipeline.REHEARSAL_PARTS)
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 1                                          # passed on this GPU type: not repeated
+    assert len(calls) == 3                                          # passed on this GPU type: not repeated
     (p.state / 'comparison_rehearsal.json').unlink()
 
-    def failing(cmd, a, p_, name, **k):
-        raise pipeline.StageError('CUDA out of memory')
-    monkeypatch.setattr(pipeline, 'run', failing)
-    assert pipeline.rehearse_comparisons(sub, p) is None            # reported, never raised
+    def one_fails(cmd, a, p_, name, **k):                          # e.g. a hang stopped by the deadline
+        part = cmd[cmd.index('--part') + 1]
+        if part == 'tecno_cnn':
+            err = pipeline.StageError('still running after the time limit')
+            err.timed_out = True
+            raise err
+        Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({part: dict(ok=True)}))
+    monkeypatch.setattr(pipeline, 'run', one_fails)
+    record = pipeline.rehearse_comparisons(sub, p)                 # reported, never raised; the others still run
+    assert record['closedset']['ok'] and record['tecno_tcn']['ok'] and not record['tecno_cnn']['ok']
+    assert 'time limit' in record['tecno_cnn']['error']
+
+
+def test_a_step_with_a_deadline_is_stopped_with_everything_it_started(tmp_path):
+    import argparse
+    a = argparse.Namespace(offline=True)
+    p = pipeline.Paths(tmp_path, 'r')
+    child = tmp_path / 'child.pid'
+    code = (f'import subprocess, sys, time; c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"]); '
+            f'open({str(child)!r}, "w").write(str(c.pid)); print("started", flush=True); time.sleep(600)')
+    started = time.time()
+    with pytest.raises(pipeline.StageError) as e:
+        pipeline.run([sys.executable, '-c', code], a, p, 'hangs', timeout=3)
+    assert e.value.timed_out and time.time() - started < 60 and 'time limit' in str(e.value)
+    pid = int(child.read_text())
+    time.sleep(0.5)
+    try:                                                            # the grandchild is gone too (process group)
+        os.kill(pid, 0)
+        alive = open(f'/proc/{pid}/stat').read().split()[2] != 'Z'
+    except (ProcessLookupError, FileNotFoundError):
+        alive = False
+    assert not alive
+    assert pipeline.run([sys.executable, '-c', 'print(1)'], a, p, 'quick', timeout=60) == 0   # normal steps unaffected
+
+
+# --------------------------------------------------------------------------- seeds and --force
+def test_sample_seeds_never_collide_and_never_reseed_the_gpu(tmp_path, monkeypatch):
+    sys.path.insert(0, str(CLOSEDSET.parent))
+    import closedset
+    for f in (closedset.sample_seed, tecno.sample_seed):
+        assert f(42, 0, 10007) != f(42, 1, 0)                        # (the earlier linear formula collided here)
+        seeds = {f(42, e, i) for e in range(20) for i in range(5000)}
+        assert len(seeds) == 20 * 5000 and all(0 <= x < 2 ** 63 for x in list(seeds)[:100])
+    assert closedset.sample_seed(1, 2, 3) == tecno.sample_seed(1, 2, 3)
+
+    class Base(torch.utils.data.Dataset):
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, i):
+            return torch.rand(2)                                     # an augmentation draw (CPU generator)
+    calls = []
+    monkeypatch.setattr(torch.cuda, 'manual_seed_all', lambda *x: calls.append(x))
+    monkeypatch.setattr(torch.cuda, 'manual_seed', lambda *x: calls.append(x))
+    data = closedset.EpochWindows(Base(), [0, 1, 2], seed=7)
+    before = torch.get_rng_state()
+    first = data[1]
+    assert torch.equal(first, data[1]) and not torch.equal(first, data[2])
+    assert torch.equal(torch.get_rng_state(), before)                # the training process's CPU stream is restored
+    assert calls == []                                               # and the GPU generators are never reseeded
+    from PIL import Image
+    image = tmp_path / 'frame.jpg'
+    Image.fromarray(np.random.default_rng(0).integers(0, 255, (32, 48, 3), dtype=np.uint8)).save(image)
+    frames = tecno.FrameSet([image] * 2, np.zeros(2, np.int64), np.zeros((2, 7)), tecno.image_transform(32, True), seed=7)
+    before = torch.get_rng_state()
+    x = frames[0][0]
+    assert torch.equal(x, frames[0][0]) and torch.equal(torch.get_rng_state(), before) and calls == []
+
+
+def test_force_train_never_pretends_to_retrain_a_finished_model(tmp_path, monkeypatch):
+    subs = _plans(tmp_path)
+    monkeypatch.setattr(pipeline, 'check_run_inputs', lambda *x: None)
+    sub = subs['tecno']
+    p = pipeline.Paths(tmp_path, sub.run_name)
+    (p.run / 'tecno_tcn').mkdir(parents=True)
+    pipeline.write_json(pipeline.finished_marker(p.run / 'tecno_tcn'), {})
+    sub.force = 'train'
+    with pytest.raises(pipeline.StageError, match='new --run-name'):
+        pipeline.stage_train(sub, p)
+    sub.force = 'predict'                                            # other stages: as before
+    monkeypatch.setattr(pipeline, 'run', lambda *x, **k: None)
+    pipeline.stage_train(sub, p)
+    base = subs['baseline']
+    pb = pipeline.Paths(tmp_path, base.run_name)
+    pb.run.mkdir(parents=True)
+    torch.save(dict(epoch=base.epochs), pb.run / 'latest_model.pth')
+    base.force = 'train'
+    with pytest.raises(pipeline.StageError, match='already finished training'):
+        pipeline.stage_train(base, pb)
+    assert pipeline.training_finished(base, pb) and not pipeline.training_finished(subs['closedset'],
+                                                                                   pipeline.Paths(tmp_path, 'nothing'))

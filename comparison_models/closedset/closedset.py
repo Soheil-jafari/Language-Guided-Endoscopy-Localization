@@ -21,7 +21,8 @@ versions are trained:
   * compute-efficient (--repeats 1, batch 8 x 2): every window once per epoch; about as many optimiser steps
     as ours, but 14x fewer backbone passes and augmentation draws;
   * exposure-matched (--repeats 14, batch 8 x 24): every window 14 times per epoch, each with its own
-    augmentation; the same number of backbone passes and optimiser steps as ours.
+    augmentation; about the same number of backbone passes and optimiser steps as ours (exactly the same when
+    every window has an observed label for every concept, since ours skips a window for a query without one).
 Every journal row records the clips processed and the optimiser steps of the epoch.
 
 train    resumable at epoch boundaries (latest.pt; best.pt is only replaced after latest.pt has recorded it);
@@ -174,8 +175,11 @@ class Windows(Dataset):
 
 
 def sample_seed(seed, epoch, index):
-    """The random augmentation of one sample in one epoch: a function of these three numbers only."""
-    return (int(seed) * 1_000_003 + int(epoch) * 10_007 + int(index)) % (2 ** 63)
+    """The random augmentation of one sample in one epoch: a function of these three numbers only (a hash, so
+    that no two (epoch, index) pairs share a seed)."""
+    import hashlib
+    digest = hashlib.blake2b(f'{int(seed)}:{int(epoch)}:{int(index)}'.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, 'little') & ((1 << 63) - 1)
 
 
 class EpochWindows(Dataset):
@@ -189,8 +193,11 @@ class EpochWindows(Dataset):
         return len(self.indices)
 
     def __getitem__(self, i):
+        # Only the CPU generator (the image transforms' source) is seeded and restored: torch.manual_seed would
+        # also reseed the CUDA generators, which fork_rng(devices=[]) does not restore - with 0 loader processes
+        # this runs in the training process, whose dropout must not depend on the last sample loaded.
         with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(sample_seed(self.seed, self.epoch, i))
+            torch.default_generator.manual_seed(sample_seed(self.seed, self.epoch, i))
             return self.windows[self.indices[i]]
 
 

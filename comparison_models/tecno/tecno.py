@@ -169,8 +169,11 @@ def image_transform(size, training):
 
 
 def sample_seed(seed, epoch, index):
-    """The random augmentation of one sample in one epoch: a function of these three numbers only."""
-    return (int(seed) * 1_000_003 + int(epoch) * 10_007 + int(index)) % (2 ** 63)
+    """The random augmentation of one sample in one epoch: a function of these three numbers only (a hash, so
+    that no two (epoch, index) pairs share a seed)."""
+    import hashlib
+    digest = hashlib.blake2b(f'{int(seed)}:{int(epoch)}:{int(index)}'.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, 'little') & ((1 << 63) - 1)
 
 
 class FrameSet(Dataset):
@@ -189,8 +192,8 @@ class FrameSet(Dataset):
         if self.seed is None:
             x = self.transform(x)
         else:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(sample_seed(self.seed, self.epoch, i))
+            with torch.random.fork_rng(devices=[]):     # CPU generator only (see closedset.EpochWindows)
+                torch.default_generator.manual_seed(sample_seed(self.seed, self.epoch, i))
                 x = self.transform(x)
         return x, int(self.phase[i]), torch.from_numpy(self.tools[i].astype(np.float32))
 

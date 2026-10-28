@@ -30,7 +30,7 @@ add-on, ten comparison methods (CLIP zero-shot; the surgical video-language mode
 PeskaVLP zero-shot, and PeskaVLP fine-tuned; X-CLIP fine-tuned; the official UniVTG model on the same
 M2CRL features; TeCNO, a specialised Cholec80 phase-recognition model, re-implemented; and our own
 backbone and temporal head without language, as a closed-set classifier, once compute-efficient and once
-with the same training exposure as ours), two sets of unseen query wordings, and `paper_analysis.py`,
+with about the same training exposure as ours), two sets of unseen query wordings, and `paper_analysis.py`,
 which writes every table (CSV + LaTeX) and figure with bootstrap confidence intervals and paired tests
 (a permutation test for the primary endpoint, the 14-query mAP), and reports phase recognition with the
 strict, the legacy relaxed-boundary and the symmetric relaxed Cholec80 metrics. One resumable command;

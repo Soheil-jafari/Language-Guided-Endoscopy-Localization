@@ -270,8 +270,10 @@ def stage_env(a, p, online=False):
     return env
 
 
-def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=None):
-    """Run a subprocess, stream its output to the console and logs/<name>.log."""
+def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=None, timeout=None):
+    """Run a subprocess, stream its output to the console and logs/<name>.log. With `timeout` (seconds), a step
+    that is still running then is stopped (its whole process group) and reported as failed (err.timed_out); only
+    for optional checks - training steps never get a timeout."""
     folder = p.logs / p.log_scope if getattr(p, 'log_scope', None) else p.logs
     folder.mkdir(parents=True, exist_ok=True)
     logfile = folder / f'{name}.log'
@@ -295,6 +297,13 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
 
     threading.Thread(target=beat, daemon=True).start()
     proc = None
+    timed_out = threading.Event()
+
+    def watchdog():
+        if not stop.wait(timeout) and proc is not None and proc.poll() is None:
+            timed_out.set()
+            log(f'!! {name} is still running after {timeout / 60:.0f} min: stopping it')
+            stop_process_group(proc)
     try:
         with open(logfile, 'a') as lf:
             lf.write(f'\n===== {time.ctime()} :: {shown}\n')
@@ -303,6 +312,8 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
             proc = subprocess.Popen(cmd, cwd=REPO, env=env or stage_env(a, p), stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
                                     bufsize=1, start_new_session=hasattr(os, 'killpg'))
+            if timeout is not None:
+                threading.Thread(target=watchdog, daemon=True).start()
             for line in proc.stdout:
                 line = redact(line)
                 console(line)
@@ -322,13 +333,16 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
         stop.set()
     if rc != 0:
         hint = ''
-        if rc == -9:
+        if timed_out.is_set():
+            hint = f' (stopped: still running after the time limit of {timeout:.0f} s for this step)'
+        elif rc == -9:
             hint = (' (killed with SIGKILL: almost always the machine ran out of RAM, or the scheduler enforced its '
                     'memory limit - request more --mem, or lower --train-workers / --batch-size)')
         elif rc == -15:
             hint = ' (terminated with SIGTERM: usually the scheduler hit the job time limit - just submit the same command again)'
         err = StageError(f'`{cmd[0]} {cmd[1] if len(cmd) > 1 else ""}` exited with code {rc}{hint}. See {logfile}')
         err.rc = rc
+        err.timed_out = timed_out.is_set()
         raise err
     return rc
 
@@ -1112,6 +1126,10 @@ def stage_check_advanced(a, p):
         rehearse_comparisons(a, p)
 
 
+REHEARSAL_PARTS = ('closedset', 'tecno_cnn', 'tecno_tcn')
+REHEARSAL_TIMEOUT = 900                                    # seconds per model (normally well under a minute)
+
+
 def rehearse_comparisons(a, p):
     """Paper preset: once per GPU type, two training steps of the closed-set model and of TeCNO at the size the
     protocol trains them (comparison_models/rehearsal.py, about a minute), so that a memory problem shows in
@@ -1134,16 +1152,28 @@ def rehearse_comparisons(a, p):
     cfg_path = p.tmp / 'rehearsal.json'
     write_json(cfg_path, dict(MODEL=dict(M2CRL_WEIGHTS_PATH=''), TRAIN=dict(AMP_DTYPE=amp)))   # our crop and clip
     tecno_cfg = protocol.COMPARISONS['tecno']
-    try:
-        run([sys.executable, 'comparison_models/rehearsal.py', '--config', cfg_path, '--output', record,
-             '--closedset-batch', protocol.COMPARISONS['closedset']['batch_size'], '--tecno-batch',
-             tecno_cfg['cnn_batch_size'], '--tecno-size', tecno_cfg['input_size']], a, p, 'rehearse_comparisons')
-    except StageError as e:
-        log(f'!! the real-size rehearsal of the closed-set / TeCNO models failed on this GPU ({e}); the main runs '
-            f'continue, and the comparison runs concerned will report their own error. See '
-            f'logs/rehearse_comparisons.log and {record.name}.')
-        return None
-    return json.loads(record.read_text()) if record.exists() else None
+    results = dict(gpu=gpu)
+    # One process per model (so no model's memory remains allocated while the next is measured), each with a
+    # deadline (a hung CUDA call must not hold up the job; training steps never get one).
+    for part in REHEARSAL_PARTS:
+        out = p.tmp / f'rehearsal_{part}.json'
+        out.unlink(missing_ok=True)
+        try:
+            run([sys.executable, 'comparison_models/rehearsal.py', '--part', part, '--config', cfg_path, '--output', out,
+                 '--closedset-batch', protocol.COMPARISONS['closedset']['batch_size'], '--tecno-batch',
+                 tecno_cfg['cnn_batch_size'], '--tecno-size', tecno_cfg['input_size']], a, p, f'rehearse_{part}',
+                timeout=REHEARSAL_TIMEOUT)
+            results.update(json.loads(out.read_text()))
+        except (StageError, OSError, ValueError) as e:
+            try:                                        # the part's own error message, when it got that far
+                results.update(json.loads(out.read_text()))
+            except (OSError, ValueError):
+                results[part] = dict(ok=False, error=str(e)[:500])
+            results[part]['ok'] = False
+            log(f'!! the real-size rehearsal of {part} failed on this GPU ({e}); the main runs continue, and the '
+                f'comparison run concerned will report its own error. See logs/rehearse_{part}.log.')
+    write_json(record, results)
+    return results
 
 
 def _check_advanced(cfg_path):
@@ -1668,8 +1698,20 @@ def recover_unresumable_run(p):
     return None
 
 
+def training_finished(a, p):
+    """Has this run's training already finished (its model would only be re-checked, never retrained)?"""
+    if getattr(a, 'kind', 'proposed') != 'proposed':
+        return p.run.exists() and any(p.run.glob('*/FINISHED.json'))
+    return (p.run / 'latest_model.pth').exists() and completed_epochs(p) >= a.epochs
+
+
 def stage_train(a, p):
     check_run_inputs(p, a.run_name)
+    if 'train' in [f.strip() for f in str(getattr(a, 'force', None) or '').split(',')] and training_finished(a, p):
+        # Finished training is never thrown away by a flag: retraining needs a new run (its own folder).
+        raise StageError(f'run "{a.run_name}" has already finished training, and --force train does not retrain a '
+                         f'model (it would only check it again). To train it again, use a new --run-name (or a new '
+                         f'--root); to redo only its predictions and evaluation, use --force predict.')
     if getattr(a, 'kind', 'proposed') != 'proposed':
         return COMPARISON_METHODS[a.kind]['train'](a, p)
     if uses_flow(a):
