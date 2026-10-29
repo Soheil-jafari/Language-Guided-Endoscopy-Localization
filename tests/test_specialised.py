@@ -514,6 +514,19 @@ def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_th
     (p.state / 'comparison_rehearsal.json').write_text('[1]')      # an unreadable record is simply redone
     pipeline.rehearse_comparisons(sub, p)
     assert len(calls) == 24
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 24                                         # (now passed again with these settings)
+    record_file, real_read = p.state / 'comparison_rehearsal.json', Path.read_text
+
+    def unreadable(self, *x, **k):                                  # e.g. a transient file-system error
+        if self == record_file:
+            raise PermissionError('test: cannot read the record')
+        return real_read(self, *x, **k)
+    monkeypatch.setattr(Path, 'read_text', unreadable)
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 28                                         # rehearsed again, not skipped or aborted
+    monkeypatch.setattr(Path, 'read_text', real_read)
+    assert json.loads(record_file.read_text())['advanced']['ok']
     sub.amp_dtype = 'auto'
     (p.state / 'comparison_rehearsal.json').unlink()
 

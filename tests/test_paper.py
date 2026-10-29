@@ -737,6 +737,16 @@ def test_a_missing_last_journal_row_is_reported(tmp_path):
     for method in (t, x, z):
         pa.efficiency(method, root, missing)
     assert missing == {'runs/paper_tecno_s42/tecno_tcn/training_metrics.jsonl': 'all (no journal)'}
+    (t.run / 'tecno_tcn' / 'training_metrics.jsonl').write_text('')                    # present but empty
+    missing = {}
+    pa.efficiency(t, root, missing)
+    assert missing == {'runs/paper_tecno_s42/tecno_tcn/training_metrics.jsonl': 'all (empty journal)'}
+    # damaged rows are skipped, never fatal; the epochs they would have recorded show as gaps
+    (c.run / 'closedset' / 'training_metrics.jsonl').write_text(
+        '5\n' + json.dumps(dict(epoch=1, train_seconds='broken')) + '\n' + json.dumps(dict(epoch=2, train_seconds=7)) + '\n')
+    missing = {}
+    row = pa.efficiency(c, root, missing)
+    assert missing == {'runs/paper_closedset_s42/closedset/training_metrics.jsonl': [1]} and row['Training (h)'] == '0.0'
 
 
 def test_holm_and_bootstrap_p_values():

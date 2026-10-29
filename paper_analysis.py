@@ -838,8 +838,9 @@ def main(argv=None):
            f'sampled at {a.sample_fps:g} fps x 14 queries; unannotated frames are excluded. Every method uses its own '
            f'threshold selected on the {len(split.get("val", []))} validation videos ({span(split.get("val", []))}). '
            f'Square brackets: 95 % bootstrap confidence interval over test videos ({a.bootstrap} resamples, the same '
-           f'resamples for every method; a resample without a positive frame of some query is drawn again, so the '
-           f'mAP of every resample averages the same queries). Values in %.', '']
+           f'resamples for every method; conditional on every query with a positive test frame keeping at least one: '
+           f'a resample in which such a query has none is drawn again, so the mAP of every resample averages the same '
+           f'queries; a query without any positive test frame is left out of the mAP). Values in %.', '']
     report['split'] = {k: len(v) for k, v in split.items()}
     rng = np.random.default_rng(a.seed)
     counts, rejected, defined = bootstrap_counts(frames, a.bootstrap, rng)
@@ -922,7 +923,7 @@ def main(argv=None):
                            f'(the primary endpoint; {map_name}' + (f'; no positive test frame: {", ".join(undefined)}'
                                                                   if undefined else '') + '); F1 at the threshold selected on '
                            'validation; seed 42 for trained methods. Square brackets: 95 % bootstrap CI over test videos '
-                           '(resamples conditional on every query having a positive frame). '
+                           '(resamples conditional on every query with a positive test frame keeping at least one). '
                            'TeCNO: phase queries from its temporal network, tool queries from the auxiliary tool head '
                            'of its stage-1 CNN (TeCNO itself predicts phases only). Closed-set models: one output per '
                            'concept, no text input.'), '']
@@ -1413,26 +1414,33 @@ def efficiency(m, root, missing=None):
             if finished and missing is not None:               # a finished training whose journal is lost
                 missing[str(j.relative_to(root))] = list(range(1, expected + 1)) if expected else 'all (no journal)'
             continue
-        if j.exists():
-            epochs = set()
-            for line in j.read_text().splitlines():
-                try:
-                    r = json.loads(line)
-                except ValueError:
+        epochs = set()
+        for line in j.read_text(errors='replace').splitlines():
+            try:                                                # a damaged row is skipped (and shows as a gap)
+                r = json.loads(line)
+                if not isinstance(r, dict):
                     continue
-                if isinstance(r.get('epoch'), int):
-                    epochs.add(r['epoch'])
-                seconds += float(r.get('train_seconds', 0) or 0) + float(r.get('val_seconds', 0) or 0)
-                if r.get('peak_gpu_memory_gb') is not None:
-                    memory.append(float(r['peak_gpu_memory_gb']))
-                if r.get('train_clips') is not None:           # clips through the backbone (ours, closed set)
-                    clips += int(r['train_clips'])
-                    steps += int(r.get('optimizer_steps') or 0)
-            expected = journal_epochs_expected(j, m, root)       # also a missing LAST row is noticed
-            last = max([*epochs, expected or 0]) if epochs or expected else 0
-            gaps = sorted(set(range(1, last + 1)) - epochs)
-            if gaps and missing is not None:
-                missing[str(j.relative_to(root))] = gaps
+                row_seconds = float(r.get('train_seconds', 0) or 0) + float(r.get('val_seconds', 0) or 0)
+                row_memory = float(r['peak_gpu_memory_gb']) if r.get('peak_gpu_memory_gb') is not None else None
+                row_clips = int(r['train_clips']) if r.get('train_clips') is not None else None
+                row_steps = int(r.get('optimizer_steps') or 0)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(r.get('epoch'), int):
+                epochs.add(r['epoch'])
+            seconds += row_seconds
+            if row_memory is not None:
+                memory.append(row_memory)
+            if row_clips is not None:                           # clips through the backbone (ours, closed set)
+                clips += row_clips
+                steps += row_steps
+        expected = journal_epochs_expected(j, m, root)           # also a missing LAST row is noticed
+        last = max([*epochs, expected or 0]) if epochs or expected else 0
+        gaps = sorted(set(range(1, last + 1)) - epochs)
+        if not epochs and expected is None and j.parent != run and (j.parent / 'FINISHED.json').exists():
+            gaps = 'all (empty journal)'                        # finished, early stopping (no count), no row
+        if gaps and missing is not None:
+            missing[str(j.relative_to(root))] = gaps
     if seconds == 0:
         marker = root / 'state' / f'train.{m.name}.done.json'
         if marker.exists():

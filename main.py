@@ -1174,9 +1174,10 @@ def rehearse_comparisons(a, p):
     amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
     signature = rehearsal_signature(a, gpu, amp)
     record = p.state / 'comparison_rehearsal.json'
-    try:
+    try:                                        # an unreadable record is no reason to skip: rehearse again
         done = json.loads(record.read_text()) if record.exists() else {}
-    except ValueError:
+    except (OSError, ValueError) as e:
+        log(f'the earlier rehearsal record could not be read ({e}); rehearsing again')
         done = {}
     if isinstance(done, dict) and done.get('signature') == signature and \
             all(isinstance(done.get(part), dict) and done[part].get('ok') is True for part in REHEARSAL_PARTS):
