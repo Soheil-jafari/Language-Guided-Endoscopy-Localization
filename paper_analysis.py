@@ -839,7 +839,7 @@ def main(argv=None):
            f'threshold selected on the {len(split.get("val", []))} validation videos ({span(split.get("val", []))}). '
            f'Square brackets: 95 % bootstrap confidence interval over test videos ({a.bootstrap} resamples, the same '
            f'resamples for every method; a resample without a positive frame of some query is drawn again, so the '
-           f'14-query mAP always averages the same queries). Values in %.', '']
+           f'mAP of every resample averages the same queries). Values in %.', '']
     report['split'] = {k: len(v) for k, v in split.items()}
     rng = np.random.default_rng(a.seed)
     counts, rejected, defined = bootstrap_counts(frames, a.bootstrap, rng)
@@ -847,9 +847,17 @@ def main(argv=None):
     report['bootstrap_resamples_redrawn'] = rejected
     undefined = [q for q, d in zip(frames.queries, defined) if not d]
     report['queries_without_test_positives'] = undefined
+    n_defined = len(frames.queries) - len(undefined)
+    # The macro mAP's name everywhere it is shown: "14-query" normally; the count of queries it really averages
+    # when some query has no positive test frame (its AP is undefined).
+    map_name = f'{len(frames.queries)}-query mAP' if not undefined else \
+        f'mAP over the {n_defined} of {len(frames.queries)} queries with positive test frames'
+    map_column = f'mAP ({len(frames.queries)} queries)' if not undefined else \
+        f'mAP ({n_defined} of {len(frames.queries)} queries)'
+    report['map_queries'] = n_defined
     if undefined:
-        log(f'!! WARNING: {len(undefined)} of the 14 queries have no positive test frame, so their AP is undefined '
-            f'and the mAP averages the other {14 - len(undefined)}: {undefined}. Check the annotations.')
+        log(f'!! WARNING: {len(undefined)} of the {len(frames.queries)} queries have no positive test frame, so their '
+            f'AP is undefined and the mAP averages the other {n_defined}: {undefined}. Check the annotations.')
 
     stats, reps = {}, {}
     for m in finished:
@@ -901,7 +909,7 @@ def main(argv=None):
     for m in main_methods:
         st, sg = stats[m.name], seg[m.name]
         main_rows.append({'Method': m.label, 'AP': with_ci(st['average_precision'], st['average_precision_ci']),
-                          'mAP (14 queries)': with_ci(st['macro_map'], st['macro_map_ci']),
+                          map_column: with_ci(st['macro_map'], st['macro_map_ci']),
                           'AUROC': pct(st['auroc']), 'F1': with_ci(st['f1'], st['f1_ci']),
                           'Phase mAP': pct(st['phase_map']), 'Tool mAP': pct(st['tool_map']),
                           'Segment mAP@0.5': with_ci(sg['mAP@0.5'], sg['mAP@0.5_ci']),
@@ -910,9 +918,9 @@ def main(argv=None):
         md += ['## 1. Main results (test videos)', '',
                write_table(out, 'main_results', pd.DataFrame(main_rows),
                            'Language-guided temporal localization on the Cholec80 test videos',
-                           'AP: frame-level average precision over all frames and queries; mAP: mean of the 14 per-query APs '
-                           '(the primary endpoint)' + (f' - here of the {14 - len(undefined)} queries with positive test '
-                                                       f'frames' if undefined else '') + '; F1 at the threshold selected on '
+                           'AP: frame-level average precision over all frames and queries; mAP: mean of the per-query APs '
+                           f'(the primary endpoint; {map_name}' + (f'; no positive test frame: {", ".join(undefined)}'
+                                                                  if undefined else '') + '); F1 at the threshold selected on '
                            'validation; seed 42 for trained methods. Square brackets: 95 % bootstrap CI over test videos '
                            '(resamples conditional on every query having a positive frame). '
                            'TeCNO: phase queries from its temporal network, tool queries from the auxiliary tool head '
@@ -968,7 +976,7 @@ def main(argv=None):
         md += ['## 2. Paired significance tests (test videos)', '',
                write_table(out, 'significance', pd.DataFrame(sig_rows), 'Paired comparisons on the test videos',
                            f'Differences in percentage points, with 95 % paired-bootstrap CIs over test videos. Primary '
-                           f'endpoint: 14-query mAP, two-sided paired permutation test ({a.permutations} random swaps of '
+                           f'endpoint: {map_name}, two-sided paired permutation test ({a.permutations} random swaps of '
                            f'the two methods\' scores within test videos), Holm correction over its {len(pairs_to_test)} '
                            f'comparisons (null hypothesis: within every test video the two methods\' score vectors are '
                            f'exchangeable, which is stronger than equal mAP). Secondary endpoints (pooled AP, F1, '
@@ -1308,15 +1316,16 @@ def model_sources(root, methods):
     resolved to (<root>/hf_cache, the snapshot actually loaded), the torchvision weight files (their names carry
     a hash prefix), the backbone checkpoint, the SurgVLP code commit and the hashes the runs recorded for their
     weights. A record only: anything unreadable is noted under 'unreadable', never raised."""
-    out = dict(huggingface={}, torchvision=[], surgvlp_code=dict(repository=protocol.SURGVLP['repository'],
-                                                                   commit=protocol.SURGVLP['commit']), weights={},
-               unreadable=[])
+    out = dict(huggingface={}, torchvision=[], surgvlp_code=None, weights={}, unreadable=[])
 
     def guarded(what, fn):
         try:
             fn()
         except Exception as e:                           # noqa: BLE001
             out['unreadable'].append(f'{what}: {e!r}'[:300])
+
+    def surgvlp():
+        out['surgvlp_code'] = dict(repository=protocol.SURGVLP['repository'], commit=protocol.SURGVLP['commit'])
 
     def huggingface():
         hub = root / 'hf_cache' / 'hub'
@@ -1350,6 +1359,7 @@ def model_sources(root, methods):
         if kept:
             out['weights'][m.name] = kept
 
+    guarded('SurgVLP code reference', surgvlp)
     guarded('hf_cache', huggingface)
     guarded('torch_cache', torchvision)
     guarded('weights_ref.json', backbone)
@@ -1359,6 +1369,10 @@ def model_sources(root, methods):
 
 
 # --------------------------------------------------------------------------- efficiency
+# Comparison-method folders whose training writes training_metrics.jsonl (X-CLIP's fine-tuning writes none).
+JOURNALED = ('closedset', 'peskavlp', 'univtg', 'tecno_cnn', 'tecno_tcn')
+
+
 def journal_epochs_expected(journal, m, root):
     """How many epochs a finished training wrote (None when unknown, e.g. TeCNO's early stopping): ours from the
     run's configuration once its train stage has finished; a comparison method from its FINISHED.json."""
@@ -1387,9 +1401,18 @@ def efficiency(m, root, missing=None):
         c = json.loads(counts.read_text())
         row['Parameters (M)'] = f"{sum(v['total'] for v in c.values()) / 1e6:.1f}"
         row['Trainable (M)'] = f"{sum(v['trainable'] for v in c.values()) / 1e6:.1f}"
-    journals = [run / 'training_metrics.jsonl'] + sorted(run.glob('*/training_metrics.jsonl'))
+    # Every journal there is, and every journal a finished training should have written (even if it is gone).
+    journals = [run / 'training_metrics.jsonl'] + sorted(run.glob('*/training_metrics.jsonl')) + \
+        sorted(f.parent / 'training_metrics.jsonl' for f in run.glob('*/FINISHED.json') if f.parent.name in JOURNALED)
+    journals = list(dict.fromkeys(journals))
     seconds, memory, clips, steps = 0.0, [], 0, 0
     for j in journals:
+        if not j.exists():
+            expected = journal_epochs_expected(j, m, root)
+            finished = expected is not None or (j.parent != run and (j.parent / 'FINISHED.json').exists())
+            if finished and missing is not None:               # a finished training whose journal is lost
+                missing[str(j.relative_to(root))] = list(range(1, expected + 1)) if expected else 'all (no journal)'
+            continue
         if j.exists():
             epochs = set()
             for line in j.read_text().splitlines():

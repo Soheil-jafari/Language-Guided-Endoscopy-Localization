@@ -123,7 +123,9 @@ bundle in `lgel_paper/outbox/` includes them.
 * **Early check:** the first job also runs two full training steps (forward, loss, backward, optimiser;
   random weights) of our advanced model at the training batch (every add-on and the optical-flow loss), the
   closed-set model and TeCNO, each in its own process with a 15-minute limit, and logs their peak GPU
-  memory, so a memory problem shows in the first report rather than days later. It never stops the job.
+  memory, so a memory problem shows in the first report rather than days later. It never stops the job,
+  and it is repeated only when the GPU type, the batch, the precision, the text encoder, the model code or
+  the PyTorch/Mamba versions change.
 * **One run failing does not stop the others.** If, say, a comparison method's download fails, the job
   logs it, goes on with the next run, and ends with exit code 1; the failed run is retried (from where
   it stopped) by the next job. A failure that affects every run (the data, the GPU check, the Mamba

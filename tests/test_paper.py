@@ -16,7 +16,7 @@ import torch
 import main as pipeline
 import paper_protocol as protocol
 import paper_analysis as pa
-from data_contract import PHRASES
+from data_contract import PHRASES, query_spec
 from paper_fixtures import make_prepared, tiny_xclip
 
 REPO = Path(pipeline.__file__).resolve().parent
@@ -661,7 +661,7 @@ def test_bootstrap_resamples_keep_every_defined_query(tmp_path):
         pa.bootstrap_counts(frames, 300, np.random.default_rng(0), max_redraws=5)
 
 
-def test_model_sources_records_revisions_and_never_raises(tmp_path):
+def test_model_sources_records_revisions_and_never_raises(tmp_path, monkeypatch):
     from types import SimpleNamespace
     root = tmp_path / 'root'
     repo = root / 'hf_cache' / 'hub' / 'models--openai--clip-vit-base-patch32'
@@ -689,6 +689,10 @@ def test_model_sources_records_revisions_and_never_raises(tmp_path):
         any('odd' in u for u in s['unreadable'])
     assert pa.model_sources(tmp_path / 'nothing', [])['unreadable'] == []          # an empty root is fine too
     json.dumps(s)
+    assert s['surgvlp_code'] == dict(repository=protocol.SURGVLP['repository'], commit=protocol.SURGVLP['commit'])
+    monkeypatch.setattr(pa.protocol, 'SURGVLP', {})                                 # even a broken constant
+    s = pa.model_sources(root, [good])
+    assert s['surgvlp_code'] is None and any('SurgVLP' in u for u in s['unreadable']) and s['weights']
 
 
 def test_a_missing_last_journal_row_is_reported(tmp_path):
@@ -714,6 +718,25 @@ def test_a_missing_last_journal_row_is_reported(tmp_path):
     missing = {}
     pa.efficiency(c, root, missing)
     assert missing == {'runs/paper_closedset_s42/closedset/training_metrics.jsonl': [2]}
+    # A finished training whose whole journal is gone is reported too; one that never writes a journal is not.
+    (m.run / 'training_metrics.jsonl').unlink()
+    (c.run / 'closedset' / 'training_metrics.jsonl').unlink()
+    missing = {}
+    pa.efficiency(m, root, missing)
+    pa.efficiency(c, root, missing)
+    assert missing == {'runs/paper_baseline_s42/training_metrics.jsonl': [1, 2, 3],
+                       'runs/paper_closedset_s42/closedset/training_metrics.jsonl': [1, 2]}
+    t = pa.Method([p for p in protocol.plans('paper') if p['kind'] == 'tecno'][0], root)
+    (t.run / 'tecno_tcn').mkdir(parents=True)
+    (t.run / 'tecno_tcn' / 'FINISHED.json').write_text(json.dumps(dict(finished='x')))   # early stopping: no count
+    x = pa.Method([p for p in protocol.plans('paper') if p['kind'] == 'xclip_finetune'][0], root)
+    (x.run / 'xclip').mkdir(parents=True)
+    (x.run / 'xclip' / 'FINISHED.json').write_text(json.dumps(dict(epochs=5)))          # X-CLIP writes no journal
+    z = pa.Method([p for p in protocol.plans('paper') if p['kind'] == 'clip_zeroshot'][0], root)  # no training
+    missing = {}
+    for method in (t, x, z):
+        pa.efficiency(method, root, missing)
+    assert missing == {'runs/paper_tecno_s42/tecno_tcn/training_metrics.jsonl': 'all (no journal)'}
 
 
 def test_holm_and_bootstrap_p_values():
@@ -880,6 +903,24 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     primary = [r for r in sig if r['metric'] == 'mAP']
     assert len(primary) == 1 + 2 * 9 + 4             # adv vs base, ours vs the 9 finished comparisons, ablations
     assert all(1 / 21 - 1e-9 <= r['p'] <= 1 for r in primary) and report['permutations'] == 20
+    assert 'mAP (14 queries)' in main.columns and report['map_queries'] == 14
+    assert 'Primary endpoint: 14-query mAP' in text
+    # A query without any positive test frame: the mAP is named after the queries it really averages, everywhere.
+    gone = protocol.canonical_queries()[-1]                         # a tool (phases must cover every frame)
+    wordings = {gone} | {para[k][query_spec(gone)] for k in para}
+    for f in (root / 'results').glob('*/*test*.csv'):              # every test file of every run, all wordings
+        df = pd.read_csv(f)
+        if {'text_query', 'label'} <= set(df.columns):
+            df.loc[df.text_query.isin(wordings) & (df.label == 1), 'label'] = 0
+            df.to_csv(f, index=False)
+    assert pa.main(['--root', str(root), '--bootstrap', '10', '--permutations', '5']) == 0
+    report = json.loads((out / 'analysis.json').read_text())
+    assert report['queries_without_test_positives'] == [gone] and report['map_queries'] == 13
+    main = pd.read_csv(out / 'tables' / 'main_results.csv')
+    assert 'mAP (13 of 14 queries)' in main.columns and 'mAP (14 queries)' not in main.columns
+    text = (out / 'PAPER_RESULTS.md').read_text()
+    assert '14-query mAP' not in text and 'mAP over the 13 of 14 queries with positive test frames' in text
+    assert f'no positive test frame: {gone}' in text
     # a missing input of a finished run is an error, not a silently smaller table
     (root / 'results' / 'paper_clip_zeroshot' / 'test_reference.csv').write_text('video_id,text_query,frame_idx,label\n')
     with pytest.raises(ValueError):

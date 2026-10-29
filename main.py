@@ -1133,6 +1133,31 @@ def stage_check_advanced(a, p):
 
 REHEARSAL_PARTS = ('advanced', 'closedset', 'tecno_cnn', 'tecno_tcn')
 REHEARSAL_TIMEOUT = 900                                    # seconds per model (normally well under a minute)
+# The code that decides what the rehearsed models allocate (sizes, crop, clip, layers, losses).
+REHEARSAL_CODE = ('main.py', 'project_config.py', 'models.py', 'losses.py', 'backbone/vision_transformer.py',
+                  'backbone/endomamba.py', 'paper_protocol.py', 'comparison_models/rehearsal.py',
+                  'comparison_models/closedset/closedset.py', 'comparison_models/tecno/tecno.py')
+
+
+def rehearsal_signature(a, gpu, amp):
+    """Everything a passed rehearsal depends on: a rehearsal is repeated when any of it differs (another GPU
+    type, training batch, precision, text encoder, model flags or sizes in the code, PyTorch or Mamba)."""
+    import hashlib
+    import torch
+    from importlib import metadata
+    code = hashlib.sha256()
+    for name in REHEARSAL_CODE:
+        f = REPO / name
+        code.update(name.encode() + b'\0' + (f.read_bytes() if f.is_file() else b'missing') + b'\0')
+    try:
+        mamba = metadata.version('mamba_ssm')
+    except Exception:                                   # noqa: BLE001  (the functional check has reported it)
+        mamba = None
+    tecno = protocol.COMPARISONS['tecno']
+    return dict(gpu=gpu, batch=int(a.batch_size), amp=amp, text_model=a.text_model, advanced_flags=ADVANCED_FLAGS,
+                closedset_batch=int(protocol.COMPARISONS['closedset']['batch_size']),
+                tecno_batch=int(tecno['cnn_batch_size']), tecno_size=int(tecno['input_size']),
+                torch=torch.__version__, mamba_ssm=mamba, code_sha256=code.hexdigest())
 
 
 def rehearse_comparisons(a, p):
@@ -1146,16 +1171,17 @@ def rehearse_comparisons(a, p):
     if not torch.cuda.is_available():
         return None
     gpu = torch.cuda.get_device_name(0)
+    amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
+    signature = rehearsal_signature(a, gpu, amp)
     record = p.state / 'comparison_rehearsal.json'
     try:
         done = json.loads(record.read_text()) if record.exists() else {}
     except ValueError:
         done = {}
-    if done.get('gpu') == gpu and done.get('batch') == a.batch_size and \
-            all(done.get(part, {}).get('ok') for part in REHEARSAL_PARTS):
-        log(f'full-size rehearsal already passed on this GPU type ({gpu})')
+    if isinstance(done, dict) and done.get('signature') == signature and \
+            all(isinstance(done.get(part), dict) and done[part].get('ok') is True for part in REHEARSAL_PARTS):
+        log(f'full-size rehearsal already passed with these settings on this GPU type ({gpu})')
         return done
-    amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
     p.tmp.mkdir(parents=True, exist_ok=True)
     cfg_path = p.tmp / 'rehearsal.json'
     write_json(cfg_path, dict(MODEL=dict(M2CRL_WEIGHTS_PATH=''), TRAIN=dict(AMP_DTYPE=amp)))   # our crop and clip
@@ -1163,7 +1189,7 @@ def rehearse_comparisons(a, p):
     write_json(adv_path, dict(MODEL=dict(ADVANCED_FLAGS['MODEL'], TEXT_ENCODER_MODEL=a.text_model),
                               TRAIN=dict(ADVANCED_FLAGS['TRAIN'], AMP_DTYPE=amp)))
     tecno_cfg = protocol.COMPARISONS['tecno']
-    results = dict(gpu=gpu, batch=a.batch_size)
+    results = dict(gpu=gpu, batch=a.batch_size, signature=signature)
     # One process per model (so no model's memory remains allocated while the next is measured), each with a
     # deadline (a hung CUDA call must not hold up the job; training steps never get one).
     for part in REHEARSAL_PARTS:

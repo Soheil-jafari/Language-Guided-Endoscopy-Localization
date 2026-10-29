@@ -492,11 +492,29 @@ def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_th
     assert cmd[1].endswith('rehearsal.py') and cmd[cmd.index('--tecno-batch') + 1] == '80'
     assert cmd[cmd.index('--closedset-batch') + 1] == '8'
     assert record['gpu'] == 'NVIDIA A100-SXM4-80GB' and all(record[x]['ok'] for x in pipeline.REHEARSAL_PARTS)
+    assert record['signature']['amp'] == 'bf16' and record['signature']['text_model'] == sub.text_model
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 4                                          # passed on this GPU type and batch: not repeated
+    assert len(calls) == 4                                          # passed with the same settings: not repeated
     sub.batch_size = 4
     pipeline.rehearse_comparisons(sub, p)
     assert len(calls) == 8                                          # another training batch: checked again
+    original_text_model, sub.text_model = sub.text_model, 'another/text-encoder'
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 12 and json.loads(Path(calls[-4][0][3]).read_text())['MODEL']['TEXT_ENCODER_MODEL'] == \
+        'another/text-encoder'                                      # another text encoder: checked again, with it
+    sub.text_model = original_text_model
+    sub.amp_dtype = 'fp16'
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 16                                         # another precision: checked again
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 16
+    monkeypatch.setattr(pipeline, 'REHEARSAL_CODE', pipeline.REHEARSAL_CODE[:-1])   # (stands for a code change)
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 20                                         # other model code: checked again
+    (p.state / 'comparison_rehearsal.json').write_text('[1]')      # an unreadable record is simply redone
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 24
+    sub.amp_dtype = 'auto'
     (p.state / 'comparison_rehearsal.json').unlink()
 
     def one_fails(cmd, a, p_, name, **k):                          # e.g. a hang stopped by the deadline
