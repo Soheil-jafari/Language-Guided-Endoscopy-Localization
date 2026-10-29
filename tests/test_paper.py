@@ -641,6 +641,81 @@ def test_symmetric_relaxation_also_forgives_early_transitions():
     assert pa.relaxed_evaluate(gt, late, 0.2)[3] == pa.relaxed_evaluate(gt, late, 0.2, legacy=False)[3] == 100
 
 
+def test_bootstrap_resamples_keep_every_defined_query(tmp_path):
+    frames = _synthetic_frames(n_videos=8, frames=20)
+    labels = frames.label.copy()
+    rare, never = 13, 12                                 # a tool seen in one video only, a tool never seen
+    labels[frames.query == rare] = 0
+    labels[(frames.query == rare) & (frames.video == 3)] = 1
+    labels[frames.query == never] = 0
+    frames.label = labels
+    counts, redrawn, defined = pa.bootstrap_counts(frames, 300, np.random.default_rng(0))
+    assert counts.shape == (300, 8) and (counts.sum(axis=1) == 8).all()
+    assert (counts[:, 3] > 0).all() and redrawn > 0                 # every resample contains the rare tool's video
+    assert defined.sum() == 13 and not defined[never]               # the absent one is undefined, not redrawn for
+    scores = np.random.default_rng(1).random(len(labels))
+    reps = pa.frame_replicates(frames, scores, 0.5, counts)
+    qap = reps['per_query_ap']
+    assert np.isfinite(qap[:, defined]).all() and np.isnan(qap[:, never]).all()   # the same 13 queries every time
+    with pytest.raises(ValueError, match='too few test videos'):
+        pa.bootstrap_counts(frames, 300, np.random.default_rng(0), max_redraws=5)
+
+
+def test_model_sources_records_revisions_and_never_raises(tmp_path):
+    from types import SimpleNamespace
+    root = tmp_path / 'root'
+    repo = root / 'hf_cache' / 'hub' / 'models--openai--clip-vit-base-patch32'
+    (repo / 'snapshots' / ('a' * 40)).mkdir(parents=True)
+    (repo / 'refs').mkdir()
+    (repo / 'refs' / 'main').write_text('a' * 40 + '\n')
+    (root / 'hf_cache' / 'hub' / 'models--broken--repo' / 'refs' / 'main').mkdir(parents=True)   # a folder, unreadable
+    ck = root / 'torch_cache' / 'hub' / 'checkpoints'
+    ck.mkdir(parents=True)
+    (ck / 'raft_small_C_T_V2-01064c6d.pth').write_bytes(b'x' * 10)
+    weights = tmp_path / 'm2crl.pth'
+    weights.write_bytes(b'y' * 7)
+    (root / 'state').mkdir()
+    (root / 'state' / 'weights_ref.json').write_text(json.dumps(dict(path=str(weights), random_init=False)))
+    good, odd, none = (SimpleNamespace(name=n, results=tmp_path / n) for n in ('good', 'odd', 'none'))
+    for m in (good, odd):
+        m.results.mkdir()
+    (good.results / 'proposed_test.csv.manifest.json').write_text(json.dumps(dict(checkpoint_sha256='c' * 64, x=1)))
+    (odd.results / 'proposed_test.csv.manifest.json').write_text('[1, 2]')                       # malformed
+    s = pa.model_sources(root, [good, odd, none])
+    assert s['huggingface']['openai/clip-vit-base-patch32'] == dict(revision='a' * 40, snapshots=['a' * 40])
+    assert s['torchvision'] == [dict(file='raft_small_C_T_V2-01064c6d.pth', bytes=10)]
+    assert s['backbone']['bytes'] == 7 and s['weights'] == {'good': {'checkpoint_sha256': 'c' * 64}}
+    assert len(s['unreadable']) == 2 and any('broken' in u for u in s['unreadable']) and \
+        any('odd' in u for u in s['unreadable'])
+    assert pa.model_sources(tmp_path / 'nothing', [])['unreadable'] == []          # an empty root is fine too
+    json.dumps(s)
+
+
+def test_a_missing_last_journal_row_is_reported(tmp_path):
+    plan = [p for p in protocol.plans('paper') if p['name'] == 'paper_baseline_s42'][0]
+    root = tmp_path
+    m = pa.Method(plan, root)
+    m.run.mkdir(parents=True)
+    (m.run / 'run_config.json').write_text(json.dumps(dict(TRAIN=dict(NUM_EPOCHS=3))))
+    (m.run / 'training_metrics.jsonl').write_text(''.join(json.dumps(dict(epoch=e, train_seconds=10)) + '\n'
+                                                          for e in (1, 2)))
+    missing = {}
+    pa.efficiency(m, root, missing)
+    assert missing == {}                                            # training not finished: nothing to report yet
+    (root / 'state').mkdir()
+    (root / 'state' / f'train.{m.name}.done.json').write_text('{}')
+    pa.efficiency(m, root, missing)
+    assert missing == {'runs/paper_baseline_s42/training_metrics.jsonl': [3]}     # the trailing epoch
+    cmp_plan = [p for p in protocol.plans('paper') if p['kind'] == 'closedset'][0]
+    c = pa.Method(cmp_plan, root)
+    (c.run / 'closedset').mkdir(parents=True)
+    (c.run / 'closedset' / 'training_metrics.jsonl').write_text(json.dumps(dict(epoch=1)) + '\n')
+    (c.run / 'closedset' / 'FINISHED.json').write_text(json.dumps(dict(epochs=2)))
+    missing = {}
+    pa.efficiency(c, root, missing)
+    assert missing == {'runs/paper_closedset_s42/closedset/training_metrics.jsonl': [2]}
+
+
 def test_holm_and_bootstrap_p_values():
     np.testing.assert_allclose(pa.holm([0.01, 0.04, 0.03, math.nan]), [0.03, 0.06, 0.06, math.nan])
     # null-centred: the bootstrap distribution shifted to 0 is compared with the observed difference
@@ -796,6 +871,8 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     assert list(seeds.Seeds) == ['42, 43, 44', '42, 43, 44']
     m = report['methods']['paper_advanced_s42']['frame']
     assert m['average_precision'] > 0.8 and 'evidence_uncertainty_aurc' in m
+    assert report['queries_without_test_positives'] == [] and report['bootstrap_resamples_redrawn'] >= 0
+    assert report['model_sources']['surgvlp_code']['commit'] == protocol.SURGVLP['commit']
     sig = report['significance']
     assert {r['metric'] for r in sig} == {'AP', 'mAP', 'F1', 'Segment mAP@0.5'}
     assert {r['test'] for r in sig if r['metric'] == 'mAP'} == {'permutation (primary)'}

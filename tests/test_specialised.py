@@ -449,7 +449,8 @@ def test_the_rehearsal_trains_each_model_for_two_steps_in_its_own_process(tmp_pa
     env = env_for(tmp_path)                              # (tiny backbone and crop through the test hook)
     cfg = tmp_path / 'cfg.json'
     cfg.write_text(json.dumps(dict(MODEL=dict(M2CRL_WEIGHTS_PATH=''), TRAIN=dict(AMP_DTYPE='bf16'))))
-    for part in pipeline.REHEARSAL_PARTS:
+    assert [x for x in pipeline.REHEARSAL_PARTS if x != 'advanced'] == ['closedset', 'tecno_cnn', 'tecno_tcn']
+    for part in ('closedset', 'tecno_cnn', 'tecno_tcn'):          # ('advanced' is main.py's own check)
         out = tmp_path / f'{part}.json'
         run([REPO / 'comparison_models' / 'rehearsal.py', '--part', part, '--config', cfg, '--output', out,
              '--device', 'cpu', '--closedset-batch', 2, '--tecno-batch', 4, '--tecno-size', 32, '--tcn-steps', 300],
@@ -467,33 +468,104 @@ def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_th
     monkeypatch.setattr(pipeline, 'native_bf16', lambda: True)
     calls = []
 
+    def part_of(cmd):
+        cmd = [str(c) for c in cmd]
+        return cmd[cmd.index('--part') + 1] if '--part' in cmd else 'advanced'
+
+    def output_of(cmd):
+        cmd = [str(c) for c in cmd]
+        return cmd[cmd.index('--output') + 1] if '--output' in cmd else cmd[-1]
+
     def ok(cmd, a, p_, name, **k):
         calls.append(([str(c) for c in cmd], k))
-        part = cmd[cmd.index('--part') + 1]
-        Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({part: dict(ok=True, peak_gb=20.0)}))
+        Path(output_of(cmd)).write_text(json.dumps({part_of(cmd): dict(ok=True, peak_gb=20.0)}))
     monkeypatch.setattr(pipeline, 'run', ok)
     record = pipeline.rehearse_comparisons(sub, p)
-    assert [c[c.index('--part') + 1] for c, _ in calls] == list(pipeline.REHEARSAL_PARTS)   # one process each
+    assert [part_of(c) for c, _ in calls] == list(pipeline.REHEARSAL_PARTS) == \
+        ['advanced', 'closedset', 'tecno_cnn', 'tecno_tcn']                                  # one process each
     assert all(k['timeout'] == pipeline.REHEARSAL_TIMEOUT for _, k in calls)                 # each with a deadline
-    cmd = calls[0][0]
+    advanced = calls[0][0]                                          # our advanced model at the TRAINING batch
+    assert advanced[1].endswith('main.py') and advanced[2] == '_check_advanced' and advanced[4] == str(sub.batch_size) == '8'
+    adv_cfg = json.loads(Path(advanced[3]).read_text())
+    assert adv_cfg['TRAIN']['USE_BILEVEL_CONSISTENCY'] is True and adv_cfg['MODEL']['TEMPORAL_HEAD_TYPE'] == 'SSM'
+    cmd = calls[1][0]
     assert cmd[1].endswith('rehearsal.py') and cmd[cmd.index('--tecno-batch') + 1] == '80'
     assert cmd[cmd.index('--closedset-batch') + 1] == '8'
     assert record['gpu'] == 'NVIDIA A100-SXM4-80GB' and all(record[x]['ok'] for x in pipeline.REHEARSAL_PARTS)
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 3                                          # passed on this GPU type: not repeated
+    assert len(calls) == 4                                          # passed on this GPU type and batch: not repeated
+    sub.batch_size = 4
+    pipeline.rehearse_comparisons(sub, p)
+    assert len(calls) == 8                                          # another training batch: checked again
     (p.state / 'comparison_rehearsal.json').unlink()
 
     def one_fails(cmd, a, p_, name, **k):                          # e.g. a hang stopped by the deadline
-        part = cmd[cmd.index('--part') + 1]
-        if part == 'tecno_cnn':
+        if part_of(cmd) == 'tecno_cnn':
             err = pipeline.StageError('still running after the time limit')
             err.timed_out = True
             raise err
-        Path(cmd[cmd.index('--output') + 1]).write_text(json.dumps({part: dict(ok=True)}))
+        Path(output_of(cmd)).write_text(json.dumps({part_of(cmd): dict(ok=True)}))
     monkeypatch.setattr(pipeline, 'run', one_fails)
     record = pipeline.rehearse_comparisons(sub, p)                 # reported, never raised; the others still run
     assert record['closedset']['ok'] and record['tecno_tcn']['ok'] and not record['tecno_cnn']['ok']
-    assert 'time limit' in record['tecno_cnn']['error']
+    assert record['advanced']['ok'] and 'time limit' in record['tecno_cnn']['error']
+    (p.state / 'comparison_rehearsal.json').unlink()
+
+    def odd_results(cmd, a, p_, name, **k):                        # exit 0, but no usable result for two parts
+        part = part_of(cmd)
+        text = {'advanced': json.dumps({'something else': 1}), 'closedset': '[1, 2]',
+                'tecno_cnn': json.dumps({part: dict(ok=False, error='own message')})}.get(part)
+        if text is None:
+            text = json.dumps({part: dict(ok=True, peak_gb=3.0)})
+        Path(output_of(cmd)).write_text(text)
+    monkeypatch.setattr(pipeline, 'run', odd_results)
+    record = pipeline.rehearse_comparisons(sub, p)                 # still never raises
+    assert [record[x]['ok'] for x in pipeline.REHEARSAL_PARTS] == [False, False, False, True]
+    assert record['tecno_cnn']['error'] == 'own message' and record['advanced']['error']
+
+
+def test_a_broken_rehearsal_never_stops_the_advanced_check(tmp_path, monkeypatch):
+    sub = _plans(tmp_path)['baseline']
+    p = pipeline.Paths(tmp_path, sub.run_name)
+    p.tmp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pipeline, '_ADVANCED_CHECKED', False)
+    monkeypatch.setattr(pipeline, 'run', lambda *x, **k: 0)        # the functional check passes
+    monkeypatch.setattr(pipeline, 'native_bf16', lambda: True)
+    monkeypatch.setattr(pipeline, 'rehearse_comparisons', lambda *x: 1 / 0)
+    sub.preset = 'paper'
+    pipeline.stage_check_advanced(sub, p)                           # logged, not raised
+    assert pipeline._ADVANCED_CHECKED
+
+
+def test_the_advanced_check_takes_the_batch_and_a_report_file(monkeypatch):
+    seen = []
+    monkeypatch.setattr(pipeline, '_check_advanced', lambda *x: seen.append(x))
+    monkeypatch.setattr(sys, 'argv', ['main.py', '_check_advanced', 'cfg.json'])
+    assert pipeline.main() == 0 and seen[-1] == ('cfg.json',)                        # the functional check (batch 2)
+    monkeypatch.setattr(sys, 'argv', ['main.py', '_check_advanced', 'cfg.json', '8', 'out.json'])
+    assert pipeline.main() == 0 and seen[-1] == ('cfg.json', 8, 'out.json')          # the full-size rehearsal
+
+
+def test_the_advanced_check_really_trains_at_any_batch(tmp_path):
+    """The real _check_advanced steps (forward, loss, backward, AdamW, the checks, the report), on a CPU with the
+    tiny model of the e2e hook and its Mamba stub: the functional check (batch 2) and a rehearsal-style call with
+    another batch and a report file, as rehearse_comparisons makes it."""
+    from paper_fixtures import install_in_hf_cache, tiny_clip
+    hf = tmp_path / 'hf'
+    install_in_hf_cache(hf, 'openai/clip-vit-base-patch32', tiny_clip(tmp_path / 'clip'))
+    cfg = tmp_path / 'advanced.json'
+    cfg.write_text(json.dumps(dict(MODEL=dict(pipeline.ADVANCED_FLAGS['MODEL'], TEXT_ENCODER_MODEL='openai/clip-vit-base-patch32'),
+                                   TRAIN=dict(pipeline.ADVANCED_FLAGS['TRAIN'], AMP_DTYPE='bf16'))))
+    env = dict(env_for(tmp_path), LGEL_CHECK_ON_CPU='1', HF_HOME=str(hf), HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
+    out = run([REPO / 'main.py', '_check_advanced', cfg], env, REPO)
+    assert 'advanced model OK' in out and 'batch 2' in out
+    report = tmp_path / 'report.json'
+    out = run([REPO / 'main.py', '_check_advanced', cfg, 3, report], env, REPO)
+    assert 'advanced model OK' in out and 'batch 3' in out
+    r = json.loads(report.read_text())['advanced']
+    assert r['ok'] and r['error'] is None and 'batch 3' in r['what'] and r['seconds'] >= 0
+    out = run([REPO / 'main.py', '_check_advanced', cfg, 1], env, REPO)               # (a batch of one also works)
+    assert 'advanced model OK' in out
 
 
 def test_a_step_with_a_deadline_is_stopped_with_everything_it_started(tmp_path):

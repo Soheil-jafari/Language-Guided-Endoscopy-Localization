@@ -12,7 +12,8 @@ Protocol (the same for every method):
     annotation (-100) are left out, never counted as negatives;
   * the operating threshold of each method is the one selected on the validation videos (evaluate.py);
   * 95 % confidence intervals: percentile bootstrap over test videos (resampled with replacement, the same
-    resamples for every method, so differences are paired);
+    resamples for every method, so differences are paired; conditional on every query that has positive test
+    frames keeping at least one, so every replicate's mAP averages the same queries);
   * tests: primary endpoint = the 14-query mAP, paired permutation test (the two methods' scores swapped
     within random test videos) with Holm correction over all its comparisons; secondary endpoints (pooled AP,
     F1, segment mAP@0.5): paired bootstrap test centred at the null, Holm within each; plus the Wilcoxon
@@ -115,6 +116,31 @@ class Ranked:
     def auroc(self, video_weights=None):
         w = np.ones_like(self.y) if video_weights is None else video_weights[self.video].astype(np.float64)
         return weighted_auroc(self.y, w, self.ends)
+
+
+def bootstrap_counts(frames, n, rng, max_redraws=None):
+    """Video multiplicities of n bootstrap resamples of the test videos (shared by every method, so differences
+    are paired). A resample in which a query that has positive frames in the test set has none is drawn again,
+    so that every replicate's AP is defined for exactly the same queries and the 14-query mAP always averages the
+    same queries (a bootstrap conditional on that; Cholec80's concepts each occur in many test videos, so redraws
+    are rare and are counted). Returns (counts, number of redraws, which queries are defined)."""
+    n_v = len(frames.video_ids)
+    obs = frames.observed
+    positives = np.zeros((n_v, len(frames.queries)))
+    np.add.at(positives, (frames.video[obs], frames.query[obs]), (frames.label[obs] == 1).astype(np.float64))
+    defined = positives.sum(axis=0) > 0
+    out, redrawn = [], 0
+    limit = max_redraws if max_redraws is not None else 100 * max(n, 1)
+    while len(out) < n:
+        c = np.bincount(rng.integers(0, n_v, n_v), minlength=n_v).astype(np.float64)
+        if np.all((c @ positives)[defined] > 0):
+            out.append(c)
+            continue
+        redrawn += 1
+        if redrawn > limit:
+            raise ValueError('a query has positive frames in too few test videos for the video bootstrap '
+                             f'({redrawn} resamples without them); check the annotations')
+    return (np.stack(out) if out else np.zeros((0, n_v))), redrawn, defined
 
 
 def percentile_ci(values, level=0.95):
@@ -812,11 +838,18 @@ def main(argv=None):
            f'sampled at {a.sample_fps:g} fps x 14 queries; unannotated frames are excluded. Every method uses its own '
            f'threshold selected on the {len(split.get("val", []))} validation videos ({span(split.get("val", []))}). '
            f'Square brackets: 95 % bootstrap confidence interval over test videos ({a.bootstrap} resamples, the same '
-           f'resamples for every method). Values in %.', '']
+           f'resamples for every method; a resample without a positive frame of some query is drawn again, so the '
+           f'14-query mAP always averages the same queries). Values in %.', '']
     report['split'] = {k: len(v) for k, v in split.items()}
     rng = np.random.default_rng(a.seed)
-    counts = np.stack([np.bincount(rng.integers(0, n_v, n_v), minlength=n_v) for _ in range(a.bootstrap)]).astype(np.float64)
+    counts, rejected, defined = bootstrap_counts(frames, a.bootstrap, rng)
     report['test_videos'] = frames.video_ids
+    report['bootstrap_resamples_redrawn'] = rejected
+    undefined = [q for q, d in zip(frames.queries, defined) if not d]
+    report['queries_without_test_positives'] = undefined
+    if undefined:
+        log(f'!! WARNING: {len(undefined)} of the 14 queries have no positive test frame, so their AP is undefined '
+            f'and the mAP averages the other {14 - len(undefined)}: {undefined}. Check the annotations.')
 
     stats, reps = {}, {}
     for m in finished:
@@ -878,7 +911,10 @@ def main(argv=None):
                write_table(out, 'main_results', pd.DataFrame(main_rows),
                            'Language-guided temporal localization on the Cholec80 test videos',
                            'AP: frame-level average precision over all frames and queries; mAP: mean of the 14 per-query APs '
-                           '(the primary endpoint); F1 at the threshold selected on validation; seed 42 for trained methods. '
+                           '(the primary endpoint)' + (f' - here of the {14 - len(undefined)} queries with positive test '
+                                                       f'frames' if undefined else '') + '; F1 at the threshold selected on '
+                           'validation; seed 42 for trained methods. Square brackets: 95 % bootstrap CI over test videos '
+                           '(resamples conditional on every query having a positive frame). '
                            'TeCNO: phase queries from its temporal network, tool queries from the auxiliary tool head '
                            'of its stage-1 CNN (TeCNO itself predicts phases only). Closed-set models: one output per '
                            'concept, no text input.'), '']
@@ -1250,8 +1286,10 @@ def main(argv=None):
     explanations = sorted((out / 'explanations').glob('*/explanation_*.png')) if (out / 'explanations').exists() else []
     md += ['## Figures', '', *[f'- `figures/{n}.png` (and .pdf)' for n in figs],
            *[f'- `{p.relative_to(out)}` - language-guided patch relevance (before the temporal head)' for p in explanations], '']
+    report['model_sources'] = model_sources(root, finished)
     md += ['## Files', '', 'Every table is also in `tables/` as CSV and as a LaTeX (booktabs) table; all numbers are in '
-           '`analysis.json`. Inputs (prediction file hashes) are listed there too.', '']
+           '`analysis.json`. Inputs (prediction file hashes) are listed there too, and so are the exact model sources '
+           '(the Hugging Face revision of every downloaded model, the weight files and their hashes).', '']
 
     for m in finished:
         st = {k: v for k, v in stats[m.name].items() if k != 'per_video_ap'}
@@ -1264,7 +1302,80 @@ def main(argv=None):
     return 0
 
 
+# --------------------------------------------------------------------------- provenance
+def model_sources(root, methods):
+    """What the runs were made from, for exact re-runs: the commit every Hugging Face model in the job's cache
+    resolved to (<root>/hf_cache, the snapshot actually loaded), the torchvision weight files (their names carry
+    a hash prefix), the backbone checkpoint, the SurgVLP code commit and the hashes the runs recorded for their
+    weights. A record only: anything unreadable is noted under 'unreadable', never raised."""
+    out = dict(huggingface={}, torchvision=[], surgvlp_code=dict(repository=protocol.SURGVLP['repository'],
+                                                                   commit=protocol.SURGVLP['commit']), weights={},
+               unreadable=[])
+
+    def guarded(what, fn):
+        try:
+            fn()
+        except Exception as e:                           # noqa: BLE001
+            out['unreadable'].append(f'{what}: {e!r}'[:300])
+
+    def huggingface():
+        hub = root / 'hf_cache' / 'hub'
+        for repo in sorted(hub.glob('models--*')) if hub.exists() else []:
+            def one(repo=repo):
+                ref = repo / 'refs' / 'main'
+                snaps = repo / 'snapshots'
+                out['huggingface'][repo.name[len('models--'):].replace('--', '/')] = dict(
+                    revision=ref.read_text().strip() if ref.exists() else None,
+                    snapshots=sorted(x.name for x in snaps.iterdir()) if snaps.exists() else [])
+            guarded(repo.name, one)
+
+    def torchvision():
+        checkpoints = root / 'torch_cache' / 'hub' / 'checkpoints'
+        for f in sorted(checkpoints.glob('*')) if checkpoints.exists() else []:
+            if f.is_file():
+                out['torchvision'].append(dict(file=f.name, bytes=f.stat().st_size))
+
+    def backbone():
+        ref = root / 'state' / 'weights_ref.json'
+        if ref.exists():
+            info = json.loads(ref.read_text())
+            path = Path(info.get('path') or '')
+            out['backbone'] = dict(info, bytes=path.stat().st_size if str(path) not in ('', '.') and path.is_file()
+                                   else None)
+
+    def recorded(m):                                     # hashes written by the run itself
+        manifest = m.results / 'proposed_test.csv.manifest.json'
+        man = json.loads(manifest.read_text()) if manifest.exists() else {}
+        kept = {k: man[k] for k in ('weights_sha256', 'checkpoint_sha256', 'model') if man.get(k)}
+        if kept:
+            out['weights'][m.name] = kept
+
+    guarded('hf_cache', huggingface)
+    guarded('torch_cache', torchvision)
+    guarded('weights_ref.json', backbone)
+    for m in methods:
+        guarded(f'{m.name} manifest', lambda m=m: recorded(m))
+    return out
+
+
 # --------------------------------------------------------------------------- efficiency
+def journal_epochs_expected(journal, m, root):
+    """How many epochs a finished training wrote (None when unknown, e.g. TeCNO's early stopping): ours from the
+    run's configuration once its train stage has finished; a comparison method from its FINISHED.json."""
+    try:
+        if journal.parent == m.run:
+            if (root / 'state' / f'train.{m.name}.done.json').exists() and (m.run / 'run_config.json').exists():
+                return int(json.loads((m.run / 'run_config.json').read_text())['TRAIN']['NUM_EPOCHS'])
+            return None
+        done = journal.parent / 'FINISHED.json'
+        if done.exists():
+            epochs = json.loads(done.read_text()).get('epochs')
+            return int(epochs) if isinstance(epochs, int) else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return None
+
+
 def efficiency(m, root, missing=None):
     """One row of the efficiency table. `missing` (a dict) receives {journal: epochs without a row}."""
     row = {'Method': m.label, 'Parameters (M)': 'n/a', 'Trainable (M)': 'n/a', 'Training (h)': 'n/a',
@@ -1294,7 +1405,9 @@ def efficiency(m, root, missing=None):
                 if r.get('train_clips') is not None:           # clips through the backbone (ours, closed set)
                     clips += int(r['train_clips'])
                     steps += int(r.get('optimizer_steps') or 0)
-            gaps = sorted(set(range(1, max(epochs) + 1)) - epochs) if epochs else []
+            expected = journal_epochs_expected(j, m, root)       # also a missing LAST row is noticed
+            last = max([*epochs, expected or 0]) if epochs or expected else 0
+            gaps = sorted(set(range(1, last + 1)) - epochs)
             if gaps and missing is not None:
                 missing[str(j.relative_to(root))] = gaps
     if seconds == 0:

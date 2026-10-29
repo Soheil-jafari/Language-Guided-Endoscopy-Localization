@@ -5,7 +5,7 @@
 #   bash hpc/submit.sh pilot          # a few hours: real data prepared once, short training, time estimate
 #   bash hpc/submit.sh full           # the real experiment: baseline, then advanced model (use --repeat 2)
 #   bash hpc/submit.sh full --repeat 2    # same, plus one follow-up job in case 72 h are not enough
-#   bash hpc/submit.sh paper --repeat 6   # the paper's complete protocol (about 11-12 GPU days; see README_HPC.md)
+#   bash hpc/submit.sh paper --repeat 6   # the paper's complete protocol (about 13 GPU days; see README_HPC.md)
 #
 # Anything after the preset is passed on to main.py, e.g.  bash hpc/submit.sh full --batch-size 4 --accum 48
 # (except --root/--preset, which this script sets, and the download links, which belong in links.env).

@@ -1093,10 +1093,12 @@ def require_flow_weights_offline(a, p):
 
 
 def stage_check_advanced(a, p):
-    """Build the advanced model (every add-on switched on) and run one training step on the GPU with
-    random inputs. This proves - in about a minute, before any long job depends on it - that the Mamba
+    """Build the advanced model (every add-on switched on) and run two training steps (batch 2) on the GPU
+    with random inputs. This proves - in about a minute, before any long job depends on it - that the Mamba
     kernels, evidential uncertainty, confidence fusion and the bi-level loss (including the download of
-    the optical-flow network's weights) all work in this environment. It trains nothing."""
+    the optical-flow network's weights) all work in this environment; a failure stops the job. The paper
+    preset then also rehearses the training batch (rehearse_comparisons; never stops the job). It trains
+    nothing."""
     global _ADVANCED_CHECKED
     if _ADVANCED_CHECKED:
         log('advanced model already checked in this job')
@@ -1123,18 +1125,23 @@ def stage_check_advanced(a, p):
         raise
     _ADVANCED_CHECKED = True
     if getattr(a, 'preset', None) == 'paper':
-        rehearse_comparisons(a, p)
+        try:                                    # a report only: whatever happens in it, the job goes on
+            rehearse_comparisons(a, p)
+        except Exception as e:                  # noqa: BLE001
+            log(f'!! the full-size rehearsal could not run ({e!r}); the job continues.')
 
 
-REHEARSAL_PARTS = ('closedset', 'tecno_cnn', 'tecno_tcn')
+REHEARSAL_PARTS = ('advanced', 'closedset', 'tecno_cnn', 'tecno_tcn')
 REHEARSAL_TIMEOUT = 900                                    # seconds per model (normally well under a minute)
 
 
 def rehearse_comparisons(a, p):
-    """Paper preset: once per GPU type, two training steps of the closed-set model and of TeCNO at the size the
-    protocol trains them (comparison_models/rehearsal.py, about a minute), so that a memory problem shows in
-    the first report instead of days later. Never stops the job: a run that cannot train fails on its own (and
-    is retried by the next job); here it is only reported early."""
+    """Paper preset: once per GPU type, two full training steps (forward, loss, backward, optimiser) at the size
+    the protocol trains them, with random weights and inputs: our advanced model (the largest of our models: the
+    training batch, every add-on, the optical-flow loss; _check_advanced), the closed-set model and TeCNO
+    (comparison_models/rehearsal.py). A few minutes in all, so that a memory problem shows in the first report
+    instead of days later. Never stops the job: a run that cannot train fails on its own (and is retried by the
+    next job, after a fix); here it is only reported early, with the peak GPU memory of each."""
     import torch
     if not torch.cuda.is_available():
         return None
@@ -1144,40 +1151,57 @@ def rehearse_comparisons(a, p):
         done = json.loads(record.read_text()) if record.exists() else {}
     except ValueError:
         done = {}
-    if done.get('gpu') == gpu and all(v.get('ok') for v in done.values() if isinstance(v, dict)):
-        log(f'closed-set / TeCNO rehearsal already passed on this GPU type ({gpu})')
+    if done.get('gpu') == gpu and done.get('batch') == a.batch_size and \
+            all(done.get(part, {}).get('ok') for part in REHEARSAL_PARTS):
+        log(f'full-size rehearsal already passed on this GPU type ({gpu})')
         return done
     amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
     p.tmp.mkdir(parents=True, exist_ok=True)
     cfg_path = p.tmp / 'rehearsal.json'
     write_json(cfg_path, dict(MODEL=dict(M2CRL_WEIGHTS_PATH=''), TRAIN=dict(AMP_DTYPE=amp)))   # our crop and clip
+    adv_path = p.tmp / 'rehearsal_advanced.config.json'
+    write_json(adv_path, dict(MODEL=dict(ADVANCED_FLAGS['MODEL'], TEXT_ENCODER_MODEL=a.text_model),
+                              TRAIN=dict(ADVANCED_FLAGS['TRAIN'], AMP_DTYPE=amp)))
     tecno_cfg = protocol.COMPARISONS['tecno']
-    results = dict(gpu=gpu)
+    results = dict(gpu=gpu, batch=a.batch_size)
     # One process per model (so no model's memory remains allocated while the next is measured), each with a
     # deadline (a hung CUDA call must not hold up the job; training steps never get one).
     for part in REHEARSAL_PARTS:
         out = p.tmp / f'rehearsal_{part}.json'
         out.unlink(missing_ok=True)
+        if part == 'advanced':
+            cmd = [sys.executable, __file__, '_check_advanced', adv_path, a.batch_size, out]
+        else:
+            cmd = [sys.executable, 'comparison_models/rehearsal.py', '--part', part, '--config', cfg_path, '--output',
+                   out, '--closedset-batch', protocol.COMPARISONS['closedset']['batch_size'], '--tecno-batch',
+                   tecno_cfg['cnn_batch_size'], '--tecno-size', tecno_cfg['input_size']]
         try:
-            run([sys.executable, 'comparison_models/rehearsal.py', '--part', part, '--config', cfg_path, '--output', out,
-                 '--closedset-batch', protocol.COMPARISONS['closedset']['batch_size'], '--tecno-batch',
-                 tecno_cfg['cnn_batch_size'], '--tecno-size', tecno_cfg['input_size']], a, p, f'rehearse_{part}',
-                timeout=REHEARSAL_TIMEOUT)
-            results.update(json.loads(out.read_text()))
-        except (StageError, OSError, ValueError) as e:
+            run(cmd, a, p, f'rehearse_{part}', timeout=REHEARSAL_TIMEOUT)
+            r = json.loads(out.read_text())[part]
+            if not (isinstance(r, dict) and r.get('ok') is True):
+                raise ValueError(f'unexpected result {r!r:.300}')
+            results[part] = r
+            log(f'full-size rehearsal of {part}: OK, peak {r.get("peak_gb")} GB of GPU memory '
+                f'({r.get("reserved_gb")} GB reserved), {r.get("seconds")} s - {r.get("what")}')
+        except (StageError, OSError, ValueError, KeyError, TypeError) as e:
             try:                                        # the part's own error message, when it got that far
-                results.update(json.loads(out.read_text()))
-            except (OSError, ValueError):
-                results[part] = dict(ok=False, error=str(e)[:500])
+                own = json.loads(out.read_text()).get(part)
+            except (OSError, ValueError, AttributeError):
+                own = None
+            results[part] = dict(own) if isinstance(own, dict) else {}
             results[part]['ok'] = False
-            log(f'!! the real-size rehearsal of {part} failed on this GPU ({e}); the main runs continue, and the '
-                f'comparison run concerned will report its own error. See logs/rehearse_{part}.log.')
+            results[part]['error'] = results[part].get('error') or str(e)[:500]
+            log(f'!! the full-size rehearsal of {part} failed on this GPU ({e}); the job continues, and the runs '
+                f'concerned will report their own error. See logs/rehearse_{part}.log.')
     write_json(record, results)
     return results
 
 
-def _check_advanced(cfg_path):
-    """Internal (subprocess): one forward/backward step of the advanced model on random data."""
+def _check_advanced(cfg_path, batch=2, report=None):
+    """Internal (subprocess): training steps of the advanced model on random data - forward, loss (with the
+    optical-flow network), backward and an AdamW step, as train.py. batch 2: the functional check of every job;
+    with the training batch and `report`, the full-size memory rehearsal (rehearse_comparisons)."""
+    import time as _time
     import torch
     from project_config import config
     _apply_overrides(config, json.loads(Path(cfg_path).read_text()))
@@ -1188,49 +1212,76 @@ def _check_advanced(cfg_path):
         print(f'OPTICAL-FLOW WEIGHTS UNAVAILABLE: {e!r}', flush=True)
         sys.exit(FLOW_WEIGHTS_MISSING)
     print('optical-flow network (bi-level loss) ready', flush=True)
-    if not torch.cuda.is_available():
+    on_cpu = os.environ.get('LGEL_CHECK_ON_CPU') == '1'          # TEST ONLY: the same steps on a CPU (stub Mamba)
+    if not torch.cuda.is_available() and not on_cpu:
         print('advanced-model check SKIPPED: no CUDA GPU here (the Mamba kernels only run on a GPU)', flush=True)
         return
     try:
         import mamba_ssm
-        import selective_scan_cuda  # noqa: F401  pyflakes: ignore (Mamba's compiled GPU kernels)
+        if not on_cpu:
+            import selective_scan_cuda  # noqa: F401  pyflakes: ignore (Mamba's compiled GPU kernels)
     except Exception as e:                                      # noqa: BLE001
         print(f'MAMBA NOT AVAILABLE: {e!r}', flush=True)
         sys.exit(MAMBA_MISSING)
-    print(f'mamba_ssm {mamba_ssm.__version__}, torch {torch.__version__}, GPU {torch.cuda.get_device_name(0)}', flush=True)
+    cuda = not on_cpu
+    print(f'mamba_ssm {mamba_ssm.__version__}, torch {torch.__version__}, '
+          f'{"GPU " + torch.cuda.get_device_name(0) if cuda else "CPU (test)"}', flush=True)
     from models import LocalizationFramework
     torch.manual_seed(0)
-    dev = 'cuda'
+    torch.backends.cudnn.benchmark = False                      # as train.py
+    torch.backends.cudnn.deterministic = True
+    dev = 'cuda' if cuda else 'cpu'
+    started = _time.time()
     model = LocalizationFramework(config, initialize_backbone=False).to(dev).train()
     criterion = criterion.to(dev)
     criterion.set_epoch(0)
+    optimizer = torch.optim.AdamW([q for q in model.parameters() if q.requires_grad], lr=config.TRAIN.LEARNING_RATE,
+                                  weight_decay=config.TRAIN.WEIGHT_DECAY)
     length, size = config.DATA.CLIP_LENGTH, config.DATA.TRAIN_CROP_SIZE
-    video = torch.randn(2, 3, length, size, size, device=dev)
-    text = model.text_encoder.tokenizer(['grasper', 'calot triangle dissection'], padding='max_length', truncation=True,
+    video = torch.randn(batch, 3, length, size, size, device=dev)
+    words = ['grasper', 'calot triangle dissection']
+    text = model.text_encoder.tokenizer([words[i % 2] for i in range(batch)], padding='max_length', truncation=True,
                                         max_length=config.DATA.MAX_TEXT_LENGTH, return_tensors='pt')
-    target = torch.zeros(2, length, device=dev)
+    target = torch.zeros(batch, length, device=dev)
     target[:, length // 2:] = 1
-    target[1, 0] = -100                                         # an unlabelled frame, as in real windows
+    target[-1, 0] = -100                                        # an unlabelled frame, as in real windows
     dtype = torch.bfloat16 if config.TRAIN.AMP_DTYPE == 'bf16' else torch.float16
-    torch.cuda.reset_peak_memory_stats()
-    with torch.autocast(device_type='cuda', dtype=dtype):
-        outputs = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))
-        loss, primary, regularizer = criterion(outputs, video, target)
-    loss.backward()
+    scaler = torch.amp.GradScaler('cuda', enabled=cuda and dtype == torch.float16)
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
+    try:
+        for step in range(2):                                   # (the optimiser state exists from the first step)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=dev, dtype=dtype, enabled=cuda):
+                outputs = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))
+                loss, primary, regularizer = criterion(outputs, video, target)
+            scaler.scale(loss).backward()
+            if step == 0:
+                mixers = [m for m in model.temporal_head.modules() if type(m).__name__ == 'Mamba']
+                mamba_grad = any(q.grad is not None and bool(q.grad.abs().sum() > 0) for m in mixers for q in m.parameters())
+            scaler.step(optimizer)
+            scaler.update()
+        if cuda:
+            torch.cuda.synchronize()
+    except torch.cuda.OutOfMemoryError as e:
+        print(f'ADVANCED MODEL OUT OF GPU MEMORY at batch {batch}: {e}', flush=True)
+        if report:
+            Path(report).write_text(json.dumps({'advanced': dict(ok=False, error=f'out of GPU memory at batch {batch}')}))
+        sys.exit(1)
+    peak, reserved = (gb(torch.cuda.max_memory_allocated()), gb(torch.cuda.max_memory_reserved())) if cuda else (0.0, 0.0)
     evidence = outputs[-1]
     problems = []
     if not torch.isfinite(loss):
         problems.append(f'non-finite loss {float(loss)}')
-    if evidence is None or tuple(evidence.shape) != (2, length, 2) or bool((evidence < 0).any()):
+    if evidence is None or tuple(evidence.shape) != (batch, length, 2) or bool((evidence < 0).any()):
         problems.append('the uncertainty (evidence) output is missing or malformed')
     if not float(regularizer) > 0:
         problems.append('the bi-level consistency loss is not active')
     if model.language_guided_head.confidence_module is None:
         problems.append('confidence fusion is not active')
-    mixers = [m for m in model.temporal_head.modules() if type(m).__name__ == 'Mamba']
     if not mixers:
         problems.append('the temporal head has no official Mamba layers')
-    if not any(q.grad is not None and bool(q.grad.abs().sum() > 0) for m in mixers for q in m.parameters()):
+    if not mamba_grad:
         problems.append('no gradient reaches the Mamba layers')
     # Validation and prediction run the model in eval mode, without autocast and without gradients.
     model.eval()
@@ -1238,12 +1289,18 @@ def _check_advanced(cfg_path):
         scores = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))[0]
     if not bool(torch.isfinite(scores).all()) or bool((scores < 0).any()) or bool((scores > 1).any()):
         problems.append('the evaluation-mode forward pass does not give probabilities in [0, 1]')
+    if report:
+        Path(report).write_text(json.dumps({'advanced': dict(
+            ok=not problems, error='; '.join(problems) or None, peak_gb=round(peak, 2), reserved_gb=round(reserved, 2),
+            seconds=round(_time.time() - started, 1),
+            what=f'our advanced model, batch {batch} x {length} frames, {size} px, {config.TRAIN.AMP_DTYPE}, with the '
+                 f'optical-flow loss and an AdamW step')}, indent=2))
     if problems:
         print('ADVANCED MODEL CHECK FAILED: ' + '; '.join(problems), flush=True)
         sys.exit(1)
     print(f'advanced model OK: Mamba head ({len(mixers)} layers), uncertainty, confidence fusion and bi-level loss '
-          f'(loss {float(loss):.3f} = {float(primary):.3f} + {float(regularizer):.3f}); one training step with batch 2 '
-          f'used {gb(torch.cuda.max_memory_allocated()):.1f} GB of GPU memory', flush=True)
+          f'(loss {float(loss):.3f} = {float(primary):.3f} + {float(regularizer):.3f}); two training steps with batch '
+          f'{batch} used {peak:.1f} GB of GPU memory ({reserved:.1f} GB reserved)', flush=True)
 
 
 MAMBA_MISSING, FLOW_WEIGHTS_MISSING = 3, 4
@@ -2613,7 +2670,8 @@ def main(argv=None):
         _check_model(sys.argv[2])
         return 0
     if argv is None and len(sys.argv) > 1 and sys.argv[1] == '_check_advanced':  # internal helper
-        _check_advanced(sys.argv[2])
+        _check_advanced(sys.argv[2], *([int(sys.argv[3])] if len(sys.argv) > 3 else []),
+                        *(sys.argv[4:5] if len(sys.argv) > 4 else []))
         return 0
     a = ap.parse_args(argv)
     if a.list_stages:

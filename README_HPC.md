@@ -117,13 +117,13 @@ bundle in `lgel_paper/outbox/` includes them.
   frames are extracted again for the new folder (a few hours). The earlier `lgel/` runs are not touched.
 * **Time:** about 13 days of GPU time in total: the ten trainings of our model (two main models, four
   ablations, four extra seeds) and the exposure-matched closed-set model take about a day each; the other
-  comparison methods add several hours.
-* **Early check:** the first job also trains the closed-set model and TeCNO for two steps at full size
-  (about a minute, random weights) and logs their peak GPU memory, so a memory problem shows in the first
-  report rather than days later. It never stops the job.
-  Each job runs up to 72 h and the next one continues where it stopped, so `--repeat 6` queues enough
-  jobs; a job that starts when everything is already finished only redoes the summaries and the
-  analysis (about 20 minutes).
+  comparison methods add several hours. Each job runs up to 72 h and the next one continues where it
+  stopped, so `--repeat 6` queues enough jobs; a job that starts when everything is already finished only
+  redoes the summaries and the analysis (about 20 minutes).
+* **Early check:** the first job also runs two full training steps (forward, loss, backward, optimiser;
+  random weights) of our advanced model at the training batch (every add-on and the optical-flow loss), the
+  closed-set model and TeCNO, each in its own process with a 15-minute limit, and logs their peak GPU
+  memory, so a memory problem shows in the first report rather than days later. It never stops the job.
 * **One run failing does not stop the others.** If, say, a comparison method's download fails, the job
   logs it, goes on with the next run, and ends with exit code 1; the failed run is retried (from where
   it stopped) by the next job. A failure that affects every run (the data, the GPU check, the Mamba
@@ -233,7 +233,7 @@ bash run.sh --preset full --root $SCRATCH/lgel
 | `full` | all videos, 20 epochs, all training windows, effective batch size 192 - the baseline model, then the advanced model | the final numbers |
 
 `--variant baseline|advanced|both` overrides which model(s) a preset trains (`full`: both; `smoke`,
-`pilot`: baseline). The smoke test does not train the advanced model, but it runs one training step
+`pilot`: baseline). The smoke test does not train the advanced model, but it runs two training steps
 of it on the GPU (`check_advanced`), so a problem with Mamba or the other add-ons shows up in the
 first 30 minutes, not after the baseline's 20 epochs.
 
