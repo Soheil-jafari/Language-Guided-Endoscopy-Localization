@@ -65,11 +65,30 @@ TCN = dict(stages=2, layers=8, f_maps=32, dim=2048, classes=7)
 
 
 # --------------------------------------------------------------------------- models
+class download_timeout:
+    """Within it, a network read that stalls for `seconds` raises instead of waiting forever (torchvision
+    downloads its weights through urllib without a time limit). Only around a download: never set while data
+    loader processes communicate."""
+    def __init__(self, seconds=120):
+        self.seconds = seconds
+
+    def __enter__(self):
+        import socket
+        self.previous = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(self.seconds)
+
+    def __exit__(self, *exc):
+        import socket
+        socket.setdefaulttimeout(self.previous)
+        return False
+
+
 class TwoHeadResNet50(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
         from torchvision import models
-        self.model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
+        with download_timeout():                    # (the first run downloads the ImageNet weights)
+            self.model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
         self.model.fc = nn.Identity()
         self.fc_phase = nn.Linear(2048, 7)
         self.fc_tool = nn.Linear(2048, 7)

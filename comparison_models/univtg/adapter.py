@@ -50,7 +50,7 @@ sys.path.insert(0, str(HERE / 'official'))          # the official `model` and `
 from data_contract import AnnotationIndex, load_video_metadata, sample_indices, window_positions  # noqa: E402
 from comparison_models.frame_scores import manifest_pairs  # noqa: E402
 from metrics import temporal_ap  # noqa: E402
-from checkpoint_utils import commit_best, pending_best_path  # noqa: E402
+from checkpoint_utils import atomic_write_text, commit_best, pending_best_path  # noqa: E402
 
 SCHEMA = 'univtg-adapter-2'
 # Official QVHighlights fine-tuning settings (scripts/qvhl_pretrain.sh, main/config.py defaults), except as noted above.
@@ -70,6 +70,23 @@ def file_sha(path):
         for block in iter(lambda: f.read(1 << 20), b''):
             h.update(block)
     return h.hexdigest()
+
+
+def clean_journal(journal, finished):
+    """Keep the complete rows of finished epochs only, when a training starts or resumes: a row torn by a hard
+    stop (SIGKILL during the append) and rows of the interrupted epoch, which is redone, are dropped."""
+    journal = Path(journal)
+    if not journal.exists():
+        return
+    rows = {}
+    for line in journal.read_text(errors='replace').splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and isinstance(r.get('epoch'), int) and r['epoch'] <= finished:
+            rows[r['epoch']] = r
+    atomic_write_text(journal, ''.join(json.dumps(rows[e]) + '\n' for e in sorted(rows)))
 
 
 def atomic_save(value, path):
@@ -409,6 +426,7 @@ def train(args):
         start, best, best_epoch = ck['epoch'], ck['best_val_map'], ck.get('best_epoch')
         print(f'resuming after epoch {start}', flush=True)
     commit_best(out / 'best.pt', best_epoch)              # best.pt only holds an epoch that latest.pt committed
+    clean_journal(out / 'training_metrics.jsonl', start)
     weights = criterion.weight_dict
     for epoch in range(start, args.epochs):
         started = time.time()

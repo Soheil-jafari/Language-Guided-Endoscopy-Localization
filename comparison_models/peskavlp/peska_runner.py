@@ -81,6 +81,34 @@ def commit_best(best, committed_epoch):
             f.unlink()
 
 
+def atomic_write_text(path, text):
+    """Write a text file atomically (a local copy of checkpoint_utils.atomic_write_text)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
+    with open(tmp, 'w') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def clean_journal(journal, finished):
+    """Keep the complete rows of finished epochs only, when a training starts or resumes: a row torn by a hard
+    stop (SIGKILL during the append) and rows of the interrupted epoch, which is redone, are dropped."""
+    journal = Path(journal)
+    if not journal.exists():
+        return
+    rows = {}
+    for line in journal.read_text(errors='replace').splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and isinstance(r.get('epoch'), int) and r['epoch'] <= finished:
+            rows[r['epoch']] = r
+    atomic_write_text(journal, ''.join(json.dumps(rows[e]) + '\n' for e in sorted(rows)))
+
+
 def atomic_torch_save(value, path):
     tmp = Path(path).with_name(Path(path).name + f'.{os.getpid()}.tmp')
     torch.save(value, tmp)
@@ -283,6 +311,7 @@ def finetune(args):
         start, best, best_epoch = ck['epoch'], ck['best_val_loss'], ck.get('best_epoch')
         print(f'resuming after epoch {start}', flush=True)
     commit_best(out / 'best.pt', best_epoch)
+    clean_journal(out / 'training_metrics.jsonl', start)
     train_set = Frames(train_paths, preprocess, train_labels)
     val_loader = DataLoader(Frames(val_paths, preprocess, val_labels), batch_size=args.batch_size,
                             num_workers=args.workers, shuffle=False)

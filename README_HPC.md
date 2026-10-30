@@ -67,7 +67,13 @@ one 72-hour job; `--repeat 2` queues a second job that simply continues where th
   its report. Submitting the same command again continues from the last finished epoch.
   * `bash code/hpc/submit.sh full --repeat 2` queues a follow-up job up front. It starts when the
     first one ends, whatever the outcome: if the first job failed for a reason that is still there,
-    the follow-up fails the same way within minutes.
+    the follow-up fails the same way.
+  * A job that fails within its first 30 minutes (e.g. a short network or file-system outage) waits
+    30 minutes before it ends, so that a short outage costs one job of the chain, not all of them
+    (never after a success or a stop).
+  * The checks and model downloads at the start have time limits (GPU check and model checks: 1 h;
+    model downloads and the SurgVLP environment: 2 h), so a stalled download or a hung GPU call cannot
+    hold up a job; training and prediction never have one.
 * **The trained models** are `lgel/results/full_baseline_seed42/model_weights.pth` and
   `lgel/results/full_advanced_seed42/model_weights.pth` (each the best checkpoint without optimizer
   state); `lgel/results/full_seed42_COMPARISON.md` puts their test results side by side. The full
@@ -123,9 +129,9 @@ bundle in `lgel_paper/outbox/` includes them.
 * **Early check:** the first job also runs two full training steps (forward, loss, backward, optimiser;
   random weights) of our advanced model at the training batch (every add-on and the optical-flow loss), the
   closed-set model and TeCNO, each in its own process with a 15-minute limit, and logs their peak GPU
-  memory, so a memory problem shows in the first report rather than days later. It never stops the job,
-  and it is repeated only when the GPU type, the batch, the precision, the text encoder, the model code or
-  the PyTorch/Mamba versions change.
+  memory, so a memory problem shows in the first report rather than days later. It never stops the job.
+  It is repeated in a later job only while one of its parts has not passed, or when the GPU type, the
+  batch, the precision, the text encoder, the model code or the PyTorch/Mamba versions change.
 * **One run failing does not stop the others.** If, say, a comparison method's download fails, the job
   logs it, goes on with the next run, and ends with exit code 1; the failed run is retried (from where
   it stopped) by the next job. A failure that affects every run (the data, the GPU check, the Mamba
@@ -338,9 +344,10 @@ Everything lives under `--root`:
 Test videos are never used for training, model selection or threshold selection.
 
 The one command produces the frame-level results of the baseline and the advanced model (`full`),
-and `results/<run>_COMPARISON.md` with both side by side. The temporal-segment evaluation and the
-external comparison models described in `README.md` (CLIP, X-CLIP, Moment-DETR) are separate tools
-and are not run automatically.
+and `results/<run>_COMPARISON.md` with both side by side. With `full`, the temporal-segment evaluation
+and the external comparison models described in `README.md` are separate tools and are not run
+automatically; the `paper` preset runs its ten comparison methods, the segment evaluation and the
+analysis itself ("The paper protocol" in section 0).
 
 ## 7. Example Slurm job for other clusters (TEMPLATE)
 
@@ -422,7 +429,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with 211 automated tests plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with the automated tests in `tests/` (282 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.

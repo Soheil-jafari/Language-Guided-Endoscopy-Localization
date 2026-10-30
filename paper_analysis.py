@@ -196,13 +196,25 @@ def permutation_map_tests(frames, scores, pairs, n_perm, seed=0, workers=1):
     """Paired permutation tests (approximate randomisation) of the 14-query mAP difference for every pair:
     under the null hypothesis the two methods are exchangeable within a test video, so each permutation swaps
     the two methods' scores on a random subset of the videos (each video with probability 1/2, the same for all
-    queries). Two-sided p = (1 + #{|d_perm| >= |d_obs|}) / (n_perm + 1). Returns {pair: (d_obs, p)}."""
+    queries). Two-sided p = (1 + #{|d_perm| >= |d_obs|}) / (n_perm + 1). Returns {pair: (d_obs, p)}.
+    Each method's scores are first replaced by their ranks within each query (scaled to (0, 1]): a query's AP
+    depends only on that order, so every AP and every observed difference is unchanged, and a swap never mixes
+    two methods' score scales (e.g. a similarity and a probability)."""
     import warnings
+    from scipy.stats import rankdata
     obs = frames.observed
     per_q = []
     for qi in range(len(frames.queries)):
         rows = np.flatnonzero(obs & (frames.query == qi))
         per_q.append((frames.label[rows].astype(np.float64), frames.video[rows], rows))
+    ranked = {}
+    for name in sorted({m for pair in pairs for m in pair}):
+        r = np.zeros(len(scores[name]), dtype=np.float64)
+        for _, _, rows in per_q:
+            if len(rows):
+                r[rows] = rankdata(scores[name][rows], method='average') / len(rows)
+        ranked[name] = r
+    scores = ranked
     _PERMUTATION.update(queries=per_q, scores=scores, n_videos=len(frames.video_ids))
     tasks = [(pair, seed + 7919 * i, n_perm) for i, pair in enumerate(pairs)]
     with warnings.catch_warnings():
@@ -926,7 +938,8 @@ def main(argv=None):
                            '(resamples conditional on every query with a positive test frame keeping at least one). '
                            'TeCNO: phase queries from its temporal network, tool queries from the auxiliary tool head '
                            'of its stage-1 CNN (TeCNO itself predicts phases only). Closed-set models: one output per '
-                           'concept, no text input.'), '']
+                           'concept, no text input. ECE and Brier score of the zero-shot methods are computed on '
+                           'their similarity scores, which are not trained to be probabilities.'), '']
 
     # ---- significance
     sig_rows = []
@@ -978,9 +991,11 @@ def main(argv=None):
                write_table(out, 'significance', pd.DataFrame(sig_rows), 'Paired comparisons on the test videos',
                            f'Differences in percentage points, with 95 % paired-bootstrap CIs over test videos. Primary '
                            f'endpoint: {map_name}, two-sided paired permutation test ({a.permutations} random swaps of '
-                           f'the two methods\' scores within test videos), Holm correction over its {len(pairs_to_test)} '
-                           f'comparisons (null hypothesis: within every test video the two methods\' score vectors are '
-                           f'exchangeable, which is stronger than equal mAP). Secondary endpoints (pooled AP, F1, '
+                           f'the two methods\' scores within test videos; each method\'s scores are replaced by their '
+                           f'ranks within each query first, which leaves every AP unchanged, so a swap never mixes two '
+                           f'score scales), Holm correction over its {len(pairs_to_test)} '
+                           f'comparisons (null hypothesis: within every test video the two methods\' within-query score '
+                           f'ranks are exchangeable, which is stronger than equal mAP). Secondary endpoints (pooled AP, F1, '
                            f'segment mAP@0.5): two-sided paired '
                            f'bootstrap test with the bootstrap distribution centred at the null, Holm correction within '
                            f'each endpoint. Wilcoxon signed-rank test on the per-video APs. One training seed (42); '
@@ -1241,7 +1256,8 @@ def main(argv=None):
                                ' (some epochs have no logged row, so these times are lower bounds; see analysis.json)'
                                if missing_rows else '') + '. Training clips: training windows (clips of the clip '
                            'length) passed through the video backbone (ours: one per window and query; closed set: one '
-                           'per window and repeat); optimiser steps: the parameter updates they made. Throughput: video frames per second '
+                           'per window and repeat); optimiser steps: the parameter updates they made (n/a: not counted by '
+                           'that trainer; its epochs and batch size are in paper_protocol.py). Throughput: video frames per second '
                            'for all 14 queries on the test videos, including frame loading. UniVTG works on '
                            'precomputed M2CRL features (feature extraction not included); its parameters exclude '
                            'the frozen backbone. TeCNO: both stages (ResNet-50 and TCN; its throughput includes the '
@@ -1350,8 +1366,9 @@ def model_sources(root, methods):
         if ref.exists():
             info = json.loads(ref.read_text())
             path = Path(info.get('path') or '')
-            out['backbone'] = dict(info, bytes=path.stat().st_size if str(path) not in ('', '.') and path.is_file()
-                                   else None)
+            usable = str(path) not in ('', '.') and path.is_file()
+            out['backbone'] = dict(info, bytes=path.stat().st_size if usable else None,
+                                   sha256_16=file_sha(path) if usable else None)        # the M2CRL file itself
 
     def recorded(m):                                     # hashes written by the run itself
         manifest = m.results / 'proposed_test.csv.manifest.json'
@@ -1571,8 +1588,19 @@ def training_figure(plt, out, methods):
     rows = {}
     for m in methods:
         j = m.run / 'training_metrics.jsonl'
-        if j.exists():
-            rows[m.label] = [json.loads(line) for line in j.read_text().splitlines() if line.strip()]
+        if not j.exists():
+            continue
+        parsed = []
+        for line in j.read_text(errors='replace').splitlines():
+            try:                                        # a damaged row is skipped, as in efficiency()
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and all(isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool)
+                                           for k in ('epoch', 'train_loss', 'val_frame_nll', 'average_precision')):
+                parsed.append(r)
+        if parsed:
+            rows[m.label] = sorted(parsed, key=lambda x: x['epoch'])
     if not rows:
         return []
     fig, axes = plt.subplots(1, 2, figsize=(8.5, 3.0))

@@ -419,6 +419,32 @@ def test_xclip_scores_all_queries_of_a_window_at_once_exactly_like_one_at_a_time
 
 
 # --------------------------------------------------------------------------- UniVTG adapter
+def test_univtg_and_peskavlp_journals_are_cleaned_when_training_resumes(tmp_path):
+    from comparison_models.univtg import adapter
+    sys.path.insert(0, str(Path(pa.__file__).resolve().parent / 'comparison_models' / 'peskavlp'))
+    import peska_runner
+    for clean in (adapter.clean_journal, peska_runner.clean_journal):
+        j = tmp_path / f'{clean.__module__}.jsonl'
+        rows = [json.dumps(dict(epoch=e, train_loss=1.0 / e)) for e in (1, 2)]
+        torn = json.dumps(dict(epoch=3, train_loss=0.3))[:12] + json.dumps(dict(epoch=3, train_loss=0.3))
+        j.write_text('\n'.join(rows + [torn, '[1, 2]', json.dumps(dict(epoch=4, train_loss=0.2))]) + '\n')
+        clean(j, 2)                                 # resumed after epoch 2: epochs 3 and 4 are redone
+        assert [json.loads(x)['epoch'] for x in j.read_text().splitlines()] == [1, 2]
+        clean(j, 0)                                 # a fresh start keeps nothing
+        assert j.read_text() == ''
+        clean(tmp_path / 'absent.jsonl', 3)         # no journal yet: nothing to do
+        assert not (tmp_path / 'absent.jsonl').exists() and not list(tmp_path.glob('*.tmp'))
+
+
+def test_tecno_records_the_epochs_it_trained(tmp_path):
+    torch.save(dict(epoch=7, model={}), tmp_path / 'latest.pt')
+    assert pipeline.tecno_epochs(tmp_path) == 7
+    assert pipeline.tecno_epochs(tmp_path / 'missing') is None
+    (tmp_path / 'bad').mkdir()
+    (tmp_path / 'bad' / 'latest.pt').write_text('not a checkpoint')
+    assert pipeline.tecno_epochs(tmp_path / 'bad') is None
+
+
 def test_univtg_batches_never_repeat_a_query_and_use_every_sample_once():
     import random
     from comparison_models.univtg import adapter
@@ -793,6 +819,12 @@ def test_paired_permutation_test_of_the_map_difference():
     assert res[('twin_a', 'twin_b')][1] > 0.05
     # the same numbers with several processes (each pair has its own random stream)
     assert pa.permutation_map_tests(frames, scores, pairs, 200, seed=3, workers=2) == res
+    # A monotone change of one method's score scale (e.g. a probability vs a similarity) changes no AP, and
+    # now changes no p-value either: the test works on within-query ranks.
+    rescaled = dict(scores, good=good ** 5, twin_a=0.2 + 0.1 * twin_a)
+    again = pa.permutation_map_tests(frames, rescaled, pairs, 200, seed=3)
+    for pair in pairs:
+        assert again[pair][0] == pytest.approx(res[pair][0], abs=1e-12) and again[pair][1] == res[pair][1]
 
 
 def _write_results(root, d, plan, rng, quality, sets=('val', 'test'), para=None):
@@ -980,3 +1012,19 @@ def test_each_run_records_the_unseen_wording_manifests_it_was_evaluated_on(tmp_p
     manifest.write_text(manifest.read_text() + '\n')
     with pytest.raises(pipeline.StageError, match='changed'):
         pipeline.check_run_inputs(p, 'r')
+
+
+def test_a_damaged_journal_row_never_costs_the_training_figure(tmp_path):
+    from types import SimpleNamespace
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    run = tmp_path / 'run'
+    run.mkdir()
+    good = [dict(epoch=e, train_loss=1 / e, val_frame_nll=0.5, average_precision=0.7) for e in (2, 1)]
+    (run / 'training_metrics.jsonl').write_text('\n'.join(
+        [json.dumps(good[0]), '{"epoch": 3, "train_lo', '7', json.dumps(dict(epoch=4, train_loss='x', val_frame_nll=0.1,
+                                                                         average_precision=0.1)), json.dumps(good[1])]) + '\n')
+    m = SimpleNamespace(run=run, label='Baseline (ours)')
+    assert pa.training_figure(plt, tmp_path, [m]) == ['training_dynamics']
+    assert list(tmp_path.rglob('training_dynamics.png'))

@@ -773,7 +773,8 @@ def stage_preflight(a, p, selected):
         # Seeing a GPU is not the same as being able to run on it: run real kernels now, in seconds,
         # instead of failing after hours of data preparation.
         try:
-            run([sys.executable, '-c', GPU_CHECK, 'bf16' if native_bf16() else 'fp16'], a, p, 'gpu_check')
+            run([sys.executable, '-c', GPU_CHECK, 'bf16' if native_bf16() else 'fp16'], a, p, 'gpu_check',
+                timeout=CHECK_TIMEOUT)                  # a check, not training: a hang must not hold the job
         except StageError as e:
             raise StageError(f'the GPU cannot run PyTorch kernels with this environment ({e}). Typical causes: a '
                              f'GPU newer than the installed PyTorch build (RTX 50xx / Blackwell needs PyTorch >= 2.7 '
@@ -810,7 +811,7 @@ def stage_fetch_models(a, p):
     env = stage_env(a, p)
     if a.offline:
         env.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
-    run([sys.executable, '-c', code, a.text_model], a, p, 'fetch_models', env=env)
+    run([sys.executable, '-c', code, a.text_model], a, p, 'fetch_models', env=env, timeout=FETCH_TIMEOUT)
 
 
 # --------------------------------------------------------------------------- downloading
@@ -1111,7 +1112,8 @@ def stage_check_advanced(a, p):
     cfg_path = p.tmp / 'check_advanced.json'
     write_json(cfg_path, cfg)
     try:
-        run([sys.executable, __file__, '_check_advanced', cfg_path], a, p, 'check_advanced')
+        run([sys.executable, __file__, '_check_advanced', cfg_path], a, p, 'check_advanced',
+            timeout=CHECK_TIMEOUT)              # (the first job also downloads the optical-flow weights here)
     except StageError as e:
         if getattr(e, 'rc', None) == MAMBA_MISSING:
             raise StageError(f'{e}\n   The Mamba package (mamba_ssm) is missing or broken in this environment, so the '
@@ -1133,6 +1135,11 @@ def stage_check_advanced(a, p):
 
 REHEARSAL_PARTS = ('advanced', 'closedset', 'tecno_cnn', 'tecno_tcn')
 REHEARSAL_TIMEOUT = 900                                    # seconds per model (normally well under a minute)
+# Time limits of the steps that are neither training nor prediction, so that a stalled download or a hung
+# GPU call costs at most this, not the rest of a 72-hour job (the job then fails clearly, or the run alone
+# fails and is retried by the next job). Training and prediction never get one.
+CHECK_TIMEOUT = 3600                                       # the GPU check, the model checks (normally minutes)
+FETCH_TIMEOUT = 7200                                       # model downloads, the SurgVLP environment (resumable)
 # The code that decides what the rehearsed models allocate (sizes, crop, clip, layers, losses).
 REHEARSAL_CODE = ('main.py', 'project_config.py', 'models.py', 'losses.py', 'backbone/vision_transformer.py',
                   'backbone/endomamba.py', 'paper_protocol.py', 'comparison_models/rehearsal.py',
@@ -1234,7 +1241,8 @@ def _check_advanced(cfg_path, batch=2, report=None):
     _apply_overrides(config, json.loads(Path(cfg_path).read_text()))
     from losses import MasterLoss
     try:                                                        # works without a GPU: fetched once, then cached
-        criterion = MasterLoss(config)                          # (TORCH_HOME = <root>/torch_cache)
+        with download_timeout():                                # (TORCH_HOME = <root>/torch_cache)
+            criterion = MasterLoss(config)
     except Exception as e:                                      # noqa: BLE001
         print(f'OPTICAL-FLOW WEIGHTS UNAVAILABLE: {e!r}', flush=True)
         sys.exit(FLOW_WEIGHTS_MISSING)
@@ -1331,6 +1339,19 @@ def _check_advanced(cfg_path, batch=2, report=None):
 
 
 MAMBA_MISSING, FLOW_WEIGHTS_MISSING = 3, 4
+
+
+@contextlib.contextmanager
+def download_timeout(seconds=120):
+    """Within it, a network read that stalls for `seconds` raises instead of waiting forever (torchvision
+    downloads the optical-flow weights through urllib without a time limit)."""
+    import socket
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(previous)
 
 
 def _check_model(cfg_path):
@@ -1931,7 +1952,8 @@ PREFETCH = {
 def prefetch_hf(a, p, family, name):
     """Download (once) a Hugging Face model and its processor into <root>/hf_cache."""
     code = PREFETCH[family] + '; import sys; n = sys.argv[1]; M.from_pretrained(n); P.from_pretrained(n); print("ready:", n)'
-    run([sys.executable, '-c', code, name], a, p, f'fetch_{family}', env=stage_env(a, p, online=not a.offline))
+    run([sys.executable, '-c', code, name], a, p, f'fetch_{family}', env=stage_env(a, p, online=not a.offline),
+        timeout=FETCH_TIMEOUT)
 
 
 def finished_marker(folder):
@@ -2089,13 +2111,14 @@ def peskavlp_setup(a, p, model='PeskaVLP'):
     if a.offline and not (prefix / '.lgel_peskavlp_ready').exists():
         raise StageError(f'--offline: the SurgVLP environment ({prefix}) has not been created yet.')
     if not a.offline:
-        run(['bash', 'comparison_models/peskavlp/setup_env.sh', prefix], a, p, 'peskavlp_setup',
+        run(['bash', 'comparison_models/peskavlp/setup_env.sh', prefix], a, p, 'peskavlp_setup', timeout=FETCH_TIMEOUT,
             env=peskavlp_env(a, p, online=True))
     weights = peskavlp_weights(a, p, model)
     # One construction with the real weights (strict loading); it also fetches what the authors' model
     # constructor needs: Bio_ClinicalBERT (Hugging Face).
     run([prefix / 'bin' / 'python', 'comparison_models/peskavlp/peska_runner.py', 'check', '--weights', weights,
-         '--model', model], a, p, f'{model.lower()}_check', env=peskavlp_env(a, p, online=not a.offline))
+         '--model', model], a, p, f'{model.lower()}_check', env=peskavlp_env(a, p, online=not a.offline),
+        timeout=CHECK_TIMEOUT)
     return prefix, weights
 
 
@@ -2254,6 +2277,16 @@ TECNO = 'comparison_models/tecno/tecno.py'
 RESNET50_IMAGENET = 'resnet50-0676ba61.pth'                # torchvision ResNet50_Weights.IMAGENET1K_V1
 
 
+def tecno_epochs(folder):
+    """How many epochs a TeCNO stage trained (it stops early, so this is only known afterwards): recorded in
+    its FINISHED.json, so that the analysis notices a lost last journal row. None if unreadable."""
+    import torch
+    try:
+        return int(torch.load(Path(folder) / 'latest.pt', map_location='cpu', weights_only=False)['epoch'])
+    except Exception:                                           # noqa: BLE001  (a record only)
+        return None
+
+
 def tecno_train(a, p):
     cfg = protocol.COMPARISONS['tecno']
     cnn, features, tcn = p.run / 'tecno_cnn', p.run / 'tecno_features', p.run / 'tecno_tcn'
@@ -2274,7 +2307,7 @@ def tecno_train(a, p):
              '--input-size', cfg['input_size'], '--workers', score_workers(a)], a, p, 'train_cnn')
         if not (cnn / 'best.pt').exists():
             raise StageError('TeCNO stage 1 ended without a best checkpoint')
-        write_json(finished_marker(cnn), dict(finished=time.ctime()))
+        write_json(finished_marker(cnn), dict(finished=time.ctime(), epochs=tecno_epochs(cnn)))
     test_order, _ = work_order(a, p, p.triplet_csv('test'), 'test')
     run([sys.executable, TECNO, 'extract', '--checkpoint', cnn / 'best.pt', '--work-order', train_order, val_order,
          test_order, '--output', features, '--workers', score_workers(a)], a, p, 'tecno_features')
@@ -2283,7 +2316,7 @@ def tecno_train(a, p):
          p.run / 'parameter_counts.json'], a, p, 'train_tcn')
     if not (tcn / 'best.pt').exists():
         raise StageError('TeCNO stage 2 ended without a best checkpoint')
-    write_json(finished_marker(tcn), dict(finished=time.ctime()))
+    write_json(finished_marker(tcn), dict(finished=time.ctime(), epochs=tecno_epochs(tcn)))
 
 
 def tecno_predict(a, p, sets):

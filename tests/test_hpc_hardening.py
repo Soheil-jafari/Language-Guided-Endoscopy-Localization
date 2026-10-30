@@ -289,7 +289,8 @@ def _fake_repo(tmp_path, run_sh):
     return repo
 
 
-def _job(tmp_path, repo, preset='smoke', args=(), module_fails=False, signal_after=None, links=True):
+def _job(tmp_path, repo, preset='smoke', args=(), module_fails=False, signal_after=None, links=True, fail_pause='0',
+         send=None):
     stub = tmp_path / 'bin'
     stub.mkdir(exist_ok=True)
     (stub / 'module').write_text('#!/bin/bash\n' + ('[ "$2" = apps/miniconda3 ] && exit 1\n' if module_fails else '')
@@ -302,7 +303,7 @@ def _job(tmp_path, repo, preset='smoke', args=(), module_fails=False, signal_aft
     root = base / ('lgel_smoke' if preset == 'smoke' else 'lgel')
     (root / 'logs').mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, PATH=f'{stub}:{os.environ["PATH"]}', LGEL_REPO=str(repo), LGEL_BASE=str(base),
-               LGEL_PRESET=preset, LGEL_ROOT=str(root), SLURM_JOB_ID='555')
+               LGEL_PRESET=preset, LGEL_ROOT=str(root), SLURM_JOB_ID='555', LGEL_FAIL_PAUSE=fail_pause)
     env.pop('LGEL_WEIGHTS_URL', None)
     env.pop('LGEL_DATA_URL', None)
     logf = open(root / 'logs' / 'slurm-555.out', 'w')
@@ -310,7 +311,7 @@ def _job(tmp_path, repo, preset='smoke', args=(), module_fails=False, signal_aft
                             stderr=subprocess.STDOUT, start_new_session=True)
     if signal_after is not None:
         time.sleep(signal_after)
-        os.kill(proc.pid, signal.SIGUSR1)                     # Slurm's early warning, to the batch shell only
+        os.kill(proc.pid, send or signal.SIGUSR1)             # Slurm's early warning, to the batch shell only
     rc = proc.wait(timeout=120)
     logf.close()
     return rc, root, (root / 'logs' / 'slurm-555.out').read_text()
@@ -331,6 +332,27 @@ def test_early_warning_stops_the_pipeline_which_reports_itself(tmp_path):
     assert 'the time limit is near (USR1)' in log and 'pipeline: stopping' in log
     reports = sorted(x.name for x in (root / 'outbox').glob('*.tar.gz'))
     assert reports == ['r-job555-STOPPED.tar.gz']           # no extra fallback report
+
+
+@posix_only
+def test_a_quick_failure_waits_before_the_next_job_of_the_chain_may_start(tmp_path):
+    repo = _fake_repo(tmp_path, '#!/bin/bash\necho "ARGS: $*"\nexit 5\n')        # e.g. a short network outage
+    started = time.time()
+    rc, root, log = _job(tmp_path, repo, fail_pause='3')
+    assert rc == 5 and time.time() - started >= 3 and 'within 30 minutes of its start: waiting 3 s' in log
+    assert (root / 'outbox' / 'LATEST.txt').exists()                  # the report is written before the wait
+    started = time.time()
+    rc, root, log = _job(tmp_path, repo, module_fails=True, preset='pilot', fail_pause='3')
+    assert rc == 3 and time.time() - started >= 3                     # also a failure before the pipeline
+    for script in ('#!/bin/bash\nexit 0\n', FAKE_PIPELINE):          # a success, or a stop: no wait
+        repo = _fake_repo(tmp_path / f'r{len(script)}', script)
+        started = time.time()
+        rc, root, log = _job(tmp_path, repo, fail_pause='30', signal_after=1 if script == FAKE_PIPELINE else None)
+        assert rc in (0, 143) and time.time() - started < 20 and 'waiting' not in log
+    repo = _fake_repo(tmp_path / 'scancel', '#!/bin/bash\nexit 5\n')
+    proc_started = time.time()                                        # scancel during the wait ends it at once
+    rc, root, log = _job(tmp_path, repo, fail_pause='60', signal_after=1.5, send=signal.SIGTERM)
+    assert time.time() - proc_started < 30 and 'waiting 60 s' in log
 
 
 @posix_only

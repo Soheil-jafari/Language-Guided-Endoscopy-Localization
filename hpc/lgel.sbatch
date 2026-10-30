@@ -28,12 +28,35 @@ SLURM_LOG="$LGEL_ROOT/logs/slurm-$JOB.out"
 mkdir -p "$LGEL_ROOT/logs"
 START_MARK="$LGEL_ROOT/logs/.job-$JOB.started"
 touch "$START_MARK"
+JOB_START=$(date +%s)
 RC=1
 CHILD=
 
+# A job that FAILS within its first 30 minutes (e.g. a short network, file-system or module outage) waits
+# 30 minutes before it ends, so that the next job of the --repeat chain (which starts as soon as this one
+# ends) does not run into the same outage, and so on through the whole chain: a short outage then costs
+# one job, not all of them. Never after a success or a stop (time limit, scancel).
+# (LGEL_FAIL_PAUSE: seconds to wait, 0 = never; for the tests.)
+pause_after_quick_failure() {
+  case "$RC" in 0|129|130|138|143) return 0 ;; esac
+  local pause="${LGEL_FAIL_PAUSE:-1800}"
+  case "$pause" in ''|*[!0-9]*) pause=1800 ;; esac
+  [ "$pause" -gt 0 ] || return 0
+  [ $(( $(date +%s) - JOB_START )) -lt 1800 ] || return 0
+  echo "$(date): this job failed (exit code $RC) within 30 minutes of its start: waiting $pause s before it" \
+       "ends, so that the next job of the chain does not start straight into the same problem"
+  sleep "$pause" &
+  local sleeper=$!
+  wait "$sleeper" 2>/dev/null || true          # a stop (scancel) ends the wait at once
+  kill "$sleeper" 2>/dev/null || true
+}
+
 # Whatever happens below, end with a report: the pipeline writes its own; if it never got to run
 # (module or environment problems), a small one is made from the end of this job's log.
-finish() { bash "$LGEL_REPO/hpc/fallback_report.sh" "$LGEL_ROOT" "$JOB" "$RC" "$SLURM_LOG" "$LGEL_PRESET" "$START_MARK"; }
+finish() {
+  bash "$LGEL_REPO/hpc/fallback_report.sh" "$LGEL_ROOT" "$JOB" "$RC" "$SLURM_LOG" "$LGEL_PRESET" "$START_MARK"
+  pause_after_quick_failure
+}
 trap finish EXIT
 trap 'echo "stop requested before the pipeline started"; RC=143; exit 143' USR1 TERM INT
 

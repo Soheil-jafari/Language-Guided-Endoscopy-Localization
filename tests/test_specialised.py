@@ -677,3 +677,45 @@ def test_force_train_never_pretends_to_retrain_a_finished_model(tmp_path, monkey
         pipeline.stage_train(base, pb)
     assert pipeline.training_finished(base, pb) and not pipeline.training_finished(subs['closedset'],
                                                                                    pipeline.Paths(tmp_path, 'nothing'))
+
+
+def test_only_checks_and_downloads_have_a_time_limit_never_training_or_prediction():
+    """Every run(...) step of main.py with a time limit, read from the source: the checks, the model downloads
+    and the rehearsal - and no training, prediction or data step."""
+    import ast
+    limited, unlimited = set(), set()
+    for node in ast.walk(ast.parse((REPO / 'main.py').read_text())):
+        if isinstance(node, ast.Call) and getattr(node.func, 'id', None) == 'run' and len(node.args) >= 4:
+            name = ast.unparse(node.args[3])
+            (limited if any(k.arg == 'timeout' for k in node.keywords) else unlimited).add(name)
+    assert limited == {"'gpu_check'", "'fetch_models'", "'check_advanced'", "f'rehearse_{part}'", "f'fetch_{family}'",
+                       "'peskavlp_setup'", "f'{model.lower()}_check'"}
+    assert {"'train'", "f'predict_{name}'", "'train_cnn'", "'train_tcn'", "'fetch_data'"} <= unlimited
+    assert not limited & unlimited
+    assert pipeline.CHECK_TIMEOUT == 3600 and pipeline.FETCH_TIMEOUT == 7200
+
+
+def test_torchvision_downloads_cannot_stall_forever(tmp_path, monkeypatch):
+    import socket
+    import torchvision
+    before = socket.getdefaulttimeout()
+    seen = []
+
+    def resnet50(weights=None):                     # records the time limit the download would run with
+        seen.append((weights is not None, socket.getdefaulttimeout()))
+        return torchvision.models.ResNet(torchvision.models.resnet.Bottleneck, [1, 1, 1, 1])
+    monkeypatch.setattr(torchvision.models, 'resnet50', resnet50)
+    tecno.TwoHeadResNet50(pretrained=True)
+    assert seen == [(True, 120)] and socket.getdefaulttimeout() == before        # restored afterwards
+    import losses
+
+    def flow_loss(config):
+        seen.append(('flow', socket.getdefaulttimeout()))
+        raise TimeoutError('test: the download stalled')
+    monkeypatch.setattr(losses, 'MasterLoss', flow_loss)
+    cfg = tmp_path / 'none.json'
+    cfg.write_text('{}')
+    with pytest.raises(SystemExit) as e:
+        pipeline._check_advanced(cfg)
+    assert e.value.code == pipeline.FLOW_WEIGHTS_MISSING and seen[-1] == ('flow', 120)
+    assert socket.getdefaulttimeout() == before
