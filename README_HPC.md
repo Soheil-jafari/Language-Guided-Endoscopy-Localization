@@ -93,7 +93,7 @@ one 72-hour job; `--repeat 2` queues a second job that simply continues where th
 ```bash
 cd /mnt/scratch/users/daiz1/soheil
 git -C code pull                         # the version with the paper preset
-bash code/hpc/submit.sh paper --repeat 6
+bash code/hpc/submit.sh paper --repeat 8
 ```
 
 This runs the complete experimental protocol of `paper_protocol.py` in its own folder,
@@ -111,8 +111,8 @@ This runs the complete experimental protocol of `paper_protocol.py` in its own f
 
 Every run is evaluated on the same test frames with its own threshold chosen on the validation
 videos; the main, comparison and seed runs are also evaluated with two sets of query wordings never
-seen in training (`protocol/paraphrases.json`; not TeCNO and the closed-set model, which have no text
-input). At the end of every job, `paper_analysis.py` (CPU,
+seen in training (`protocol/paraphrases.json`, written from published phase and tool definitions, which
+the file lists; not TeCNO and the closed-set model, which have no text input). At the end of every job, `paper_analysis.py` (CPU,
 minutes) rewrites all tables and figures from whatever has finished:
 `lgel_paper/paper/PAPER_RESULTS.md`, `paper/tables/*.csv|.tex`, `paper/figures/*.png|.pdf`,
 `paper/explanations/` (patch-relevance maps of our two models), `paper/analysis.json`. The report
@@ -124,8 +124,9 @@ bundle in `lgel_paper/outbox/` includes them.
 * **Time:** about 13 days of GPU time in total: the ten trainings of our model (two main models, four
   ablations, four extra seeds) and the exposure-matched closed-set model take about a day each; the other
   comparison methods add several hours. Each job runs up to 72 h and the next one continues where it
-  stopped, so `--repeat 6` queues enough jobs; a job that starts when everything is already finished only
-  redoes the summaries and the analysis (about 20 minutes).
+  stopped. `--repeat 8` queues 576 h for about 312 h of work, which leaves room for queue restarts, a
+  retried run or a slower node; a job that starts when everything is already finished only redoes the
+  summaries and the analysis (about 20 minutes).
 * **Early check:** the first job also runs two full training steps (forward, loss, backward, optimiser;
   random weights) of our advanced model at the training batch (every add-on and the optical-flow loss), the
   closed-set model and TeCNO, each in its own process with a 15-minute limit, and logs their peak GPU
@@ -429,7 +430,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with the automated tests in `tests/` (282 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with the automated tests in `tests/` (288 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.

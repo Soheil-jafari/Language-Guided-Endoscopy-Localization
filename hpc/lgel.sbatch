@@ -45,6 +45,9 @@ pause_after_quick_failure() {
   [ $(( $(date +%s) - JOB_START )) -lt 1800 ] || return 0
   echo "$(date): this job failed (exit code $RC) within 30 minutes of its start: waiting $pause s before it" \
        "ends, so that the next job of the chain does not start straight into the same problem"
+  # A stop during the wait only ends the wait: the exit code stays that of the failure, and the sleep is
+  # cleaned up (the trap set before the pipeline started would exit 143 from inside this EXIT handler).
+  trap 'echo "$(date): stop requested during the wait - ending it"' USR1 TERM INT
   sleep "$pause" &
   local sleeper=$!
   wait "$sleeper" 2>/dev/null || true          # a stop (scancel) ends the wait at once

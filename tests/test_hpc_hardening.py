@@ -352,7 +352,18 @@ def test_a_quick_failure_waits_before_the_next_job_of_the_chain_may_start(tmp_pa
     repo = _fake_repo(tmp_path / 'scancel', '#!/bin/bash\nexit 5\n')
     proc_started = time.time()                                        # scancel during the wait ends it at once
     rc, root, log = _job(tmp_path, repo, fail_pause='60', signal_after=1.5, send=signal.SIGTERM)
-    assert time.time() - proc_started < 30 and 'waiting 60 s' in log
+    assert rc == 5 and time.time() - proc_started < 30 and 'waiting 60 s' in log
+    # The same before the pipeline started (a failed module load): the exit code stays that of the failure,
+    # and no sleep is left behind.
+    for send in (signal.SIGTERM, signal.SIGUSR1):
+        proc_started = time.time()
+        rc, root, log = _job(tmp_path, repo, preset='pilot', module_fails=True, fail_pause='77', signal_after=1.5,
+                             send=send)
+        assert rc == 3 and time.time() - proc_started < 30 and 'stop requested during the wait' in log
+        assert 'stop requested before the pipeline started' not in log
+        time.sleep(0.3)
+        left = subprocess.run(['pgrep', '-f', '^sleep 77$'], capture_output=True, text=True).stdout.split()
+        assert not left, f'a sleep was left behind: {left}'
 
 
 @posix_only

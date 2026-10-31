@@ -68,6 +68,11 @@ def test_paraphrases_cover_every_concept_and_never_reuse_training_wordings(tmp_p
                              protocol.PESKAVLP_PHASE_PROMPTS):
         assert words in prompt.lower()
     data = json.loads(protocol.PARAPHRASE_FILE.read_text())
+    # how the wordings were made is recorded with them; the tool labels mean "visible", so no tool wording
+    # claims that the tool is being used
+    assert len(data['sources']) >= 3 and 'not reviewed by a clinician' in data['_comment']
+    assert not any('being used' in q['text'] or 'is used' in q['text']
+                   for s in data['sets'].values() for q in s['queries'] if q['concept'] == 'tool')
     bad = json.loads(json.dumps(data))
     bad['sets']['A']['queries'][0]['text'] = PHRASES[0]                          # a training sentence
     (tmp_path / 'bad.json').write_text(json.dumps(bad))

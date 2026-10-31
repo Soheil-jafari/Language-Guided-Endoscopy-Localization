@@ -1,5 +1,12 @@
 {
-  "_comment": "Unseen query wordings for the language-generalisation test. Training only ever uses the 14 canonical sentences in data_contract.PHRASES; these sentences are used only at test time. Set A renames each concept (synonyms and clinical terms); set B describes what is happening. concept/concept_id follow data_contract.PHASES and data_contract.TOOLS. Drafted for review: every sentence must be checked by a clinician or the author before the results are reported.",
+  "_comment": "Unseen query wordings for the language-generalisation test. Training only ever uses the 14 canonical sentences in data_contract.PHRASES; these sentences are used only at test time. Set A renames each concept (synonyms and clinical terms); set B describes it in plain words. concept/concept_id follow data_contract.PHASES and data_contract.TOOLS. How they were made: drafted by the authors with the help of an AI assistant, then checked against published definitions, listed in \"sources\" (the Cholec80 phases and its tool rule: a tool is present when at least half of its tip is visible; the phase descriptions of the TUM LapChole dataset, which uses the same phases plus a separate trocar-placement phase; standard anatomical and instrument terms). They were not reviewed by a clinician.",
+  "sources": [
+    "Twinanda et al., EndoNet: A Deep Architecture for Recognition Tasks on Laparoscopic Videos, IEEE TMI 2017 (arXiv:1602.03012): the 7 Cholec80 phases and 7 tools; a tool is present if at least half of its tip is visible.",
+    "Stauder et al., The TUM LapChole dataset for the M2CAI 2016 workflow challenge, arXiv:1610.09278: what each phase contains (preparation begins after the last trocar is placed; clipping and cutting of the cystic duct and artery; the liver bed is cleaned and checked for bleeding; the gallbladder is packed in a plastic retrieval bag, which is pulled out of the body in the retraction phase).",
+    "Jones et al., Anatomy, Abdomen and Pelvis: Gallbladder, StatPearls (NCBI Bookshelf NBK459288): the hepatocystic triangle, also termed the triangle of Calot; the gallbladder bed of the liver.",
+    "Kelly, Laparoscopic retrograde (fundus first) cholecystectomy, BMC Surgery 2009;9:19: the standard first step places a grasper on the gallbladder fundus and elevates the liver to expose Calot's triangle.",
+    "AORN, Laparoscopic Cholecystectomy (2023): the instruments (blunt grasping forceps, electrocautery hook, laparoscopic scissors, clip appliers, laparoscopic irrigator and suction, specimen retrieval bag); the gallbladder is dissected off the liver bed, placed in the retrieval bag and removed through a port."
+  ],
   "sets": {
     "A": {
       "description": "synonyms and clinical terminology",
@@ -8,35 +15,35 @@
         {"concept": "phase", "concept_id": 1, "text": "dissection of the hepatocystic triangle"},
         {"concept": "phase", "concept_id": 2, "text": "division of the cystic duct and cystic artery between clips"},
         {"concept": "phase", "concept_id": 3, "text": "separation of the gallbladder from the liver bed"},
-        {"concept": "phase", "concept_id": 4, "text": "placement of the gallbladder into an endoscopic retrieval pouch"},
-        {"concept": "phase", "concept_id": 5, "text": "haemostasis and irrigation of the operative field"},
+        {"concept": "phase", "concept_id": 4, "text": "placement of the gallbladder into a retrieval pouch"},
+        {"concept": "phase", "concept_id": 5, "text": "haemostasis and irrigation of the liver bed"},
         {"concept": "phase", "concept_id": 6, "text": "extraction of the gallbladder from the abdominal cavity"},
         {"concept": "tool", "concept_id": 0, "text": "a grasping forceps is visible"},
         {"concept": "tool", "concept_id": 1, "text": "bipolar coagulation forceps are visible"},
-        {"concept": "tool", "concept_id": 2, "text": "a monopolar electrocautery hook is visible"},
+        {"concept": "tool", "concept_id": 2, "text": "an electrocautery hook is visible"},
         {"concept": "tool", "concept_id": 3, "text": "laparoscopic shears are visible"},
         {"concept": "tool", "concept_id": 4, "text": "a surgical clipping device is visible"},
         {"concept": "tool", "concept_id": 5, "text": "a suction and irrigation cannula is visible"},
-        {"concept": "tool", "concept_id": 6, "text": "an endoscopic retrieval pouch is visible"}
+        {"concept": "tool", "concept_id": 6, "text": "a retrieval pouch for the specimen is visible"}
       ]
     },
     "B": {
-      "description": "descriptions of the surgical action",
+      "description": "plain descriptions: what happens in each phase, and what each instrument does or looks like (a tool counts as present when it is visible, as in the Cholec80 tool labels)",
       "queries": [
-        {"concept": "phase", "concept_id": 0, "text": "the ports are being placed and the abdomen is being prepared for surgery"},
+        {"concept": "phase", "concept_id": 0, "text": "the gallbladder is grasped and the liver is lifted to expose the area to be dissected"},
         {"concept": "phase", "concept_id": 1, "text": "the surgeon is exposing the cystic duct and the cystic artery"},
         {"concept": "phase", "concept_id": 2, "text": "the surgeon applies clips to the cystic structures and cuts them"},
         {"concept": "phase", "concept_id": 3, "text": "the gallbladder is being detached from the liver"},
         {"concept": "phase", "concept_id": 4, "text": "the detached gallbladder is being put into a bag"},
-        {"concept": "phase", "concept_id": 5, "text": "bleeding points are coagulated and the area is rinsed and suctioned"},
+        {"concept": "phase", "concept_id": 5, "text": "the liver bed is rinsed and checked for bleeding, and bleeding points are coagulated"},
         {"concept": "phase", "concept_id": 6, "text": "the bag containing the gallbladder is pulled out of the patient"},
-        {"concept": "tool", "concept_id": 0, "text": "the surgeon is holding tissue with a grasping instrument"},
-        {"concept": "tool", "concept_id": 1, "text": "a bipolar instrument is being used to coagulate tissue"},
-        {"concept": "tool", "concept_id": 2, "text": "an electric hook is being used to dissect tissue"},
-        {"concept": "tool", "concept_id": 3, "text": "a pair of scissors is being used to cut"},
-        {"concept": "tool", "concept_id": 4, "text": "clips are being applied with an applicator"},
-        {"concept": "tool", "concept_id": 5, "text": "fluid is being suctioned or irrigated through a cannula"},
-        {"concept": "tool", "concept_id": 6, "text": "a plastic bag for removing the specimen is inside the abdomen"}
+        {"concept": "tool", "concept_id": 0, "text": "an instrument that grasps and holds tissue is in view"},
+        {"concept": "tool", "concept_id": 1, "text": "an instrument that coagulates tissue between its two tips is in view"},
+        {"concept": "tool", "concept_id": 2, "text": "a hook-shaped instrument that cuts tissue with electric current is in view"},
+        {"concept": "tool", "concept_id": 3, "text": "an instrument with two blades for cutting is in view"},
+        {"concept": "tool", "concept_id": 4, "text": "an instrument that applies clips is in view"},
+        {"concept": "tool", "concept_id": 5, "text": "a tube for suction and rinsing is in view"},
+        {"concept": "tool", "concept_id": 6, "text": "a plastic bag for removing the gallbladder is in view"}
       ]
     }
   }

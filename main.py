@@ -273,7 +273,7 @@ def stage_env(a, p, online=False):
 def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=None, timeout=None):
     """Run a subprocess, stream its output to the console and logs/<name>.log. With `timeout` (seconds), a step
     that is still running then is stopped (its whole process group) and reported as failed (err.timed_out); only
-    for optional checks - training steps never get a timeout."""
+    for checks and downloads - training and prediction steps never get one."""
     folder = p.logs / p.log_scope if getattr(p, 'log_scope', None) else p.logs
     folder.mkdir(parents=True, exist_ok=True)
     logfile = folder / f'{name}.log'

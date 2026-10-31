@@ -1239,9 +1239,11 @@ def main(argv=None):
         md += ['## 9. Generalisation to unseen query wordings', '',
                write_table(out, 'generalisation', pd.DataFrame(gen_rows),
                            'Frame AP on the test videos with query wordings never seen in training',
-                           'Set A: synonyms and clinical terms; set B: descriptions of the surgical action '
-                           '(protocol/paraphrases.json). In brackets: change vs the training wording and its paired '
-                           'bootstrap CI. Same frames, labels and threshold as with the training wording.'), '']
+                           'Set A: synonyms and clinical terms; set B: plain descriptions of each phase and instrument '
+                           '(protocol/paraphrases.json). The wordings were written from published phase and tool '
+                           'definitions (Cholec80, TUM LapChole, standard anatomical and instrument terms; listed in that '
+                           'file) and were not reviewed by a clinician. In brackets: change vs the training wording and '
+                           'its paired bootstrap CI. Same frames, labels and threshold as with the training wording.'), '']
 
     # ---- efficiency
     eff_rows, missing_rows = [], {}
