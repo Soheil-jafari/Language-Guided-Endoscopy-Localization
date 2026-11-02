@@ -127,6 +127,8 @@ def test_the_paper_protocol_end_to_end(tmp_path):
     assert rc == 143, log.read_text()[-3000:]
     name, files = latest_report(root)
     assert name.endswith('-STOPPED.tar.gz') and 'logs/main.log' in files
+    status = (root / 'paper' / 'STATUS.md').read_text()          # the status is current; the analysis waits
+    assert 'This job was stopped (exit code 143)' in status and 'paper/STATUS.md' in files
 
     # 2. the next job continues; the injected UniVTG failure does not stop the other runs
     rc = job(root, env, log=log)
@@ -150,9 +152,11 @@ def test_the_paper_protocol_end_to_end(tmp_path):
         assert (root / 'runs' / n / 'training_metrics.jsonl').read_text() == content, n
     assert all((root / 'results' / n / 'proposed_test_metrics.json').exists() for n in names)
     text = (paper / 'PAPER_RESULTS.md').read_text()
-    assert 'Runs finished: **20 of 20**' in text
+    assert 'Runs analysed: **20 of 20**' in text
     report = json.loads((paper / 'analysis.json').read_text())
-    assert 'figure_error' not in report and len(report['methods']) == 20
+    assert 'figure_error' not in report and len(report['methods']) == 20 and report['excluded'] == {}
+    assert 'Runs finished: **20 of 20**' in (paper / 'STATUS.md').read_text()
+    assert json.loads((paper / 'analysis_status.json').read_text())['ok']
     for table in ('main_results', 'significance', 'segment_results', 'phase_recognition', 'phase_recognition_relaxed',
                   'phase_recognition_relaxed_symmetric', 'tool_presence', 'ablations', 'seeds', 'generalisation',
                   'efficiency'):
@@ -169,6 +173,8 @@ def test_the_paper_protocol_end_to_end(tmp_path):
     for label in ('TeCNO (re-implementation)', 'Closed-set, our backbone (compute-efficient)',
                   'Closed-set, our backbone (exposure-matched)'):
         assert eff.loc[label, 'Training (h)'] != 'n/a' and eff.loc[label, 'Trainable (M)'] != 'n/a', label
+    for label in ('X-CLIP fine-tuned', 'UniVTG (M2CRL features)', 'Baseline (ours)'):   # every pass, all jobs
+        assert str(eff.loc[label, 'Training, all attempts (h)']) not in ('n/a', 'nan'), label
     clips = {k: int(float(str(eff.loc[k, 'Training clips']).replace(',', ''))) for k in ('Baseline (ours)',
              'Closed-set, our backbone (compute-efficient)', 'Closed-set, our backbone (exposure-matched)')}
     assert clips['Closed-set, our backbone (exposure-matched)'] > 5 * clips['Closed-set, our backbone (compute-efficient)']

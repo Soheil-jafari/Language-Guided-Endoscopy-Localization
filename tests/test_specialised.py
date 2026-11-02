@@ -595,6 +595,9 @@ def test_the_advanced_check_really_trains_at_any_batch(tmp_path):
     assert 'advanced model OK' in out and 'batch 3' in out
     r = json.loads(report.read_text())['advanced']
     assert r['ok'] and r['error'] is None and 'batch 3' in r['what'] and r['seconds'] >= 0
+    # train.py's own loop with accumulated micro-batches, and the evaluation peak measured on its own
+    assert "train.py's training loop" in r['what'] and 'accumulated' in r['what'] and 'eval_peak_gb' in r
+    assert 'accumulated micro-batches' in out
     out = run([REPO / 'main.py', '_check_advanced', cfg, 1], env, REPO)               # (a batch of one also works)
     assert 'advanced model OK' in out
 
@@ -688,10 +691,11 @@ def test_only_checks_and_downloads_have_a_time_limit_never_training_or_predictio
         if isinstance(node, ast.Call) and getattr(node.func, 'id', None) == 'run' and len(node.args) >= 4:
             name = ast.unparse(node.args[3])
             (limited if any(k.arg == 'timeout' for k in node.keywords) else unlimited).add(name)
+    # (`name`: the transfers of download(), whose limit is the download's time budget - None for the dataset)
     assert limited == {"'gpu_check'", "'fetch_models'", "'check_advanced'", "f'rehearse_{part}'", "f'fetch_{family}'",
-                       "'peskavlp_setup'", "f'{model.lower()}_check'"}
+                       "'peskavlp_setup'", "f'{model.lower()}_check'", 'name'}
     assert {"'train'", "f'predict_{name}'", "'train_cnn'", "'train_tcn'", "'fetch_data'"} <= unlimited
-    assert not limited & unlimited
+    assert not (limited - {'name'}) & unlimited                     # (`name` also names other generic steps)
     assert pipeline.CHECK_TIMEOUT == 3600 and pipeline.FETCH_TIMEOUT == 7200
 
 
@@ -719,3 +723,13 @@ def test_torchvision_downloads_cannot_stall_forever(tmp_path, monkeypatch):
         pipeline._check_advanced(cfg)
     assert e.value.code == pipeline.FLOW_WEIGHTS_MISSING and seen[-1] == ('flow', 120)
     assert socket.getdefaulttimeout() == before
+
+
+def test_the_rehearsal_is_repeated_when_the_training_loop_or_its_accumulation_changes():
+    import argparse
+    a = argparse.Namespace(batch_size=8, accum=24, text_model='openai/clip-vit-base-patch32')
+    sig = pipeline.rehearsal_signature(a, 'NVIDIA A100-SXM4-80GB', 'bf16')
+    assert sig['accumulation'] == 24 and sig['rehearsed_accumulation'] == pipeline.REHEARSAL_ACCUMULATION >= 2
+    assert 'train.py' in pipeline.REHEARSAL_CODE
+    assert pipeline.rehearsal_signature(argparse.Namespace(**dict(vars(a), accum=12)), 'NVIDIA A100-SXM4-80GB',
+                                        'bf16') != sig

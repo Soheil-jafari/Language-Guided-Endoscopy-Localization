@@ -895,7 +895,7 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     assert pa.main(['--root', str(root), '--bootstrap', '30', '--permutations', '20']) == 0
     out = root / 'paper'
     text = (out / 'PAPER_RESULTS.md').read_text()
-    assert 'Runs finished: **19 of 20**' in text and 'paper_peskavlp_finetune_s42' in text
+    assert 'Runs analysed: **19 of 20**' in text and 'paper_peskavlp_finetune_s42' in text
     for section in ('Main results', 'Paired significance', 'Temporal segments', 'phase recognition', 'Tool presence',
                     'Per-query AP', 'Ablations', 'seeds', 'unseen query wordings', 'Efficiency', 'Published results'):
         assert section.lower() in text.lower(), section
@@ -968,10 +968,27 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     text = (out / 'PAPER_RESULTS.md').read_text()
     assert '14-query mAP' not in text and 'mAP over the 13 of 14 queries with positive test frames' in text
     assert f'no positive test frame: {gone}' in text
-    # a missing input of a finished run is an error, not a silently smaller table
+    # an unusable input of a finished run leaves that run out, by name and with the reason - never silently, and
+    # never at the cost of the whole report
     (root / 'results' / 'paper_clip_zeroshot' / 'test_reference.csv').write_text('video_id,text_query,frame_idx,label\n')
-    with pytest.raises(ValueError):
+    assert pa.main(['--root', str(root), '--bootstrap', '5', '--permutations', '5']) == 0
+    report = json.loads((out / 'analysis.json').read_text())
+    assert 'paper_clip_zeroshot' not in report['finished'] and 'frames differ' in report['excluded']['paper_clip_zeroshot']
+    text = (out / 'PAPER_RESULTS.md').read_text()
+    assert 'Runs analysed: **18 of 20**' in text and 'left out because their outputs cannot be used: paper_clip_zeroshot' in text
+    assert json.loads((out / 'analysis_status.json').read_text())['ok']
+    # test rows or labels that differ between runs (different data) still stop the analysis - and say why
+    df = pd.read_csv(root / 'results' / 'paper_tecno_s42' / 'test_reference.csv')
+    df.loc[0, 'label'] = 1 - df.loc[0, 'label'] if df.loc[0, 'label'] in (0, 1) else 1
+    df.to_csv(root / 'results' / 'paper_tecno_s42' / 'test_reference.csv', index=False)
+    pred = pd.read_csv(root / 'results' / 'paper_tecno_s42' / 'proposed_test.csv')
+    pred.loc[0, 'label'] = df.loc[0, 'label']
+    pred.to_csv(root / 'results' / 'paper_tecno_s42' / 'proposed_test.csv', index=False)
+    with pytest.raises(ValueError, match='differ from the other runs'):
         pa.main(['--root', str(root), '--bootstrap', '5', '--permutations', '5'])
+    status = json.loads((out / 'analysis_status.json').read_text())
+    assert not status['ok'] and 'differ from the other runs' in status['error']
+    assert 'Runs analysed: **18 of 20**' in (out / 'PAPER_RESULTS.md').read_text()     # the last good report stays
 
 
 def test_the_analysis_of_a_root_without_finished_runs_is_a_short_note(tmp_path):
@@ -1033,3 +1050,197 @@ def test_a_damaged_journal_row_never_costs_the_training_figure(tmp_path):
     m = SimpleNamespace(run=run, label='Baseline (ours)')
     assert pa.training_figure(plt, tmp_path, [m]) == ['training_dynamics']
     assert list(tmp_path.rglob('training_dynamics.png'))
+
+
+# --------------------------------------------------------------------------- round 15 (the last review)
+def test_univtg_never_uses_a_co_occurring_concept_as_a_negative():
+    from comparison_models.univtg import adapter
+    phase, tool, other = PHRASES[1], PHRASES[7], PHRASES[8]          # e.g. Calot dissection, grasper, bipolar
+    clips = 6
+    flags_v1 = {phase: np.array([1, 1, 1, 0, 0, 0], bool),          # clip may NOT be a negative for the concept
+                tool: np.array([1, 1, 0, 0, 1, 1], bool),            # (present in a frame, or not annotated)
+                other: np.array([0, 0, 0, 0, 0, 1], bool)}
+    a = dict(query=tool, not_negative=flags_v1)                      # anchor clip 1: the phase is going on there
+    b = dict(query=phase, not_negative=flags_v1)                     # anchor clip 4: the tool is in view there
+    c = dict(query=other, not_negative=flags_v1)                     # anchor clip 3: neither of the others
+    d = dict(query=PHRASES[2], not_negative={})                      # a video without annotations for these: unknown
+    valid = adapter.inter_negatives([a, b, c, d], [1, 4, 3, 2])
+    assert valid.diagonal().all()
+    assert not valid[0, 1]                         # the phase sentence is no negative for a clip in that phase
+    assert not valid[1, 0]                         # the tool sentence is no negative for a clip that shows the tool
+    assert valid[0, 2] and valid[2, 0] and valid[2, 1]   # known absent: proper negatives
+    assert not valid[3, 0] and not valid[0, 3]      # unknown either way: left out
+    assert clips == len(flags_v1[phase])
+
+
+def test_univtg_masked_inter_loss_is_the_official_one_without_the_masked_pairs():
+    from comparison_models.univtg import adapter
+    torch.manual_seed(0)
+    settings = dict(clip_frames=4, sample_fps=1.0, epochs=1, lr=1e-4, batch_size=4, eval_every=1, seed=0,
+                    max_v_l=100000)
+    _, criterion, _ = adapter.build(settings, 'cpu')
+    official = type(criterion).__mro__[1]
+    n, length, dim = 4, 7, 16
+    outputs = dict(vid_mem_proj=torch.randn(n, length, dim, requires_grad=True),
+                   txt_mem_proj=torch.randn(n, 1, dim, requires_grad=True))
+    scores = torch.zeros(n, length)
+    pos = torch.tensor([[1], [3], [0], [5]])
+    scores[torch.arange(n), pos[:, 0]] = 1
+    targets = dict(saliency_scores=scores, saliency_pos_labels=pos, timestamp_mask=torch.ones(n, length))
+    want = official.loss_saliency(criterion, outputs, targets, None)
+    got = criterion.loss_saliency(outputs, dict(targets, inter_valid=torch.ones(n, n, dtype=torch.bool)), None)
+    assert torch.allclose(got['loss_s_inter'], want['loss_s_inter']) and torch.allclose(got['loss_s_intra'], want['loss_s_intra'])
+    valid = torch.ones(n, n, dtype=torch.bool)
+    valid[0, 1] = valid[1, 0] = False
+    got = criterion.loss_saliency(outputs, dict(targets, inter_valid=valid), None)
+    sim = adapter.torch.nn.functional.cosine_similarity(
+        outputs['vid_mem_proj'][torch.arange(n), pos[:, 0]][:, None], outputs['txt_mem_proj'][:, 0][None], dim=-1)
+    sim = (sim / criterion.temperature).masked_fill(~valid, float('-inf'))
+    manual = -sim.log_softmax(1).diagonal().mean() - sim.t().log_softmax(1).diagonal().mean()
+    assert torch.allclose(got['loss_s_inter'], manual, atol=1e-6)
+    assert not torch.allclose(got['loss_s_inter'], want['loss_s_inter'])
+    assert torch.allclose(got['loss_s_intra'], want['loss_s_intra'])          # the intra-video part is untouched
+
+
+def test_univtg_feature_record_is_atomic_and_a_damaged_one_never_vouches_for_old_features(tmp_path):
+    from comparison_models.univtg import adapter
+    out = tmp_path / 'features'
+    out.mkdir()
+    adapter.feature_record(out, 'abc', 1.0)
+    first = (out / 'features.json').stat().st_mtime_ns
+    adapter.feature_record(out, 'abc', 1.0)                          # unchanged: not rewritten
+    assert (out / 'features.json').stat().st_mtime_ns == first
+    with pytest.raises(ValueError, match='other backbone weights'):
+        adapter.feature_record(out, 'other', 1.0)
+    np.save(out / 'v1.npy', np.zeros((3, 2)))
+    (out / 'features.json').write_text('{"weights_sha256": "ab')    # torn by a stop
+    for _ in range(2):                                               # recovers at once, and stays recovered
+        adapter.feature_record(out, 'abc', 1.0)
+    assert json.loads((out / 'features.json').read_text())['weights_sha256'] == 'abc'
+    assert not list(out.glob('*.npy'))                               # to be computed again with the new record
+    aside = list(out.glob('unverified-*'))
+    assert len(aside) == 1 and (aside[0] / 'v1.npy').exists() and (aside[0] / 'features.json').exists()
+
+
+def test_a_damaged_or_unfinished_run_never_stops_the_analysis_or_counts_as_finished(tmp_path):
+    root = tmp_path / 'root'
+    d = make_prepared(root, n_videos=6, seconds=30, split=dict(
+        train=['CHOLEC80__video01', 'CHOLEC80__video02', 'CHOLEC80__video03'], val=['CHOLEC80__video04'],
+        test=['CHOLEC80__video05', 'CHOLEC80__video06']))
+    rng = np.random.default_rng(0)
+    plans = {p['name']: p for p in protocol.plans('paper')}
+    for name in ('paper_baseline_s42', 'paper_advanced_s42', 'paper_clip_zeroshot', 'paper_tecno_s42',
+                 'paper_closedset_s42'):
+        p = plans[name]
+        p['short'] = 'advanced' if p['flags'] == protocol.ADVANCED else p['kind']
+        _write_results(root, d, p, rng, quality=2.0)
+    # an unfinished run with a half-written calibration file (its outputs are never read)
+    unfinished = root / 'results' / 'paper_univtg_s42'
+    unfinished.mkdir(parents=True)
+    (unfinished / 'proposed_calibration.json').write_text('{"thresh')
+    # a finished run whose threshold is not a number, and one whose test predictions are gone
+    (root / 'results' / 'paper_tecno_s42' / 'proposed_calibration.json').write_text('{"threshold": NaN}')
+    (root / 'results' / 'paper_closedset_s42' / 'proposed_test.csv').unlink()
+    # a finished run with a damaged optional file (its efficiency row shows n/a)
+    (root / 'runs' / 'paper_baseline_s42' / 'parameter_counts.json').write_text('{"vision')
+    assert pa.main(['--root', str(root), '--bootstrap', '10', '--permutations', '5']) == 0
+    report = json.loads((root / 'paper' / 'analysis.json').read_text())
+    assert sorted(report['finished']) == ['paper_advanced_s42', 'paper_baseline_s42', 'paper_clip_zeroshot']
+    assert set(report['excluded']) == {'paper_tecno_s42', 'paper_closedset_s42'}
+    assert 'not a probability' in report['excluded']['paper_tecno_s42']
+    assert 'missing' in report['excluded']['paper_closedset_s42']
+    assert 'paper_univtg_s42' in report['missing'] and 'paper_univtg_s42' not in report['excluded']
+    text = (root / 'paper' / 'PAPER_RESULTS.md').read_text()
+    assert 'Runs analysed: **3 of 20**' in text and 'paper_tecno_s42 (' in text
+    status = json.loads((root / 'paper' / 'analysis_status.json').read_text())
+    assert status['ok'] and status['analysed'] == 3 and set(status['excluded']) == set(report['excluded'])
+    eff = pd.read_csv(root / 'paper' / 'tables' / 'efficiency.csv', keep_default_na=False).set_index('Method')
+    assert eff.loc['Baseline (ours)', 'Trainable (M)'] == 'n/a'
+
+
+def test_the_efficiency_table_also_counts_the_compute_of_interrupted_attempts(tmp_path):
+    plan = dict(protocol.plans('paper')[6])                          # X-CLIP: no epoch journal
+    m = pa.Method(plan, tmp_path)
+    m.run.mkdir(parents=True)
+    (m.run / 'train_attempts.jsonl').write_text(
+        json.dumps(dict(seconds=3600, outcome='stopped')) + '\n{"seconds": 18' + '\n'
+        + json.dumps(dict(seconds=1800, outcome='finished')) + '\n')
+    (tmp_path / 'state').mkdir()
+    (tmp_path / 'state' / f'train.{plan["name"]}.done.json').write_text(json.dumps(dict(seconds=1800)))
+    row = pa.efficiency(m, tmp_path)
+    assert row['Training (h)'] == '1.5' and row['Training, all attempts (h)'] == '1.5'
+    ours = pa.Method(dict(protocol.plans('paper')[0]), tmp_path)    # epoch journal: the finished epochs' time
+    ours.run.mkdir(parents=True)
+    (ours.run / 'training_metrics.jsonl').write_text(json.dumps(dict(epoch=1, train_seconds=3000, val_seconds=600)) + '\n')
+    (ours.run / 'train_attempts.jsonl').write_text(json.dumps(dict(seconds=7200)) + '\n')
+    row = pa.efficiency(ours, tmp_path)
+    assert row['Training (h)'] == '1.0' and row['Training, all attempts (h)'] == '2.0'
+
+
+def test_every_pass_through_a_train_stage_is_recorded_even_when_it_is_stopped(tmp_path, monkeypatch):
+    p = pipeline.Paths(tmp_path, 'r')
+    pipeline.record_train_attempt(p, 12.34, 'stopped')
+    pipeline.record_train_attempt(p, 5, 'finished')
+    rows = [json.loads(x) for x in (p.run / 'train_attempts.jsonl').read_text().splitlines()]
+    assert [(r['seconds'], r['outcome']) for r in rows] == [(12.3, 'stopped'), (5, 'finished')]
+
+
+def test_the_real_driver_records_a_train_attempt_that_a_stop_interrupts(tmp_path, monkeypatch):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu'])
+    sub = pipeline.experiment_plans(a)[0]
+    p = pipeline.Paths(tmp_path, sub.run_name)
+    for d in (p.state, p.logs):
+        d.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pipeline, 'stage_preflight', lambda *x: None)
+    monkeypatch.setattr(pipeline, 'stage_train', lambda a, p: (_ for _ in ()).throw(SystemExit(143)))
+    for s in pipeline.STAGES[1:pipeline.STAGES.index('train')]:
+        if s not in pipeline.ALWAYS_RUN:
+            pipeline.write_json(p.marker(s), dict(signature=pipeline.stage_signature(s, sub)))
+    sub.check_advanced = False
+    with pytest.raises(SystemExit):
+        pipeline._drive(sub, p, ['train'], [])
+    rows = [json.loads(x) for x in (p.run / 'train_attempts.jsonl').read_text().splitlines()]
+    assert [r['outcome'] for r in rows] == ['stopped']
+
+
+def test_a_stopped_paper_job_writes_the_status_and_leaves_the_analysis_to_the_next_job(tmp_path, monkeypatch):
+    names = [p['name'] for p in protocol.plans('paper')]
+
+    def drive(a, p, stages, redo):
+        if a.run_name == names[2]:
+            raise SystemExit(143)                                    # the time limit arrives during the third run
+        a.failed_stage = 'train' if a.run_name == names[1] else None
+        return 1 if a.run_name == names[1] else 0
+    monkeypatch.setattr(pipeline, '_drive', drive)
+    monkeypatch.setattr(pipeline, 'write_report_bundle', lambda *a, **k: None)
+    outputs = []
+    monkeypatch.setattr(pipeline, 'paper_outputs', lambda a, plans: outputs.append(1) or 0)
+    monkeypatch.setattr(pipeline, 'data_prepared', lambda p: True)
+    with pytest.raises(SystemExit):
+        pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job'])
+    assert outputs == []                                             # no analysis in the last minutes
+    status = (tmp_path / 'paper' / 'STATUS.md').read_text()
+    assert 'This job was stopped (exit code 143)' in status and 'next job' in status
+    assert f'| 2 | {names[1]} |' in status and 'failed in this job' in status
+    assert 'Runs finished: **0 of 20**' in status
+    data = json.loads((tmp_path / 'paper' / 'status.json').read_text())
+    assert len(data['runs']) == 20 and data['runs'][1]['state'].startswith('failed')
+
+
+def test_a_tecno_run_counts_as_trained_only_when_its_last_stage_finished(tmp_path):
+    a = argparse.Namespace(kind='tecno', epochs=10)
+    p = pipeline.Paths(tmp_path, 'paper_tecno_s42')
+    (p.run / 'tecno_cnn').mkdir(parents=True)
+    (p.run / 'tecno_cnn' / 'FINISHED.json').write_text('{}')
+    assert not pipeline.training_finished(a, p)                      # stage 1 only: --force train is not refused
+    (p.run / 'tecno_tcn').mkdir()
+    (p.run / 'tecno_tcn' / 'FINISHED.json').write_text('{}')
+    assert pipeline.training_finished(a, p)
+    assert not pipeline.training_finished(argparse.Namespace(kind='clip_zeroshot', epochs=1), p)   # trains nothing
+    for kind, spec in pipeline.COMPARISON_METHODS.items():           # every trained method names its last stage
+        assert ('trained' in spec) == (kind not in protocol.ZERO_SHOT), kind
+
+
+def test_the_clipping_phase_wording_names_both_of_its_actions():
+    para = protocol.load_paraphrases()
+    assert para['A'][('phase', 2)] == 'clipping and division of the cystic duct and cystic artery'

@@ -13,7 +13,7 @@
       "queries": [
         {"concept": "phase", "concept_id": 0, "text": "the preparatory stage of the operation"},
         {"concept": "phase", "concept_id": 1, "text": "dissection of the hepatocystic triangle"},
-        {"concept": "phase", "concept_id": 2, "text": "division of the cystic duct and cystic artery between clips"},
+        {"concept": "phase", "concept_id": 2, "text": "clipping and division of the cystic duct and cystic artery"},
         {"concept": "phase", "concept_id": 3, "text": "separation of the gallbladder from the liver bed"},
         {"concept": "phase", "concept_id": 4, "text": "placement of the gallbladder into a retrieval pouch"},
         {"concept": "phase", "concept_id": 5, "text": "haemostasis and irrigation of the liver bed"},

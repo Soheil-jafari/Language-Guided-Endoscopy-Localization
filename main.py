@@ -36,6 +36,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -298,12 +299,23 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
     threading.Thread(target=beat, daemon=True).start()
     proc = None
     timed_out = threading.Event()
+    watcher = None
 
     def watchdog():
-        if not stop.wait(timeout) and proc is not None and proc.poll() is None:
+        # The step is over only when its output has been read to the end AND its first process has ended
+        # (`stop` is set after both): a process it started can keep the output open after the first one ends.
+        if not stop.wait(timeout) and proc is not None:
             timed_out.set()
             log(f'!! {name} is still running after {timeout / 60:.0f} min: stopping it')
-            stop_process_group(proc)
+            stop_process_group(proc)                 # the whole group, even if its first process has ended
+
+    def pump(lf):
+        for line in proc.stdout:
+            line = redact(line)
+            console(line)
+            lf.write(line)
+            if on_line is not None:
+                on_line(line)
     try:
         with open(logfile, 'a') as lf:
             lf.write(f'\n===== {time.ctime()} :: {shown}\n')
@@ -312,14 +324,30 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
             proc = subprocess.Popen(cmd, cwd=REPO, env=env or stage_env(a, p), stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
                                     bufsize=1, start_new_session=hasattr(os, 'killpg'))
-            if timeout is not None:
-                threading.Thread(target=watchdog, daemon=True).start()
-            for line in proc.stdout:
-                line = redact(line)
-                console(line)
-                lf.write(line)
-                if on_line is not None:
-                    on_line(line)
+            if timeout is None:
+                pump(lf)
+            else:
+                # The output is read in a thread, so that the time limit holds even if something outside the
+                # step's process group (it left the group) keeps the output open: once the group has been
+                # stopped, such output is no longer waited for.
+                failure = []
+
+                def reader():
+                    try:
+                        pump(lf)
+                    except BaseException as e:       # noqa: BLE001  (re-raised below, in this thread)
+                        failure.append(e)
+                pumping = threading.Thread(target=reader, daemon=True)
+                pumping.start()
+                watcher = threading.Thread(target=watchdog, daemon=True)
+                watcher.start()
+                while pumping.is_alive():
+                    pumping.join(0.5)
+                    if timed_out.is_set() and not watcher.is_alive() and pumping.is_alive():
+                        log(f'!! {name}: its output is still held open by a process outside its group; not waiting')
+                        break
+                if failure:
+                    raise failure[0]
             rc = proc.wait()
     except BaseException:
         if proc is not None:                         # even if its first process has already ended
@@ -331,7 +359,9 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
         raise
     finally:
         stop.set()
-    if rc != 0:
+        if watcher is not None and timed_out.is_set():
+            watcher.join(60)                         # its SIGTERM/SIGKILL sequence ends before this step does
+    if rc != 0 or timed_out.is_set():                # stopped at the time limit: a failure, whatever its exit code
         hint = ''
         if timed_out.is_set():
             hint = f' (stopped: still running after the time limit of {timeout:.0f} s for this step)'
@@ -644,6 +674,19 @@ def resolve_settings(a):
     return a
 
 
+def record_train_attempt(p, seconds, outcome):
+    """One line per pass through a run's train stage - finished, failed or stopped - in <run>/train_attempts.jsonl,
+    so that the total compute a training used (interrupted epochs that were redone, set-up, validation) is known
+    even when it took several jobs (the stage marker only holds the last pass). Never raises."""
+    try:
+        p.run.mkdir(parents=True, exist_ok=True)
+        with open(p.run / 'train_attempts.jsonl', 'a') as f:
+            f.write(json.dumps(dict(ended=time.ctime(), seconds=round(seconds, 1), outcome=outcome,
+                                    job=os.environ.get('SLURM_JOB_ID'))) + '\n')
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
 def model_finished(p):
     """A run whose evaluation finished (its summary is rewritten on every pass, so it is not required)."""
     return p.marker('evaluate').exists() and (p.results / 'proposed_test_metrics.json').exists()
@@ -846,35 +889,85 @@ def url_file(url, p, curl=True):
 DOWNLOAD_ATTEMPTS, DOWNLOAD_PAUSE, STALL_SECONDS = 20, 15, 600
 
 
-def remote_size(url, p):
+class TimeBudget:
+    """One time limit shared by every attempt, check and pause of an operation (seconds=None: no limit)."""
+    def __init__(self, seconds=None, what='the download'):
+        self.seconds, self.what = seconds, what
+        self.end = None if seconds is None else time.monotonic() + seconds
+
+    def left(self, cap=None):
+        """Seconds the next step may take (at most `cap`); a StageError once the budget is used up."""
+        if self.end is None:
+            return cap
+        remaining = self.end - time.monotonic()
+        if remaining <= 0:
+            raise self.used_up()
+        return remaining if cap is None else min(cap, remaining)
+
+    def used_up(self):
+        return StageError(f'{self.what} did not finish within its time limit of {self.seconds / 60:.0f} min. What was '
+                          f'downloaded so far is kept: the next job (or the same command again) continues it.')
+
+
+def final_response(text):
+    """(status, header block) of the final response in curl's header output (-I / -D: one block per redirect or
+    proxy tunnel); (None, '') when there is none."""
+    blocks = [b for b in re.split(r'(?im)^(?=HTTP/)', text or '') if b.strip()]
+    final = blocks[-1] if blocks else ''
+    status = re.match(r'(?i)HTTP/\S+\s+(\d{3})', final)
+    return (int(status.group(1)) if status else None), final
+
+
+def range_total(block):
+    """The complete size a Content-Range header states ("bytes */N" or "bytes A-B/N"), or None."""
+    found = re.findall(r'(?im)^content-range:\s*bytes\s+[^/\r\n]*/(\d+)', block or '')
+    return int(found[-1]) if found else None
+
+
+def remote_size(url, p, limit=60):
     """Size of the file behind the link: the Content-Length of the final (post-redirect) response, only if
     that response is a success and not a web page (an expired link's error page, a refused HEAD request
     or a redirect must never be mistaken for the file). None when unknown: then nothing is decided by size."""
     try:
         with url_file(url, p) as conf:
-            done = subprocess.run(['curl', '-sIL', '--max-time', '60', '-K', conf], capture_output=True, text=True)
+            done = subprocess.run(['curl', '-sIL', '--max-time', str(max(1, int(limit))), '-K', conf],
+                                  capture_output=True, text=True)
     except Exception:                                           # noqa: BLE001
         return None
     if done.returncode != 0:                                    # e.g. a proxy tunnel that failed after its "200"
         return None
-    blocks = [b for b in re.split(r'(?im)^(?=HTTP/)', done.stdout) if b.strip()]
-    final = blocks[-1] if blocks else ''
-    status = re.match(r'(?i)HTTP/\S+\s+(\d{3})', final)
-    if not status or not status.group(1).startswith('2') or re.search(r'(?im)^content-type:\s*text/html', final):
+    status, final = final_response(done.stdout)
+    if status is None or not 200 <= status < 300 or re.search(r'(?im)^content-type:\s*text/html', final):
         return None
     sizes = re.findall(r'(?im)^content-length:\s*(\d+)', final)
     return int(sizes[-1]) if sizes else None
 
 
-def same_start(url, path, p):
-    """Whether the file behind the link begins with the same bytes as `path` (its first KB)."""
+def ranged_size(url, p, limit=60):
+    """Size of the file behind the link from a one-byte range request (servers that leave the size out of a
+    HEAD answer usually state it in Content-Range); None when unknown."""
+    try:
+        with url_file(url, p) as conf:
+            done = subprocess.run(['curl', '-sSL', '--max-time', str(max(1, int(limit))), '-r', '0-0', '-D', '-',
+                                   '-o', os.devnull, '-K', conf], capture_output=True, text=True)
+    except Exception:                                           # noqa: BLE001
+        return None
+    status, final = final_response(done.stdout)
+    return range_total(final) if done.returncode == 0 and status == 206 else None
+
+
+def same_bytes(url, path, p, offset=0, length=1024, limit=120):
+    """Whether the file behind the link has the same `length` bytes at `offset` as `path`: True or False, or
+    None if that could not be checked (no answer)."""
     with open(path, 'rb') as f:
-        mine = f.read(1024)
+        f.seek(offset)
+        mine = f.read(length)
     if not mine:
         return False
     try:
         with url_file(url, p) as conf:
-            proc = subprocess.Popen(['curl', '-fsSL', '--max-time', '120', '-r', f'0-{len(mine) - 1}', '-K', conf],
+            proc = subprocess.Popen(['curl', '-fsSL', '--max-time', str(max(1, int(limit))), '-r',
+                                     f'{offset}-{offset + len(mine) - 1}', '-K', conf],
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             try:
                 theirs = proc.stdout.read(len(mine))            # (a server that ignores -r sends more: not read)
@@ -882,8 +975,59 @@ def same_start(url, path, p):
                 proc.kill()
                 proc.wait()
     except Exception:                                           # noqa: BLE001
-        return False
+        return None
+    if not theirs:
+        return None
     return theirs == mine
+
+
+def same_start(url, path, p):
+    """Whether the file behind the link begins with the same bytes as `path` (its first KB)."""
+    return bool(same_bytes(url, path, p))
+
+
+def accept_if_complete(url, dest, total, p, budget):
+    """The server answered "416 range not satisfiable" to continuing `dest` after its last byte: curl 7.x fails
+    (exit code 22), curl 8.x reports success, and neither adds anything. The file is accepted as complete only
+    if the server's size equals the file's AND its first and last KB are the bytes on disk; otherwise a clear
+    error, the file kept."""
+    size = dest.stat().st_size
+    if total is None:                                   # no Content-Range in the 416: ask for the size directly
+        total = ranged_size(url, p, budget.left(60) or 60)
+    if total is None:
+        raise StageError(f'the server will not continue {dest.name} after its {size} bytes (HTTP 416) and does not say '
+                         f'how large the file is, so it cannot be checked whether the download is complete. The file '
+                         f'is kept. Check the link and run the same command again (or delete {dest} to download it '
+                         f'from the start).')
+    checks = []
+    if total == size:
+        checks = [same_bytes(url, dest, p, 0, limit=budget.left(120) or 120),
+                  same_bytes(url, dest, p, max(0, size - 1024), limit=budget.left(120) or 120)]
+        if None in checks and False not in checks:
+            raise StageError(f'{dest.name}: the server reports the size on disk ({size} bytes), but its bytes could '
+                             f'not be compared (no answer). The file is kept; run the same command again.')
+    if total != size or False in checks:
+        raise StageError(f'the link for {dest.name} no longer returns the file that was being downloaded (it now '
+                         f'returns {total} bytes, {size} are on disk; expired?). The partial download is kept. Check '
+                         f'the link and run the same command again.')
+    log(f'{dest.name}: already complete ({gb(size):.2f} GB): the server reports the same size, and the first and last '
+        f'bytes match')
+
+
+@contextlib.contextmanager
+def private_file(p, prefix):
+    """An empty private (0600) temporary file in <root>/tmp, removed afterwards (e.g. curl's response headers,
+    which can name a signed link)."""
+    p.tmp.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix='.txt', dir=p.tmp)
+    os.close(fd)
+    try:
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def is_web_page(path):
@@ -897,9 +1041,11 @@ def web_page_error(name):
                       f'expired link). Give a direct download link and run the same command again.')
 
 
-def download(url, dest, a, p, name):
+def download(url, dest, a, p, name, limit=None):
     """Resumable download. Safe to call again after an interruption: a finished file (recorded in
-    <file>.complete) is reused, a partial one is continued. Never touches the network with --offline."""
+    <file>.complete) is reused, a partial one is continued. Never touches the network with --offline.
+    `limit` (seconds): one time budget for all of it - every attempt, check and pause (model downloads; the
+    dataset has none)."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     complete = dest.with_name(dest.name + '.complete')
@@ -918,7 +1064,10 @@ def download(url, dest, a, p, name):
                          f'--to-stage fetch_data, or give a local file (--weights-path / --data-zip / --data-dir).')
     if not url:
         raise StageError(f'{dest.name} is missing and no download link was given.')
-    _download(url, dest, a, p, name)
+    if limit is None:
+        _download(url, dest, a, p, name)
+    else:
+        _download(url, dest, a, p, name, TimeBudget(limit, f'the download of {dest.name}'))
     if is_web_page(dest):
         dest.unlink()
         raise web_page_error(dest.name)
@@ -940,7 +1089,8 @@ def discard_download(path, keep=True):
     return None
 
 
-def _download(url, dest, a, p, name):
+def _download(url, dest, a, p, name, budget=None):
+    budget = budget or TimeBudget()
     if any(h in url for h in ('drive.google.com', 'docs.google.com')):
         if shutil.which('gdown') is None and subprocess.run([sys.executable, '-m', 'gdown', '--version'],
                                                             capture_output=True).returncode != 0:
@@ -963,10 +1113,15 @@ def _download(url, dest, a, p, name):
                 'accepted = inspect.signature(gdown.download).parameters\n'
                 'kw = {k: v for k, v in wanted.items() if k in accepted}\n'
                 'sys.exit(0 if gdown.download(os.environ["LGEL_GDOWN_URL"], sys.argv[1], **kw) else 1)\n')
-        run([sys.executable, '-c', code, dest], a, p, name, progress_path=dest, env=env)
+        try:
+            run([sys.executable, '-c', code, dest], a, p, name, progress_path=dest, env=env, timeout=budget.left())
+        except StageError as e:
+            if getattr(e, 'timed_out', False):          # gdown keeps its partial data for the next attempt
+                raise budget.used_up() from e
+            raise
         return
     if shutil.which('curl'):
-        total = remote_size(url, p)
+        total = remote_size(url, p) if budget.end is None else remote_size(url, p, budget.left(60))
         if dest.exists() and total is not None:
             if dest.stat().st_size == total:
                 log(f'{dest.name} already fully downloaded ({gb(total):.2f} GB)')
@@ -987,27 +1142,44 @@ def _download(url, dest, a, p, name):
         fresh = dest.with_name(dest.name + '.restart')
         fresh.unlink(missing_ok=True)                       # an unfinished copy of that kind cannot be continued
         resumable = True
-        with url_file(url, p) as conf:
+        with url_file(url, p) as conf, private_file(p, '.headers-') as headers:
             for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+                limit = budget.left()
                 target = dest if resumable else fresh
                 if not resumable:
                     fresh.unlink(missing_ok=True)
                 before = dest.stat().st_size if (resumable and dest.exists()) else None
+                Path(headers).write_text('')                # this attempt's response headers only
+                failure = None
                 try:
-                    run(base + (['-C', '-'] if resumable else []) + ['-o', target, '-K', conf], a, p, name,
-                        progress_path=target)
+                    run(base + (['-C', '-'] if resumable else []) + ['-D', headers, '-o', target, '-K', conf], a, p,
+                        name, progress_path=target, timeout=limit)
                 except StageError as e:
-                    code = getattr(e, 'rc', None)
+                    failure = e
+                try:
+                    status, response = final_response(Path(headers).read_text(errors='replace'))
+                except OSError:
+                    status, response = None, ''
+                if resumable and status == 416 and dest.exists() and dest.stat().st_size > 0:
+                    # Nothing after the bytes on disk: finished earlier (only its marker was lost), or the link
+                    # now returns something else. Decided by size and content - never by curl's exit code.
+                    accept_if_complete(url, dest, range_total(response), p, budget)
+                    break
+                if failure is not None:
+                    if getattr(failure, 'timed_out', False):
+                        fresh.unlink(missing_ok=True)
+                        raise budget.used_up() from failure
+                    code = getattr(failure, 'rc', None)
                     if attempt == DOWNLOAD_ATTEMPTS:
                         fresh.unlink(missing_ok=True)
-                        raise
+                        raise failure
                     if code == 33 and resumable:
                         log('the server does not continue a partial download: fetching a complete new copy')
                         resumable = False
                         continue
-                    log(f'download interrupted (curl exit code {code}); continuing in {DOWNLOAD_PAUSE} s '
-                        f'(attempt {attempt + 1} of {DOWNLOAD_ATTEMPTS})')
-                    time.sleep(DOWNLOAD_PAUSE)
+                    log(f'download interrupted (curl exit code {code}' + (f', HTTP {status}' if status else '') +
+                        f'); continuing in {DOWNLOAD_PAUSE} s (attempt {attempt + 1} of {DOWNLOAD_ATTEMPTS})')
+                    time.sleep(budget.left(DOWNLOAD_PAUSE) if budget.end is not None else DOWNLOAD_PAUSE)
                     continue
                 if not resumable:
                     if not fresh.exists() or is_web_page(fresh):
@@ -1020,7 +1192,7 @@ def _download(url, dest, a, p, name):
                             raise StageError(f'the new copy of {dest.name} has {got} bytes, but the server announced '
                                              f'{total}. The partial download is kept. Run the same command again.')
                         log(f'the new copy has {got} of {total} bytes; trying again in {DOWNLOAD_PAUSE} s')
-                        time.sleep(DOWNLOAD_PAUSE)
+                        time.sleep(budget.left(DOWNLOAD_PAUSE) if budget.end is not None else DOWNLOAD_PAUSE)
                         continue
                     os.replace(fresh, dest)
                 elif total is None and before and dest.stat().st_size == before and not same_start(url, dest, p):
@@ -1037,8 +1209,13 @@ def _download(url, dest, a, p, name):
                              f'Run the same command again to continue.')
     elif shutil.which('wget'):
         with url_file(url, p, curl=False) as listing:
-            run(['wget', '-nv', '-c', '--tries=20', '--waitretry=15', '-O', dest, '-i', listing], a, p, name,
-                progress_path=dest)
+            try:
+                run(['wget', '-nv', '-c', '--tries=20', '--waitretry=15', '-O', dest, '-i', listing], a, p, name,
+                    progress_path=dest, timeout=budget.left())
+            except StageError as e:
+                if getattr(e, 'timed_out', False):
+                    raise budget.used_up() from e
+                raise
     else:
         raise StageError('Neither curl, wget nor gdown is available to download files.')
 
@@ -1053,7 +1230,8 @@ def stage_fetch_weights(a, p):
             raise StageError(f'--weights-path not found: {a.weights_path}')
         weights = str(Path(a.weights_path).resolve())
     else:
-        download(a.weights_url, p.weights, a, p, 'fetch_weights')   # continues a partial file; instant if complete
+        download(a.weights_url, p.weights, a, p, 'fetch_weights',   # continues a partial file; instant if complete
+                 limit=FETCH_TIMEOUT)
         weights = str(p.weights)
     # Build the real model once: this is the only place a wrong checkpoint would surface, and it
     # is far better to learn that now than after hours of frame extraction.
@@ -1141,14 +1319,15 @@ REHEARSAL_TIMEOUT = 900                                    # seconds per model (
 CHECK_TIMEOUT = 3600                                       # the GPU check, the model checks (normally minutes)
 FETCH_TIMEOUT = 7200                                       # model downloads, the SurgVLP environment (resumable)
 # The code that decides what the rehearsed models allocate (sizes, crop, clip, layers, losses).
-REHEARSAL_CODE = ('main.py', 'project_config.py', 'models.py', 'losses.py', 'backbone/vision_transformer.py',
+REHEARSAL_CODE = ('main.py', 'train.py', 'project_config.py', 'models.py', 'losses.py', 'backbone/vision_transformer.py',
                   'backbone/endomamba.py', 'paper_protocol.py', 'comparison_models/rehearsal.py',
                   'comparison_models/closedset/closedset.py', 'comparison_models/tecno/tecno.py')
 
 
 def rehearsal_signature(a, gpu, amp):
     """Everything a passed rehearsal depends on: a rehearsal is repeated when any of it differs (another GPU
-    type, training batch, precision, text encoder, model flags or sizes in the code, PyTorch or Mamba)."""
+    type, training batch or accumulation, precision, text encoder, model flags or sizes in the code, the training
+    loop, PyTorch or Mamba)."""
     import hashlib
     import torch
     from importlib import metadata
@@ -1161,7 +1340,8 @@ def rehearsal_signature(a, gpu, amp):
     except Exception:                                   # noqa: BLE001  (the functional check has reported it)
         mamba = None
     tecno = protocol.COMPARISONS['tecno']
-    return dict(gpu=gpu, batch=int(a.batch_size), amp=amp, text_model=a.text_model, advanced_flags=ADVANCED_FLAGS,
+    return dict(gpu=gpu, batch=int(a.batch_size), accumulation=int(getattr(a, 'accum', 1) or 1),
+                rehearsed_accumulation=REHEARSAL_ACCUMULATION, amp=amp, text_model=a.text_model, advanced_flags=ADVANCED_FLAGS,
                 closedset_batch=int(protocol.COMPARISONS['closedset']['batch_size']),
                 tecno_batch=int(tecno['cnn_batch_size']), tecno_size=int(tecno['input_size']),
                 torch=torch.__version__, mamba_ssm=mamba, code_sha256=code.hexdigest())
@@ -1231,14 +1411,22 @@ def rehearse_comparisons(a, p):
     return results
 
 
+REHEARSAL_ACCUMULATION = 2      # micro-batches per optimiser step in the advanced-model check (see below)
+
+
 def _check_advanced(cfg_path, batch=2, report=None):
-    """Internal (subprocess): training steps of the advanced model on random data - forward, loss (with the
-    optical-flow network), backward and an AdamW step, as train.py. batch 2: the functional check of every job;
-    with the training batch and `report`, the full-size memory rehearsal (rehearse_comparisons)."""
+    """Internal (subprocess): training steps of the advanced model on random data with train.py's own training
+    loop (train_one_epoch): two optimiser steps of REHEARSAL_ACCUMULATION accumulated micro-batches each -
+    forward, loss (with the optical-flow network), backward, gradients kept between micro-batches, AdamW step.
+    That is the allocation pattern of training: from the second step on, the optimiser state and the gradients
+    of the earlier micro-batches are held while a micro-batch runs (more micro-batches per step add no memory).
+    Then one evaluation-mode forward pass, measured separately. batch 2: the functional check of every job; with
+    the training batch and `report`, the full-size memory rehearsal (rehearse_comparisons)."""
     import time as _time
     import torch
     from project_config import config
     _apply_overrides(config, json.loads(Path(cfg_path).read_text()))
+    config.TRAIN.GRADIENT_ACCUMULATION_STEPS = REHEARSAL_ACCUMULATION
     from losses import MasterLoss
     try:                                                        # works without a GPU: fetched once, then cached
         with download_timeout():                                # (TORCH_HOME = <root>/torch_cache)
@@ -1262,6 +1450,7 @@ def _check_advanced(cfg_path, batch=2, report=None):
     print(f'mamba_ssm {mamba_ssm.__version__}, torch {torch.__version__}, '
           f'{"GPU " + torch.cuda.get_device_name(0) if cuda else "CPU (test)"}', flush=True)
     from models import LocalizationFramework
+    from train import train_one_epoch
     torch.manual_seed(0)
     torch.backends.cudnn.benchmark = False                      # as train.py
     torch.backends.cudnn.deterministic = True
@@ -1282,60 +1471,84 @@ def _check_advanced(cfg_path, batch=2, report=None):
     target[-1, 0] = -100                                        # an unlabelled frame, as in real windows
     dtype = torch.bfloat16 if config.TRAIN.AMP_DTYPE == 'bf16' else torch.float16
     scaler = torch.amp.GradScaler('cuda', enabled=cuda and dtype == torch.float16)
+    mixers = [m for m in model.temporal_head.modules() if type(m).__name__ == 'Mamba']
+    reached = []                                                # did a non-zero gradient reach the Mamba layers?
+    for m in mixers:
+        for q in m.parameters():
+            if q.requires_grad:
+                q.register_hook(lambda g: reached.append(bool(g.abs().sum() > 0)))
+
+    class Recorder:
+        """The loss train_one_epoch calls, recording (detached) what the checks below need."""
+        def __init__(self, inner):
+            self.inner, self.config, self.values, self.evidence = inner, inner.config, None, None
+
+        def __call__(self, outputs, clip, labels):
+            loss, primary, regularizer = self.inner(outputs, clip, labels)
+            self.values = (float(loss), float(primary), float(regularizer))
+            self.evidence = outputs[-1].detach() if outputs[-1] is not None else None
+            return loss, primary, regularizer
+    recorder = Recorder(criterion)
+    micro = dict(video_clip=video, labels=target, input_ids=text['input_ids'], attention_mask=text['attention_mask'])
     if cuda:
         torch.cuda.reset_peak_memory_stats()
+    problems = []
     try:
-        for step in range(2):                                   # (the optimiser state exists from the first step)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=dev, dtype=dtype, enabled=cuda):
-                outputs = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))
-                loss, primary, regularizer = criterion(outputs, video, target)
-            scaler.scale(loss).backward()
-            if step == 0:
-                mixers = [m for m in model.temporal_head.modules() if type(m).__name__ == 'Mamba']
-                mamba_grad = any(q.grad is not None and bool(q.grad.abs().sum() > 0) for m in mixers for q in m.parameters())
-            scaler.step(optimizer)
-            scaler.update()
+        try:                                                    # 2 optimiser steps x REHEARSAL_ACCUMULATION
+            train_one_epoch(model, [micro] * (2 * REHEARSAL_ACCUMULATION), optimizer, recorder, None, dev, scaler,
+                            amp_dtype=dtype)
+        except FloatingPointError as e:
+            problems.append(f'non-finite loss ({e})')
         if cuda:
             torch.cuda.synchronize()
+        peak = gb(torch.cuda.max_memory_allocated()) if cuda else 0.0
+        reserved = gb(torch.cuda.max_memory_reserved()) if cuda else 0.0
+        # Validation and prediction run the model in eval mode, without autocast and without gradients (with the
+        # optimiser state still allocated, as during training): measured on their own.
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
+        model.eval()
+        with torch.no_grad():
+            scores = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))[0]
+        if cuda:
+            torch.cuda.synchronize()
+        eval_peak = gb(torch.cuda.max_memory_allocated()) if cuda else 0.0
+        reserved = max(reserved, gb(torch.cuda.max_memory_reserved()) if cuda else 0.0)
     except torch.cuda.OutOfMemoryError as e:
         print(f'ADVANCED MODEL OUT OF GPU MEMORY at batch {batch}: {e}', flush=True)
         if report:
             Path(report).write_text(json.dumps({'advanced': dict(ok=False, error=f'out of GPU memory at batch {batch}')}))
         sys.exit(1)
-    peak, reserved = (gb(torch.cuda.max_memory_allocated()), gb(torch.cuda.max_memory_reserved())) if cuda else (0.0, 0.0)
-    evidence = outputs[-1]
-    problems = []
-    if not torch.isfinite(loss):
-        problems.append(f'non-finite loss {float(loss)}')
+    loss, primary, regularizer = recorder.values or (math.nan, math.nan, math.nan)
+    evidence = recorder.evidence
+    if not math.isfinite(loss):
+        problems.append(f'non-finite loss {loss}')
     if evidence is None or tuple(evidence.shape) != (batch, length, 2) or bool((evidence < 0).any()):
         problems.append('the uncertainty (evidence) output is missing or malformed')
-    if not float(regularizer) > 0:
+    if not regularizer > 0:
         problems.append('the bi-level consistency loss is not active')
     if model.language_guided_head.confidence_module is None:
         problems.append('confidence fusion is not active')
     if not mixers:
         problems.append('the temporal head has no official Mamba layers')
-    if not mamba_grad:
+    if not any(reached):
         problems.append('no gradient reaches the Mamba layers')
-    # Validation and prediction run the model in eval mode, without autocast and without gradients.
-    model.eval()
-    with torch.no_grad():
-        scores = model(video, text['input_ids'].to(dev), text['attention_mask'].to(dev))[0]
     if not bool(torch.isfinite(scores).all()) or bool((scores < 0).any()) or bool((scores > 1).any()):
         problems.append('the evaluation-mode forward pass does not give probabilities in [0, 1]')
     if report:
         Path(report).write_text(json.dumps({'advanced': dict(
-            ok=not problems, error='; '.join(problems) or None, peak_gb=round(peak, 2), reserved_gb=round(reserved, 2),
-            seconds=round(_time.time() - started, 1),
+            ok=not problems, error='; '.join(problems) or None, peak_gb=round(peak, 2),
+            eval_peak_gb=round(eval_peak, 2), reserved_gb=round(reserved, 2), seconds=round(_time.time() - started, 1),
             what=f'our advanced model, batch {batch} x {length} frames, {size} px, {config.TRAIN.AMP_DTYPE}, with the '
-                 f'optical-flow loss and an AdamW step')}, indent=2))
+                 f'optical-flow loss: train.py\'s training loop, 2 AdamW steps of {REHEARSAL_ACCUMULATION} accumulated '
+                 f'micro-batches; then an evaluation-mode forward pass (peak measured separately)')}, indent=2))
     if problems:
         print('ADVANCED MODEL CHECK FAILED: ' + '; '.join(problems), flush=True)
         sys.exit(1)
     print(f'advanced model OK: Mamba head ({len(mixers)} layers), uncertainty, confidence fusion and bi-level loss '
-          f'(loss {float(loss):.3f} = {float(primary):.3f} + {float(regularizer):.3f}); two training steps with batch '
-          f'{batch} used {peak:.1f} GB of GPU memory ({reserved:.1f} GB reserved)', flush=True)
+          f'(loss {loss:.3f} = {primary:.3f} + {regularizer:.3f}); training with batch {batch} (2 optimiser steps of '
+          f'{REHEARSAL_ACCUMULATION} accumulated micro-batches) used {peak:.1f} GB of GPU memory, the evaluation '
+          f'forward pass {eval_peak:.1f} GB ({reserved:.1f} GB reserved)', flush=True)
 
 
 MAMBA_MISSING, FLOW_WEIGHTS_MISSING = 3, 4
@@ -1806,7 +2019,8 @@ def recover_unresumable_run(p):
 def training_finished(a, p):
     """Has this run's training already finished (its model would only be re-checked, never retrained)?"""
     if getattr(a, 'kind', 'proposed') != 'proposed':
-        return p.run.exists() and any(p.run.glob('*/FINISHED.json'))
+        last = COMPARISON_METHODS.get(a.kind, {}).get('trained')     # the folder of its LAST training stage
+        return last is not None and finished_marker(p.run / last).exists()   # (TeCNO: the TCN, not the CNN)
     return (p.run / 'latest_model.pth').exists() and completed_epochs(p) >= a.epochs
 
 
@@ -2086,7 +2300,8 @@ def peskavlp_weights(a, p, model='PeskaVLP'):
         raise StageError(f'unknown SurgVLP-family model {model!r}')
     folder = p.root / 'comparisons' / model.lower()
     download_path = folder / f'{model}.download'
-    download(protocol.SURGVLP['weights_urls'][model], download_path, a, p, f'{model.lower()}_weights')
+    download(protocol.SURGVLP['weights_urls'][model], download_path, a, p, f'{model.lower()}_weights',
+             limit=FETCH_TIMEOUT)                         # one budget for every attempt (the partial file is kept)
     if not zipfile.is_zipfile(download_path):
         return download_path                              # a plain checkpoint file
     unpacked = folder / 'unpacked'
@@ -2325,17 +2540,19 @@ def tecno_predict(a, p, sets):
         p.run / 'tecno_features', '--work-order', order, '--output', scores])
 
 
+# trained: the folder (in the run's folder) whose FINISHED.json marks the end of the method's training (its last
+# stage); zero-shot methods train nothing.
 COMPARISON_METHODS = {
     'clip_zeroshot': dict(train=clip_train, predict=clip_predict),
-    'xclip_finetune': dict(train=xclip_train, predict=xclip_predict),
+    'xclip_finetune': dict(train=xclip_train, predict=xclip_predict, trained='xclip'),
     **{kind: dict(train=surgvlp_zeroshot_train, predict=lambda a, p, sets: peskavlp_predict(a, p, sets))
        for kind in protocol.SURGVLP_ZERO_SHOT},
-    'peskavlp_finetune': dict(train=peskavlp_finetune_train,
+    'peskavlp_finetune': dict(train=peskavlp_finetune_train, trained='peskavlp',
                               predict=lambda a, p, sets: peskavlp_predict(a, p, sets, p.run / 'peskavlp' / 'best.pt')),
-    'univtg': dict(train=univtg_train, predict=univtg_predict),
-    'tecno': dict(train=tecno_train, predict=tecno_predict),
-    'closedset': dict(train=closedset_train, predict=closedset_predict),
-    'closedset_matched': dict(train=closedset_train, predict=closedset_predict),
+    'univtg': dict(train=univtg_train, predict=univtg_predict, trained='univtg'),
+    'tecno': dict(train=tecno_train, predict=tecno_predict, trained='tecno_tcn'),
+    'closedset': dict(train=closedset_train, predict=closedset_predict, trained='closedset'),
+    'closedset_matched': dict(train=closedset_train, predict=closedset_predict, trained='closedset'),
 }
 
 
@@ -2539,7 +2756,7 @@ def _bundle_candidates(ps):
     ps = ps if isinstance(ps, (list, tuple)) else [ps]
     p = ps[0]
     paper = p.root / 'paper'
-    first = [paper / 'PAPER_RESULTS.md', paper / 'analysis.json'] if paper.exists() else []
+    first = [paper / 'STATUS.md', paper / 'PAPER_RESULTS.md', paper / 'analysis.json'] if paper.exists() else []
     first += sorted((p.root / 'results').glob('*_COMPARISON.md')) if (p.root / 'results').exists() else []
     for q in ps:
         first += [q.results / n for n in ('SUMMARY.md', 'summary.json', 'proposed_calibration.json',
@@ -2806,8 +3023,8 @@ def main(argv=None):
         except ValueError:                                # not the main thread (tests)
             pass
     rc = 1
+    failed = []
     try:
-        failed = []
         for i, (sub, sp) in enumerate(plans):
             if len(plans) > 1:
                 log(f'##### run {i + 1} of {len(plans)}: {sub.label} (run {sub.run_name})')
@@ -2820,9 +3037,12 @@ def main(argv=None):
                 stages = ['summary']
             # data stages are redone (--force) once; run stages for every model
             rc_run = _drive(sub, sp, stages, redo if i == 0 else [s for s in redo if s in RUN_SCOPED])
+            if rc_run != 0:
+                failed.append(sub.run_name)
+            if paper:
+                paper_status(a, plans, failed)                  # current after every run (cheap: file checks)
             if rc_run == 0:
                 continue
-            failed.append(sub.run_name)
             if paper and getattr(sub, 'failed_stage', None) in RUN_OWN_FAILURES:
                 # Only this run is affected (e.g. a comparison method's download failed): the protocol goes on
                 # with the next run, and this one is retried when the same command is submitted again.
@@ -2833,6 +3053,7 @@ def main(argv=None):
         rc = 1 if failed else 0
         if paper and selected[-1] == STAGES[-1] and data_prepared(p):
             rc = max(rc, paper_outputs(a, plans))
+            paper_status(a, plans, failed)
             if failed:
                 log(f'!! {len(failed)} run(s) did not finish in this job: {failed}. Submit the same command again '
                     f'(finished runs are not repeated).')
@@ -2845,6 +3066,11 @@ def main(argv=None):
     except SystemExit as e:
         rc = e.code if isinstance(e.code, int) else 1
         log(f'!! stopped (exit code {rc}); resubmit the same command to continue')
+        if paper:
+            # No analysis in the last minutes before the time limit (the report bundle comes first): the status
+            # page says what has finished, and the next job rewrites the tables and figures.
+            paper_status(a, plans, failed, note=f'This job was stopped (exit code {rc}) before its end: the tables and '
+                                                f'figures were not rewritten; the next job does that.')
         raise
     finally:
         for s in previous:
@@ -2862,6 +3088,60 @@ RUN_OWN_FAILURES = RUN_SCOPED | {'summary', 'duplicate'}
 
 def data_prepared(p):
     return all(p.marker(s).exists() for s in STAGES[1:STAGES.index('train')] if s not in ALWAYS_RUN)
+
+
+def paper_status(a, plans, failed=(), note=None):
+    """The current state of the paper protocol in <root>/paper/STATUS.md (and status.json): every run's state,
+    when the tables and figures (PAPER_RESULTS.md) were last written and from how many finished runs, and how
+    the last analysis went. Cheap - file checks only, no GPU, no statistics - so it is written after every run,
+    at the end of every job and when a job is stopped (which leaves the full analysis to the next job).
+    Never raises: a status page must not cost a run."""
+    try:
+        p = plans[0][1]
+        rows, finished = [], 0
+        for sub, sp in plans:
+            if model_finished(sp):
+                state, finished = 'finished', finished + 1
+            elif sub.run_name in failed:
+                state = 'failed in this job (retried by the next job)'
+            elif sp.run_inputs.exists():
+                state = 'started'
+            else:
+                state = 'to do'
+            rows.append(dict(run=sub.run_name, method=sub.label, state=state))
+        try:
+            last = json.loads((p.paper / 'analysis_status.json').read_text())
+            last = last if isinstance(last, dict) else {}
+        except (OSError, ValueError):
+            last = {}
+        lines = ['# Paper protocol: status', '',
+                 f'Written {time.ctime()} (job {os.environ.get("SLURM_JOB_ID") or "-"}). Runs finished: '
+                 f'**{finished} of {len(plans)}**.', '']
+        if note:
+            lines += [f'**{note}**', '']
+        if last.get('generated'):
+            analysed = last.get('analysed')
+            lines += [f'Last analysis (paper_analysis.py): {last["generated"]}, '
+                      + (f'**failed**: {last.get("error")}. PAPER_RESULTS.md is from the last analysis that succeeded.'
+                         if not last.get('ok') else
+                         f'{analysed} finished run(s) in the tables'
+                         + (f'; {finished - analysed} run(s) finished since then are not in them yet.'
+                            if isinstance(analysed, int) and analysed < finished else '.'))]
+            for name, why in (last.get('excluded') or {}).items():
+                lines.append(f'* left out of the tables: {name} - {why}')
+            lines.append('')
+        else:
+            lines += ['The tables and figures (PAPER_RESULTS.md) have not been written yet.', '']
+        lines += ['| # | Run | Method | State |', '|---|---|---|---|']
+        lines += [f'| {i} | {r["run"]} | {r["method"]} | {r["state"]} |' for i, r in enumerate(rows, 1)]
+        p.paper.mkdir(parents=True, exist_ok=True)
+        tmp = p.paper / f'.STATUS.md.{os.getpid()}.tmp'
+        tmp.write_text('\n'.join(lines) + '\n')
+        os.replace(tmp, p.paper / 'STATUS.md')
+        write_json(p.paper / 'status.json', dict(written=time.ctime(), finished=finished, runs=rows, note=note,
+                                                 last_analysis=last or None))
+    except Exception as e:                                  # noqa: BLE001
+        log(f'!! could not write the status page ({e!r})')
 
 
 def paper_outputs(a, plans):
@@ -3032,21 +3312,27 @@ def _drive_stages(a, p, selected, redo):
         t0 = time.time()
         # The step logs of a run's own stages go to logs/<run>/ (the data stages' to logs/).
         p.log_scope = a.run_name if stage in RUN_SCOPED or stage == 'summary' else None
+        outcome = 'stopped'
         try:
             funcs[stage](a, p)
+            outcome = 'finished'
         except StageError as e:
+            outcome = 'failed'
             log(f'!! stage {stage} FAILED: {e}')
             log('   Fix the cause and run the same command again: finished stages are skipped and '
                 'training resumes from its last finished epoch.')
             a.failed_stage = stage
             return 1
         except Exception as e:                                  # noqa: BLE001
+            outcome = 'failed'
             import traceback
             log(f'!! stage {stage} crashed: {e!r}\n{traceback.format_exc()}')
             a.failed_stage = stage
             return 1
         finally:
             p.log_scope = None
+            if stage == 'train':
+                record_train_attempt(p, time.time() - t0, outcome)
         if stage not in ALWAYS_RUN:
             write_json(marker, dict(signature=sig, finished=time.ctime(), seconds=round(time.time() - t0)))
         log(f'== {stage}: finished in {(time.time() - t0) / 60:.1f} min')

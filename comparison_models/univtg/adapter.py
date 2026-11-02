@@ -20,9 +20,12 @@ Deviations from the published QVHighlights recipe, and why (our videos are 30-10
     and clipped to the video duration (UniVTG assumes the two are equal);
   * video-query pairs without any positive clip are not used for training (UniVTG's data has none) but are
     scored like every other pair at evaluation;
-  * every training mini-batch holds different query sentences. Our data has only 14 sentences, and UniVTG's
-    in-batch contrastive saliency loss treats the other queries of a batch as negatives, which is only
-    valid when they differ (in QVHighlights every query is unique);
+  * every training mini-batch holds different query sentences (our data has only 14), and UniVTG's in-batch
+    contrastive (inter-video saliency) loss leaves out the cross pairs that are not negatives: our concepts
+    co-occur (a phase and several tools at once), so another sentence is a negative for a sample's anchor
+    clip only if its concept is known to be absent from every frame of that clip (present or unannotated
+    there: the pair is masked out, in both directions; masked_inter_loss). In QVHighlights every query is
+    unique and describes one moment, so the official loss needs no mask;
   * the best epoch is chosen on the validation videos by window mAP (mean over tIoU 0.3, 0.5, 0.7).
 Everything else (architecture, losses and their weights, optimiser, learning-rate schedule, dropout,
 feature normalisation, temporal-element features, NMS threshold) follows the published QVHighlights
@@ -52,7 +55,7 @@ from comparison_models.frame_scores import manifest_pairs  # noqa: E402
 from metrics import temporal_ap  # noqa: E402
 from checkpoint_utils import atomic_write_text, commit_best, pending_best_path  # noqa: E402
 
-SCHEMA = 'univtg-adapter-2'
+SCHEMA = 'univtg-adapter-3'               # 3: masked inter-video negatives
 # Official QVHighlights fine-tuning settings (scripts/qvhl_pretrain.sh, main/config.py defaults), except as noted above.
 OFFICIAL = dict(dset_type='mr', train_path='ours', model_id='univtg', span_loss_type='l1', hidden_dim=1024,
                 enc_layers=4, dec_layers=2, dim_feedforward=1024, nheads=8, input_dropout=0.5, dropout=0.0,
@@ -100,6 +103,36 @@ def l2_normalize(x, eps=1e-5):
 
 
 # --------------------------------------------------------------------------- features
+def feature_record(out, weights_sha, sample_fps):
+    """features.json: what made the cached features in `out` (backbone weights, frame rate). Features of other
+    weights or another frame rate are refused. A record that cannot be read (e.g. a stop while it was written)
+    leaves the cached features' origin unknown: they are moved aside (never given this record's provenance) and
+    computed again. Written atomically, and only when it changes."""
+    out = Path(out)
+    info = out / 'features.json'
+    wanted = dict(weights_sha256=weights_sha, sample_fps=sample_fps, dim=VIDEO_DIM,
+                  description='M2CRL (pretrained, frozen) per-frame mean of patch tokens')
+    old = None
+    if info.exists():
+        try:
+            old = json.loads(info.read_text())
+            if not isinstance(old, dict):
+                raise ValueError('not a JSON object')
+        except (OSError, ValueError) as e:
+            aside = out / f'unverified-{time.strftime("%Y%m%d-%H%M%S")}-{os.getpid()}'
+            aside.mkdir()
+            for f in [info, *out.glob('*.npy')]:
+                os.replace(f, aside / f.name)
+            print(f'{info} could not be read ({e}): its features were moved to {aside} and are computed again',
+                  flush=True)
+            old = None
+        if old is not None and (old.get('weights_sha256') != weights_sha or old.get('sample_fps') != sample_fps):
+            raise ValueError(f'{out} holds features of other backbone weights or another frame rate; use a new folder')
+    if old != wanted:
+        atomic_write_text(info, json.dumps(wanted))
+    return wanted
+
+
 def video_features(args):
     """Per-second M2CRL features, one .npy per video (float16, frames x 768); finished videos are skipped."""
     from project_config import config
@@ -109,13 +142,7 @@ def video_features(args):
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     weights_sha = file_sha(args.weights) if args.weights else 'random-init'      # (--random-init runs)
-    info = out / 'features.json'
-    if info.exists():
-        old = json.loads(info.read_text())
-        if old.get('weights_sha256') != weights_sha or old.get('sample_fps') != args.sample_fps:
-            raise ValueError(f'{out} holds features of other backbone weights or another frame rate; use a new folder')
-    info.write_text(json.dumps(dict(weights_sha256=weights_sha, sample_fps=args.sample_fps, dim=VIDEO_DIM,
-                                    description='M2CRL (pretrained, frozen) per-frame mean of patch tokens')))
+    feature_record(out, weights_sha, args.sample_fps)
     config.MODEL.M2CRL_WEIGHTS_PATH = str(args.weights or '')                 # '' = random initialisation
     config.MODEL.TEXT_ENCODER_MODEL = args.text_model
     config.TRAIN.DEVICE = args.device
@@ -189,7 +216,7 @@ def build_samples(triplets, metadata, annotations, feature_dir, text_file, clip_
     meta = load_video_metadata(metadata)
     index = AnnotationIndex(annotations)
     texts = torch.load(text_file, map_location='cpu', weights_only=False)
-    cache, samples = {}, []
+    cache, samples, not_negative = {}, [], {}
     for (video, query), spec in manifest_pairs(triplets).items():
         m = meta[video]
         grid = sample_indices(m['frame_count'], m['source_fps'], sample_fps)
@@ -201,11 +228,14 @@ def build_samples(triplets, metadata, annotations, feature_dir, text_file, clip_
             pooled = np.stack([feats[c * clip_frames:(c + 1) * clip_frames].mean(0) for c in range(n_clips)])
             cache[video] = l2_normalize(pooled)
         labels = np.asarray([index.label(video, int(i), spec) for i in grid])
-        clip_labels = []
+        clip_labels, unsure = [], []
         for c in range(len(cache[video])):
             part = labels[c * clip_frames:(c + 1) * clip_frames]
             seen = part[part != -100]
             clip_labels.append(int(len(seen) > 0 and seen.mean() >= 0.5))
+            unsure.append(bool(len(seen) == 0 or (seen == 1).any()))   # present in a frame, or not annotated
+        # (shared by every sample of this video: which of its clips may NOT serve as a negative for `query`)
+        not_negative.setdefault(video, {})[query] = np.asarray(unsure)
         windows, start = [], None
         for c, v in enumerate(clip_labels + [0]):              # runs of positive clips, in clip units
             if v and start is None:
@@ -219,7 +249,7 @@ def build_samples(triplets, metadata, annotations, feature_dir, text_file, clip_
             raise ValueError(f'no text features for {query!r}')
         samples.append(dict(video=video, query=query, vfeat=cache[video], tfeat=l2_normalize(texts[query].astype(np.float32)),
                             windows=windows, grid=grid, labels=labels, source_fps=m['source_fps'],
-                            duration=m['frame_count'] / m['source_fps']))
+                            duration=m['frame_count'] / m['source_fps'], not_negative=not_negative.setdefault(video, {})))
     return samples
 
 
@@ -274,14 +304,60 @@ def batch_inputs(samples, device, rng=None):
                    span_labels_nn=pad([t['span_labels_nn'] for t in parts])[0].to(device),
                    saliency_scores=pad([t['saliency_scores'] for t in parts])[0].to(device),
                    saliency_pos_labels=torch.LongTensor([t['saliency_pos_labels'] for t in parts]).to(device))
+    anchors = [t['saliency_pos_labels'][0] for t in parts]
+    targets['inter_valid'] = torch.from_numpy(inter_negatives(samples, anchors)).to(device)
     return inputs, targets
+
+
+def inter_negatives(samples, anchors):
+    """valid[i, j]: may sample j's sentence serve as a negative for sample i's anchor clip (and that clip as a
+    negative for sentence j) in the inter-video contrastive loss? Only if sentence j's concept is known to be
+    absent from every frame of that clip; the diagonal (the positive pairs) is always kept. Our concepts are not
+    mutually exclusive - a phase and several tools are present at once - so a different sentence alone does not
+    make a negative."""
+    n = len(samples)
+    valid = np.eye(n, dtype=bool)
+    for i, (s, c) in enumerate(zip(samples, anchors)):
+        for j, t in enumerate(samples):
+            if i != j:
+                flags = s.get('not_negative', {}).get(t['query'])
+                valid[i, j] = flags is not None and c < len(flags) and not bool(flags[c])
+    return valid
 
 
 def build(args_dict, device):
     from model.univtg import build_model
     opt = SimpleNamespace(**OFFICIAL, **args_dict, device=device, v_feat_dim=VIDEO_DIM + 2, t_feat_dim=TEXT_DIM)
     model, criterion = build_model(opt)
-    return model.to(device), criterion.to(device), opt
+    return model.to(device), masked_inter_loss(criterion).to(device), opt
+
+
+def masked_inter_loss(criterion):
+    """The official SetCriterion with one change, made here (official/ stays unmodified): its inter-video saliency
+    loss (an InfoNCE over the anchor clips and sentences of a batch, in both directions) leaves out the pairs that
+    targets['inter_valid'] marks as not being negatives (inter_negatives). Without the mask it is computed exactly
+    as the official loss_saliency; its intra-video part is the official one."""
+    import torch.nn.functional as F
+    from model.univtg import sim_matrix
+
+    class MaskedSetCriterion(type(criterion)):
+        def loss_saliency(self, outputs, targets, indices, log=True):
+            losses = super().loss_saliency(outputs, targets, indices, log)
+            valid = targets.get('inter_valid') if isinstance(targets, dict) else None
+            if valid is None or not torch.is_tensor(losses.get('loss_s_inter')):
+                return losses                            # (the official early exits: nothing to mask)
+            vid = outputs['vid_mem_proj']
+            pos = targets['saliency_pos_labels'][:, 0].long()
+            rows = torch.arange(len(vid), device=vid.device)
+            sim = sim_matrix(vid[rows, pos], outputs['txt_mem_proj'].squeeze(1)) / self.temperature
+            sim = sim.masked_fill(~valid.to(sim.device).bool(), float('-inf'))
+            loss_i = torch.diag(F.log_softmax(sim, dim=1)).mean()
+            loss_j = torch.diag(F.log_softmax(sim.t(), dim=1)).mean()
+            losses['loss_s_inter'] = -loss_i - loss_j
+            return losses
+
+    criterion.__class__ = MaskedSetCriterion
+    return criterion
 
 
 class WarmupStepLR(torch.optim.lr_scheduler.StepLR):
@@ -452,8 +528,10 @@ def train(args):
         scheduler.step()
         row = dict(epoch=epoch + 1, train_loss=total / max(steps, 1), train_seconds=round(time.time() - started, 1))
         if (epoch + 1) % args.eval_every == 0 or epoch + 1 == args.epochs:
+            validated = time.time()
             val_map = window_map(model, val_samples, args.device, args.batch_size, opt)
             row['val_window_map'] = val_map
+            row['val_seconds'] = round(time.time() - validated, 1)          # (the efficiency table adds both)
             if val_map > best:
                 best, best_epoch = val_map, epoch + 1
                 atomic_save(dict(signature=signature, model=model.state_dict(), epoch=epoch + 1, val_window_map=val_map,
@@ -492,9 +570,9 @@ def predict(args):
     tmp = Path(args.output + '.tmp')
     pd.concat(parts, ignore_index=True).to_csv(tmp, index=False)
     tmp.replace(args.output)
-    Path(args.segments).write_text(''.join(json.dumps(r) + '\n' for r in native))
+    atomic_write_text(args.segments, ''.join(json.dumps(r) + '\n' for r in native))
     n = int(sum(len(s['grid']) for s in samples))
-    Path(args.output + '.manifest.json').write_text(json.dumps(dict(
+    atomic_write_text(args.output + '.manifest.json', json.dumps(dict(
         model='UniVTG (official code) on M2CRL features', checkpoint_epoch=ck['epoch'],
         val_window_map=ck.get('val_window_map'), parameters=sum(p.numel() for p in model.parameters()),
         score='foreground probability of the clip containing the frame', frame_scores=n,

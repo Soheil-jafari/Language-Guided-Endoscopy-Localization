@@ -71,9 +71,14 @@ one 72-hour job; `--repeat 2` queues a second job that simply continues where th
   * A job that fails within its first 30 minutes (e.g. a short network or file-system outage) waits
     30 minutes before it ends, so that a short outage costs one job of the chain, not all of them
     (never after a success or a stop).
-  * The checks and model downloads at the start have time limits (GPU check and model checks: 1 h;
-    model downloads and the SurgVLP environment: 2 h), so a stalled download or a hung GPU call cannot
-    hold up a job; training and prediction never have one.
+  * The checks and model downloads have time limits (GPU check and model checks: 1 h; the SurgVLP
+    environment: 2 h; each model download - Hugging Face models, the M2CRL and SurgVLP-family
+    checkpoints - 2 h in all, its attempts, checks and pauses included), so a stalled download or a hung
+    GPU call cannot hold up a job; a download that runs out of time keeps what it has, and the next job
+    continues it. A step that is stopped at its limit counts as failed, whatever its exit code, and it is
+    stopped with everything it started. Training, prediction and the dataset download never have a
+    limit, and neither has the installation of the main environment that `run.sh` starts before the
+    pipeline (conda, pip and Mamba use their own network time-outs there).
 * **The trained models** are `lgel/results/full_baseline_seed42/model_weights.pth` and
   `lgel/results/full_advanced_seed42/model_weights.pth` (each the best checkpoint without optimizer
   state); `lgel/results/full_seed42_COMPARISON.md` puts their test results side by side. The full
@@ -112,11 +117,15 @@ This runs the complete experimental protocol of `paper_protocol.py` in its own f
 Every run is evaluated on the same test frames with its own threshold chosen on the validation
 videos; the main, comparison and seed runs are also evaluated with two sets of query wordings never
 seen in training (`protocol/paraphrases.json`, written from published phase and tool definitions, which
-the file lists; not TeCNO and the closed-set model, which have no text input). At the end of every job, `paper_analysis.py` (CPU,
-minutes) rewrites all tables and figures from whatever has finished:
-`lgel_paper/paper/PAPER_RESULTS.md`, `paper/tables/*.csv|.tex`, `paper/figures/*.png|.pdf`,
-`paper/explanations/` (patch-relevance maps of our two models), `paper/analysis.json`. The report
-bundle in `lgel_paper/outbox/` includes them.
+the file lists; not TeCNO and the closed-set model, which have no text input). At the end of every job
+that is not stopped by its time limit, `paper_analysis.py` (CPU, minutes) rewrites all tables and figures
+from whatever has finished: `lgel_paper/paper/PAPER_RESULTS.md`, `paper/tables/*.csv|.tex`,
+`paper/figures/*.png|.pdf`, `paper/explanations/` (patch-relevance maps of our two models),
+`paper/analysis.json`. A run whose outputs turn out to be unusable is left out of the tables with the
+reason, never the whole analysis. `paper/STATUS.md` says, after every run and at the end of every job,
+which runs have finished, when the tables were last written and from how many runs; a job stopped by its
+time limit only updates `STATUS.md` (no analysis in its last minutes) and the next job rewrites the
+tables. The report bundle in `lgel_paper/outbox/` includes them.
 
 * **Nothing is downloaded twice.** The first job reuses the Cholec80 videos already unpacked in
   `lgel/raw/extracted` and the M2CRL weights file the earlier runs used (`submit.sh` prints both); the
@@ -127,12 +136,17 @@ bundle in `lgel_paper/outbox/` includes them.
   stopped. `--repeat 8` queues 576 h for about 312 h of work, which leaves room for queue restarts, a
   retried run or a slower node; a job that starts when everything is already finished only redoes the
   summaries and the analysis (about 20 minutes).
-* **Early check:** the first job also runs two full training steps (forward, loss, backward, optimiser;
-  random weights) of our advanced model at the training batch (every add-on and the optical-flow loss), the
-  closed-set model and TeCNO, each in its own process with a 15-minute limit, and logs their peak GPU
-  memory, so a memory problem shows in the first report rather than days later. It never stops the job.
-  It is repeated in a later job only while one of its parts has not passed, or when the GPU type, the
-  batch, the precision, the text encoder, the model code or the PyTorch/Mamba versions change.
+* **Early check:** the first job also rehearses training at full size with random weights: our advanced
+  model at the training batch (every add-on and the optical-flow loss) through `train.py`'s own training
+  loop - two AdamW steps of two accumulated micro-batches, so the optimiser state and the gradients of the
+  earlier micro-batch are held while a micro-batch runs, as in training (more micro-batches per step add no
+  memory) - then an evaluation forward pass, with the training and the evaluation peaks measured
+  separately; and two training steps of the closed-set model and of TeCNO. Each runs in its own process
+  with a 15-minute limit, so a memory problem shows in the first report rather than days later. It never
+  stops the job. It is strong evidence, not a guarantee: real data, the data loaders and memory
+  fragmentation over days are not part of it. It is repeated in a later job only while one of its parts
+  has not passed, or when the GPU type, the batch or accumulation, the precision, the text encoder, the
+  model or training-loop code or the PyTorch/Mamba versions change.
 * **One run failing does not stop the others.** If, say, a comparison method's download fails, the job
   logs it, goes on with the next run, and ends with exit code 1; the failed run is retried (from where
   it stopped) by the next job. A failure that affects every run (the data, the GPU check, the Mamba
@@ -290,7 +304,10 @@ Schedulers kill jobs at their wall-clock limit. Every step is resumable:
 * Submit the **same command again** (same `--root`, same flags). Finished steps are skipped;
   training resumes from `runs/<run>/latest_model.pth`, the last finished epoch.
 * A step that is killed half-way is redone from its own start. Downloads continue where they
-  stopped (Google-Drive links too), and a transfer that stalls is retried automatically.
+  stopped (Google-Drive links too), and a transfer that stalls is retried automatically. A file that
+  was completely downloaded but not yet recorded as complete is accepted only if the server reports
+  its exact size and its first and last bytes match; otherwise the job stops with a clear message and
+  keeps the file.
 * A job killed while saving is handled: the checkpoint is written atomically, and the metrics log
   is repaired to match it on the next start.
 * Request the **same GPU type and one GPU** for every resubmission of a run.
@@ -430,7 +447,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with the automated tests in `tests/` (288 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with the automated tests in `tests/` (305 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.

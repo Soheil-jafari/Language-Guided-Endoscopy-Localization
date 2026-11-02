@@ -1040,3 +1040,126 @@ def test_losing_the_lock_race_after_a_takeover_still_removes_the_reclaim_guard(t
     out, calls = _submit(tmp_path, 'smoke')
     assert out.returncode == 1 and 'another submit.sh is running' in out.stderr and not calls
     assert not (base / '.submit.lock.reclaim').exists()                  # later takeovers stay possible
+
+
+# ------------------------------------------------------------------ round 15: download recovery, deadlines, the watchdog
+def _range_server(blob, *, content_range=True, chunk=None, pause=0.0):
+    """A local static server with byte ranges: a resume past the end gets 416 (with or without its Content-Range);
+    `chunk`/`pause`: send the body slowly."""
+    import http.server
+    import re as _re
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.end_headers()                                       # no Content-Length: size unknown
+
+        def do_GET(self):
+            m = _re.match(r'bytes=(\d+)-(\d*)', self.headers.get('Range') or '')
+            start = int(m.group(1)) if m else 0
+            end = min(int(m.group(2)) if m and m.group(2) else len(blob) - 1, len(blob) - 1)
+            if m and start >= len(blob):
+                self.send_response(416)
+                if content_range:
+                    self.send_header('Content-Range', f'bytes */{len(blob)}')
+                self.send_header('Content-Length', '0')
+                return self.end_headers()
+            self.send_response(206 if m else 200)
+            if m:
+                self.send_header('Content-Range', f'bytes {start}-{end}/{len(blob)}')
+            self.send_header('Content-Length', str(end - start + 1))
+            self.end_headers()
+            body = blob[start:end + 1]
+            step = chunk or len(body) or 1
+            try:
+                for i in range(0, len(body), step):
+                    self.wfile.write(body[i:i + step])
+                    self.wfile.flush()
+                    time.sleep(pause)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f'http://127.0.0.1:{server.server_address[1]}/d.zip'
+
+
+@posix_only
+@pytest.mark.skipif(not __import__('shutil').which('curl'), reason='needs curl')
+@pytest.mark.parametrize('mode', ['no-content-range', 'same-size-other-end'])
+def test_a_complete_file_without_its_marker_is_accepted_only_if_size_and_bytes_match(tmp_path, monkeypatch, mode):
+    blob = os.urandom(300_000)
+    served = blob if mode == 'no-content-range' else blob[:-10] + bytes(10)    # same size, other last bytes
+    server, url = _range_server(served, content_range=(mode != 'no-content-range'))
+    monkeypatch.setattr(pipeline, 'DOWNLOAD_PAUSE', 0)
+    monkeypatch.setenv('NO_PROXY', '127.0.0.1')
+    monkeypatch.setenv('no_proxy', '127.0.0.1')
+    dest = tmp_path / 'dataset.zip'
+    dest.write_bytes(blob)                                           # complete, but its .complete marker was lost
+    a, p = argparse.Namespace(offline=False), pipeline.Paths(tmp_path, 'r')
+    try:
+        if mode == 'no-content-range':                               # the size comes from a one-byte range request
+            pipeline.download(url, dest, a, p, 'x')
+            assert dest.read_bytes() == blob and dest.with_name('dataset.zip.complete').exists()
+        else:
+            with pytest.raises(pipeline.StageError, match='no longer returns the file'):
+                pipeline.download(url, dest, a, p, 'x')
+            assert dest.read_bytes() == blob and not dest.with_name('dataset.zip.complete').exists()
+    finally:
+        server.shutdown()
+    assert not list((tmp_path / 'tmp').glob('.headers-*'))           # (response headers are never left behind)
+
+
+@posix_only
+@pytest.mark.skipif(not __import__('shutil').which('curl'), reason='needs curl')
+def test_a_model_download_never_outlasts_its_time_budget_and_keeps_what_it_has(tmp_path, monkeypatch):
+    blob = os.urandom(2_000_000)
+    server, url = _range_server(blob, chunk=2000, pause=0.05)        # ~40 KB/s: far above curl's stall limit
+    monkeypatch.setenv('NO_PROXY', '127.0.0.1')
+    monkeypatch.setenv('no_proxy', '127.0.0.1')
+    dest = tmp_path / 'weights.pth'
+    a, p = argparse.Namespace(offline=False), pipeline.Paths(tmp_path, 'r')
+    started = time.time()
+    try:
+        with pytest.raises(pipeline.StageError, match='time limit'):
+            pipeline.download(url, dest, a, p, 'x', limit=3)
+    finally:
+        server.shutdown()
+    assert time.time() - started < 40                                # the budget, plus the stop of the transfer
+    assert 0 < dest.stat().st_size < len(blob) and blob.startswith(dest.read_bytes())   # kept for the next job
+    assert not dest.with_name('weights.pth.complete').exists()
+
+
+def test_the_dataset_download_has_no_time_limit_and_model_downloads_do(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_run(cmd, a, p, name, **kw):
+        seen.append(kw.get('timeout'))
+        dest = Path([str(c) for c in cmd][[str(c) for c in cmd].index('-o') + 1])
+        dest.write_bytes(b'z' * 50)
+    monkeypatch.setattr(pipeline, 'run', fake_run)
+    monkeypatch.setattr(pipeline, 'remote_size', lambda url, p, limit=60: 50)
+    monkeypatch.setattr(pipeline.shutil, 'which', lambda n: '/usr/bin/curl' if n == 'curl' else None)
+    a, p = argparse.Namespace(offline=False), pipeline.Paths(tmp_path, 'r')
+    pipeline.download(SECRET, tmp_path / 'data.zip', a, p, 'fetch_data')
+    pipeline.download(SECRET, tmp_path / 'model.pth', a, p, 'x_weights', limit=pipeline.FETCH_TIMEOUT)
+    assert seen[0] is None and 0 < seen[1] <= pipeline.FETCH_TIMEOUT
+
+
+@posix_only
+@pytest.mark.parametrize('case', ['output-held-after-exit', 'stop-answered-with-success'])
+def test_a_step_at_its_time_limit_always_fails_and_never_waits_for_its_output(tmp_path, case):
+    a, p = argparse.Namespace(offline=True), pipeline.Paths(tmp_path, 'r')
+    cmd = {'output-held-after-exit': ['bash', '-c', '(sleep 30; echo late) & echo started; exit 0'],
+           'stop-answered-with-success': [sys.executable, '-c', 'import signal, sys, time\n'
+                                          'signal.signal(signal.SIGTERM, lambda *x: sys.exit(0))\n'
+                                          'print("up", flush=True)\ntime.sleep(60)']}[case]
+    started = time.time()
+    with pytest.raises(pipeline.StageError) as e:
+        pipeline.run(cmd, a, p, 'held', timeout=1)
+    assert e.value.timed_out and 'time limit' in str(e.value) and time.time() - started < 25

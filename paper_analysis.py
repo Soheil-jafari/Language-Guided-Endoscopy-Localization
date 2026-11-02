@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -653,16 +654,54 @@ class Method:
         self.results = root / 'results' / self.name
         self.run = root / 'runs' / self.name
         self.root = root
-        calib = self.results / 'proposed_calibration.json'
-        self.threshold = json.loads(calib.read_text())['threshold'] if calib.exists() else None
         self.short = self.kind if self.kind != 'proposed' else (
             'advanced' if plan['flags'] == protocol.ADVANCED else 'baseline' if not plan['flags'] else 'ablation')
+        # A run's outputs are read only once it has finished (an unfinished run may hold half-written files);
+        # a finished run whose outputs cannot be used is left out with the reason (self.problem).
+        self.threshold, self.problem = None, None
+        if self.evaluated:
+            self.threshold, self.problem = read_threshold(self.results / 'proposed_calibration.json')
+
+    @property
+    def evaluated(self):
+        """Evaluated completely (main.py writes the evaluate marker only after every set was evaluated)."""
+        return ((self.root / 'state' / f'evaluate.{self.name}.done.json').exists()
+                and (self.results / 'proposed_test_metrics.json').exists())
 
     @property
     def finished(self):
-        """Evaluated completely (main.py writes the evaluate marker only after every set was evaluated)."""
-        return (self.threshold is not None and (self.results / 'proposed_test_metrics.json').exists()
-                and (self.root / 'state' / f'evaluate.{self.name}.done.json').exists())
+        """Evaluated completely, with usable outputs."""
+        return self.evaluated and self.problem is None and self.threshold is not None
+
+
+def read_threshold(path):
+    """(threshold, None), or (None, why it cannot be used): the decision threshold a run selected on validation."""
+    try:
+        value = json.loads(Path(path).read_text())['threshold']
+        if isinstance(value, bool):
+            raise TypeError('not a number')
+        value = float(value)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return None, f'{Path(path).name} cannot be read ({type(e).__name__}: {e})'[:300]
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        return None, f'{Path(path).name}: the threshold {value!r} is not a probability'
+    return value, None
+
+
+def read_json(path, default=None):
+    """An optional JSON file: its content, or `default` if it is missing or cannot be read."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def atomic_text(path, text):
+    """Replace a report file atomically (never a half-written PAPER_RESULTS.md or analysis.json)."""
+    path = Path(path)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 def frame_summary(frames, scores, threshold, unc=None):
@@ -796,6 +835,24 @@ def main(argv=None):
     root = Path(a.root).resolve()
     out = Path(a.output).resolve() if a.output else root / 'paper'
     out.mkdir(parents=True, exist_ok=True)
+    # analysis_status.json: how this analysis went, written whatever happens (main.py shows it in STATUS.md). A
+    # failed analysis leaves the last complete PAPER_RESULTS.md in place (its header says when it was made).
+    status = dict(generated=time.ctime(), ok=False, error=None, analysed=None, excluded={}, missing=[])
+    try:
+        rc = analyse(a, root, out, status)
+        status['ok'] = True
+        return rc
+    except Exception as e:                               # noqa: BLE001  (recorded, then raised)
+        status['error'] = f'{type(e).__name__}: {e}'[:1000]
+        raise
+    finally:
+        try:
+            atomic_text(out / 'analysis_status.json', json.dumps(status, indent=2, default=str))
+        except OSError:
+            pass
+
+
+def analyse(a, root, out, status):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -807,25 +864,21 @@ def main(argv=None):
     meta = load_video_metadata(root / 'data' / 'video_metadata.json')
     plans = protocol.plans(a.prefix)
     methods = {p['name']: Method(p, root) for p in plans}
-    finished = [m for m in methods.values() if m.finished]
-    missing = [m.name for m in methods.values() if not m.finished]
-    log(f'{len(finished)} of {len(methods)} runs finished' + (f'; missing: {missing}' if missing else ''))
-    report = dict(version=VERSION, generated=time.ctime(), root=str(root), prefix=a.prefix, bootstrap=a.bootstrap,
-                  permutations=a.permutations,
-                  seed=a.seed, finished=[m.name for m in finished], missing=missing, methods={})
-    md = ['# Paper results', '', f'Generated {time.ctime()} by `paper_analysis.py` ({VERSION}) from `{root}`.', '',
-          f'Runs finished: **{len(finished)} of {len(methods)}**.' + (
-              f' Not finished yet (left out below): {", ".join(missing)}.' if missing else ''), '']
-    if not finished:
-        (out / 'PAPER_RESULTS.md').write_text('\n'.join(md + ['No run has finished yet.']) + '\n')
-        (out / 'analysis.json').write_text(json.dumps(report, indent=2))
-        return 0
+    missing = [m.name for m in methods.values() if not m.evaluated]
+    excluded = {m.name: m.problem for m in methods.values() if m.evaluated and m.problem}
 
-    # ---- the shared test rows, every method's scores on them, and the bootstrap resamples
+    # ---- the shared test rows, every method's scores on them, and the bootstrap resamples. A finished run whose
+    # test predictions are missing or unusable is left out, with the reason; runs whose test rows or labels differ
+    # from the others' (different data) stop the analysis.
     frames, scores, unc, shas = None, {}, {}, {}
-    for m in list(finished):
-        loaded = load_set(m.results, 'test')
+    for m in [m for m in methods.values() if m.finished]:
+        try:
+            loaded = load_set(m.results, 'test')
+        except (OSError, ValueError, KeyError) as e:        # (pandas' parser errors are ValueErrors)
+            excluded[m.name] = f'its test predictions cannot be used ({type(e).__name__}: {e})'[:300]
+            continue
         if loaded is None:
+            excluded[m.name] = 'its test predictions or reference labels are missing'
             continue
         f, s, u, sha = loaded
         if frames is None:
@@ -833,13 +886,28 @@ def main(argv=None):
         elif not frames.same_rows(f):
             raise ValueError(f'{m.name}: its test rows/labels differ from the other runs (different data?)')
         scores[m.name], unc[m.name], shas[m.name] = s.astype(np.float64), u, sha
-    finished = [m for m in finished if m.name in scores]
+    finished = [m for m in methods.values() if m.name in scores]
+    for name, why in excluded.items():
+        log(f'!! {name} has finished but is left out of the analysis: {why}')
+    log(f'{len(finished)} of {len(methods)} runs analysed' + (f'; not finished: {missing}' if missing else '')
+        + (f'; left out: {sorted(excluded)}' if excluded else ''))
+    status.update(analysed=len(finished), excluded=excluded, missing=missing)
+    report = dict(version=VERSION, generated=time.ctime(), root=str(root), prefix=a.prefix, bootstrap=a.bootstrap,
+                  permutations=a.permutations, seed=a.seed, finished=[m.name for m in finished], missing=missing,
+                  excluded=excluded, methods={})
+    md = ['# Paper results', '', f'Generated {time.ctime()} by `paper_analysis.py` ({VERSION}) from `{root}`.', '',
+          f'Runs analysed: **{len(finished)} of {len(methods)}**.' + (
+              f' Not finished yet (left out below): {", ".join(missing)}.' if missing else '') + (
+              ' Finished but left out because their outputs cannot be used: '
+              + '; '.join(f'{k} ({v})' for k, v in excluded.items()) + '.' if excluded else ''), '']
     if frames is None:
-        (out / 'PAPER_RESULTS.md').write_text('\n'.join(md + ['No test predictions found yet.']) + '\n')
-        (out / 'analysis.json').write_text(json.dumps(report, indent=2))
+        none = 'No usable test predictions yet.' if excluded else 'No run has finished yet.'
+        atomic_text(out / 'PAPER_RESULTS.md', '\n'.join(md + [none]) + '\n')
+        atomic_text(out / 'analysis.json', json.dumps(report, indent=2))
         return 0
     n_v = len(frames.video_ids)
-    split = json.loads((root / 'data' / 'splits.json').read_text()) if (root / 'data' / 'splits.json').exists() else {}
+    split = read_json(root / 'data' / 'splits.json', {})
+    split = split if isinstance(split, dict) else {}
 
     def span(vs):
         nums = sorted(int(m.group(1)) for m in (re.search(r'(\d+)$', v) for v in vs) if m)
@@ -893,12 +961,16 @@ def main(argv=None):
         variants = [(m.name, None)]
         native_file = m.results / 'native_segments_test.jsonl'
         if m.kind == 'univtg' and native_file.exists():
-            native = {}
-            for line in native_file.read_text().splitlines():
-                if line.strip():
-                    r = json.loads(line)
-                    native[(r['video_id'], r['text_query'])] = r['predictions']
-            variants.append((m.name + ':native', native))
+            try:
+                native = {}
+                for line in native_file.read_text().splitlines():
+                    if line.strip():
+                        r = json.loads(line)
+                        native[(r['video_id'], r['text_query'])] = r['predictions']
+                variants.append((m.name + ':native', native))
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                excluded[m.name + ':native'] = f'{native_file.name} cannot be read ({type(e).__name__}: {e})'[:300]
+                log(f'!! {m.name}: its own windows are left out: {excluded[m.name + ":native"]}')
         for key, native in variants:
             match = SegmentMatch(segment_pairs(frames, scores[m.name], m.threshold, meta, min_dur, gap, native),
                                  m.threshold, n_v)
@@ -1216,7 +1288,12 @@ def main(argv=None):
         found = False
         for name in sorted(rename):
             row[f'AP set {name}'] = maps[f'mAP set {name}'] = 'n/a'
-            loaded = load_set(m.results, f'test_para{name}', rename=rename[name])
+            try:
+                loaded = load_set(m.results, f'test_para{name}', rename=rename[name])
+            except (OSError, ValueError, KeyError) as e:
+                excluded[f'{m.name}:paraphrase {name}'] = f'cannot be used ({type(e).__name__}: {e})'[:300]
+                log(f'!! {m.name}: unseen wording set {name} left out: {e}')
+                continue
             if loaded is None:
                 continue
             f, s, _, _ = loaded
@@ -1253,10 +1330,14 @@ def main(argv=None):
     if eff_rows:
         md += ['## 10. Efficiency', '',
                write_table(out, 'efficiency', pd.DataFrame(eff_rows), 'Model size and compute',
-                           'Training time: sum of the logged epoch times (train + validation) where available, '
-                           'otherwise the wall time of the training stage' + (
+                           'Training time: sum of the logged times of the finished epochs (train + validation) where '
+                           'the trainer logs them, otherwise (X-CLIP) the wall time of all passes through the training '
+                           'stage' + (
                                ' (some epochs have no logged row, so these times are lower bounds; see analysis.json)'
-                               if missing_rows else '') + '. Training clips: training windows (clips of the clip '
+                               if missing_rows else '') + '. All attempts: the wall time of every pass through the '
+                           'training stage, over all jobs - including epochs that a stop interrupted and that were '
+                           'redone, start-up and validation - i.e. the compute the training consumed. Training clips: '
+                           'training windows (clips of the clip '
                            'length) passed through the video backbone (ours: one per window and query; closed set: one '
                            'per window and repeat); optimiser steps: the parameter updates they made (n/a: not counted by '
                            'that trainer; its epochs and batch size are in paper_protocol.py). Throughput: video frames per second '
@@ -1323,8 +1404,13 @@ def main(argv=None):
         report['methods'][m.name] = dict(label=m.label, kind=m.kind, group=m.group, seed=m.plan['seed'],
                                          threshold=m.threshold, inputs=shas[m.name], frame=st, segments=seg.get(m.name))
     report['seconds'] = round(time.time() - started, 1)
-    (out / 'PAPER_RESULTS.md').write_text('\n'.join(md) + '\n')
-    (out / 'analysis.json').write_text(json.dumps(report, indent=2, default=lambda x: x.tolist() if hasattr(x, 'tolist') else str(x)))
+    status.update(excluded=excluded)
+    parts = {k: v for k, v in excluded.items() if ':' in k}         # single outputs of runs that are in the tables
+    if parts:
+        md += ['## Outputs left out', '', *[f'* {k}: {v}' for k, v in parts.items()], '']
+    atomic_text(out / 'PAPER_RESULTS.md', '\n'.join(md) + '\n')
+    atomic_text(out / 'analysis.json', json.dumps(report, indent=2,
+                                                  default=lambda x: x.tolist() if hasattr(x, 'tolist') else str(x)))
     log(f'paper analysis written to {out} ({report["seconds"]:.0f} s)')
     return 0
 
@@ -1413,14 +1499,15 @@ def journal_epochs_expected(journal, m, root):
 def efficiency(m, root, missing=None):
     """One row of the efficiency table. `missing` (a dict) receives {journal: epochs without a row}."""
     row = {'Method': m.label, 'Parameters (M)': 'n/a', 'Trainable (M)': 'n/a', 'Training (h)': 'n/a',
-           'Training clips': 'n/a', 'Optimiser steps': 'n/a', 'Throughput (frames/s)': 'n/a',
-           'Peak training memory (GB)': 'n/a'}
+           'Training, all attempts (h)': 'n/a', 'Training clips': 'n/a', 'Optimiser steps': 'n/a',
+           'Throughput (frames/s)': 'n/a', 'Peak training memory (GB)': 'n/a'}
     run = m.run
-    counts = run / 'parameter_counts.json'
-    if counts.exists():
-        c = json.loads(counts.read_text())
+    c = read_json(run / 'parameter_counts.json')                # (optional files: unreadable = not shown)
+    try:
         row['Parameters (M)'] = f"{sum(v['total'] for v in c.values()) / 1e6:.1f}"
         row['Trainable (M)'] = f"{sum(v['trainable'] for v in c.values()) / 1e6:.1f}"
+    except (AttributeError, KeyError, TypeError):
+        pass
     # Every journal there is, and every journal a finished training should have written (even if it is gone).
     journals = [run / 'training_metrics.jsonl'] + sorted(run.glob('*/training_metrics.jsonl')) + \
         sorted(f.parent / 'training_metrics.jsonl' for f in run.glob('*/FINISHED.json') if f.parent.name in JOURNALED)
@@ -1460,23 +1547,38 @@ def efficiency(m, root, missing=None):
             gaps = 'all (empty journal)'                        # finished, early stopping (no count), no row
         if gaps and missing is not None:
             missing[str(j.relative_to(root))] = gaps
-    if seconds == 0:
-        marker = root / 'state' / f'train.{m.name}.done.json'
-        if marker.exists():
-            seconds = float(json.loads(marker.read_text()).get('seconds', 0))
+    # Every pass through the run's train stage (main.py: train_attempts.jsonl), finished or stopped: the compute
+    # the training used in all, including epochs that were interrupted and redone.
+    attempts = 0.0
+    if (run / 'train_attempts.jsonl').exists():
+        for line in (run / 'train_attempts.jsonl').read_text(errors='replace').splitlines():
+            try:
+                r = json.loads(line)
+                attempts += float(r['seconds']) if isinstance(r, dict) else 0.0
+            except (ValueError, TypeError, KeyError):
+                continue
+    if seconds == 0:                                            # no epoch journal (X-CLIP): the stage's wall time
+        seconds = attempts
+    if seconds == 0:                                            # (runs from before train_attempts.jsonl)
+        try:
+            seconds = float((read_json(root / 'state' / f'train.{m.name}.done.json') or {}).get('seconds', 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            seconds = 0.0
     if m.kind in protocol.ZERO_SHOT:
-        row['Training (h)'] = '0 (zero-shot)'
+        row['Training (h)'] = row['Training, all attempts (h)'] = '0 (zero-shot)'
         row['Trainable (M)'] = '0'
-    elif seconds:
-        row['Training (h)'] = f'{seconds / 3600:.1f}'
+    else:
+        if seconds:
+            row['Training (h)'] = f'{seconds / 3600:.1f}'
+        if attempts:
+            row['Training, all attempts (h)'] = f'{attempts / 3600:.1f}'
     if memory:
         row['Peak training memory (GB)'] = f'{max(memory):.1f}'
     if clips:
         row['Training clips'] = f'{clips:,}'
         row['Optimiser steps'] = f'{steps:,}'
-    manifest = m.results / 'proposed_test.csv.manifest.json'
-    if manifest.exists():
-        man = json.loads(manifest.read_text())
+    man = read_json(m.results / 'proposed_test.csv.manifest.json')
+    if isinstance(man, dict):
         if man.get('parameters') and row['Parameters (M)'] == 'n/a':
             row['Parameters (M)'] = f"{man['parameters'] / 1e6:.1f}"
         if man.get('seconds'):
