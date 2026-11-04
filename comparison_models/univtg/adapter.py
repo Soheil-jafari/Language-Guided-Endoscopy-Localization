@@ -20,12 +20,19 @@ Deviations from the published QVHighlights recipe, and why (our videos are 30-10
     and clipped to the video duration (UniVTG assumes the two are equal);
   * video-query pairs without any positive clip are not used for training (UniVTG's data has none) but are
     scored like every other pair at evaluation;
+  * a clip is supervised only if every frame in it is annotated for the query (clip_targets): an unannotated
+    or partly annotated clip is neither foreground nor background in the foreground and intra-video saliency
+    losses (it is left out of their mask, targets['timestamp_mask']) but stays in the input as visual context;
+    QVHighlights has no unannotated time;
   * every training mini-batch holds different query sentences (our data has only 14), and UniVTG's in-batch
     contrastive (inter-video saliency) loss leaves out the cross pairs that are not negatives: our concepts
     co-occur (a phase and several tools at once), so another sentence is a negative for a sample's anchor
     clip only if its concept is known to be absent from every frame of that clip (present or unannotated
-    there: the pair is masked out, in both directions; masked_inter_loss). In QVHighlights every query is
+    there: the pair is masked out, in both directions; adapted_criterion). In QVHighlights every query is
     unique and describes one moment, so the official loss needs no mask;
+  * the GIoU span loss is computed for the aligned (prediction, target) pairs only (aligned_giou), not as the
+    diagonal of a positives x positives matrix: the same values and gradients, without the quadratic memory
+    (a Cholec80 batch can have about 12,000 positive clips, a QVHighlights batch a few hundred);
   * the best epoch is chosen on the validation videos by window mAP (mean over tIoU 0.3, 0.5, 0.7).
 Everything else (architecture, losses and their weights, optimiser, learning-rate schedule, dropout,
 feature normalisation, temporal-element features, NMS threshold) follows the published QVHighlights
@@ -55,7 +62,7 @@ from comparison_models.frame_scores import manifest_pairs  # noqa: E402
 from metrics import temporal_ap  # noqa: E402
 from checkpoint_utils import atomic_write_text, commit_best, pending_best_path  # noqa: E402
 
-SCHEMA = 'univtg-adapter-3'               # 3: masked inter-video negatives
+SCHEMA = 'univtg-adapter-4'               # 4: unannotated clips unsupervised (3: masked inter-video negatives)
 # Official QVHighlights fine-tuning settings (scripts/qvhl_pretrain.sh, main/config.py defaults), except as noted above.
 OFFICIAL = dict(dset_type='mr', train_path='ours', model_id='univtg', span_loss_type='l1', hidden_dim=1024,
                 enc_layers=4, dec_layers=2, dim_feedforward=1024, nheads=8, input_dropout=0.5, dropout=0.0,
@@ -103,14 +110,37 @@ def l2_normalize(x, eps=1e-5):
 
 
 # --------------------------------------------------------------------------- features
-def feature_record(out, weights_sha, sample_fps):
-    """features.json: what made the cached features in `out` (backbone weights, frame rate). Features of other
-    weights or another frame rate are refused. A record that cannot be read (e.g. a stop while it was written)
-    leaves the cached features' origin unknown: they are moved aside (never given this record's provenance) and
-    computed again. Written atomically, and only when it changes."""
+def move_aside(out, files, why):
+    """Move cached features whose origin is unknown or different into <out>/unverified-<time>-<pid>/ (kept, never
+    reused), so that they are computed again: an unattended job recovers by itself."""
+    files = [f for f in files if Path(f).exists()]
+    if not files:
+        return None
+    aside = Path(out) / f'unverified-{time.strftime("%Y%m%d-%H%M%S")}-{os.getpid()}'
+    aside.mkdir(exist_ok=True)
+    for f in files:
+        os.replace(f, aside / Path(f).name)
+    print(f'{why}: {len(files)} cached file(s) moved to {aside}; they are computed again', flush=True)
+    return aside
+
+
+def extraction_signature(metadata, crop, clip_length):
+    """What decides which frames a feature row comes from and how it is computed, besides the weights and the
+    frame rate: the video metadata (frame counts and rates, hence the frame grid), the crop and clip length, and
+    the code that reads, transforms and encodes the frames."""
+    return dict(metadata_sha256=file_sha(metadata), crop=int(crop), clip_length=int(clip_length),
+                code={name: file_sha(REPO / name) for name in ('dataset.py', 'backbone/vision_transformer.py',
+                                                               'models.py')})
+
+
+def feature_record(out, weights_sha, sample_fps, extraction=None):
+    """features.json: what made the cached features in `out` (backbone weights, frame rate, extraction signature).
+    A record that cannot be read (e.g. a stop while it was written), or that describes other weights, another
+    frame rate or another extraction (e.g. rebuilt data), leaves the cached features unusable: they are moved aside
+    (never given this record's provenance) and computed again. Written atomically, and only when it changes."""
     out = Path(out)
     info = out / 'features.json'
-    wanted = dict(weights_sha256=weights_sha, sample_fps=sample_fps, dim=VIDEO_DIM,
+    wanted = dict(weights_sha256=weights_sha, sample_fps=sample_fps, dim=VIDEO_DIM, extraction=extraction,
                   description='M2CRL (pretrained, frozen) per-frame mean of patch tokens')
     old = None
     if info.exists():
@@ -118,19 +148,23 @@ def feature_record(out, weights_sha, sample_fps):
             old = json.loads(info.read_text())
             if not isinstance(old, dict):
                 raise ValueError('not a JSON object')
+            why = None if old == wanted else 'the cached features were made with other weights, frame rate or extraction'
         except (OSError, ValueError) as e:
-            aside = out / f'unverified-{time.strftime("%Y%m%d-%H%M%S")}-{os.getpid()}'
-            aside.mkdir()
-            for f in [info, *out.glob('*.npy')]:
-                os.replace(f, aside / f.name)
-            print(f'{info} could not be read ({e}): its features were moved to {aside} and are computed again',
-                  flush=True)
+            old, why = None, f'{info} could not be read ({e})'
+        if why:
+            move_aside(out, [info, *out.glob('*.npy'), *out.glob('*.frames.json')], why)
             old = None
-        if old is not None and (old.get('weights_sha256') != weights_sha or old.get('sample_fps') != sample_fps):
-            raise ValueError(f'{out} holds features of other backbone weights or another frame rate; use a new folder')
     if old != wanted:
         atomic_write_text(info, json.dumps(wanted))
     return wanted
+
+
+def cached_frames_match(out, video, grid):
+    """Do <video>.npy's rows come from exactly these source frames (its <video>.frames.json)?"""
+    try:
+        return json.loads((Path(out) / f'{video}.frames.json').read_text()) == [int(i) for i in grid]
+    except (OSError, ValueError):
+        return False
 
 
 def video_features(args):
@@ -142,7 +176,8 @@ def video_features(args):
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     weights_sha = file_sha(args.weights) if args.weights else 'random-init'      # (--random-init runs)
-    feature_record(out, weights_sha, args.sample_fps)
+    feature_record(out, weights_sha, args.sample_fps,
+                   extraction_signature(args.metadata, config.DATA.TRAIN_CROP_SIZE, config.DATA.CLIP_LENGTH))
     config.MODEL.M2CRL_WEIGHTS_PATH = str(args.weights or '')                 # '' = random initialisation
     config.MODEL.TEXT_ENCODER_MODEL = args.text_model
     config.TRAIN.DEVICE = args.device
@@ -156,10 +191,12 @@ def video_features(args):
         videos = [v for vs in videos.values() for v in vs]
     for video in sorted(set(videos)):
         target = out / f'{video}.npy'
-        if target.exists():
-            continue
         m = meta[video]
         grid = sample_indices(m['frame_count'], m['source_fps'], args.sample_fps)
+        if target.exists():
+            if cached_frames_match(out, video, grid):
+                continue
+            move_aside(out, [target, out / f'{video}.frames.json'], f'{video}: the cached features are not for its frames')
         sums = np.zeros((len(grid), VIDEO_DIM), dtype=np.float64)
         counts = np.zeros(len(grid))
         starts = window_positions(len(grid), length, length)
@@ -183,6 +220,7 @@ def video_features(args):
                     counts[start:start + n] += 1
         if np.any(counts == 0):
             raise RuntimeError(f'{video}: frames without a feature')
+        atomic_write_text(out / f'{video}.frames.json', json.dumps([int(i) for i in grid]))   # (then the rows)
         tmp = target.with_name(target.name + f'.{os.getpid()}.tmp.npy')
         np.save(tmp, (sums / counts[:, None]).astype(np.float16))
         os.replace(tmp, target)
@@ -224,20 +262,18 @@ def build_samples(triplets, metadata, annotations, feature_dir, text_file, clip_
             feats = np.load(Path(feature_dir) / f'{video}.npy').astype(np.float32)
             if len(feats) != len(grid):
                 raise ValueError(f'{video}: {len(feats)} feature rows for {len(grid)} sampled frames')
+            if not cached_frames_match(feature_dir, video, grid):          # same count is not the same frames
+                raise ValueError(f'{video}: its cached features were not made from the frames this data samples '
+                                 f'(rebuilt data?); the features step computes them again')
             n_clips = math.ceil(len(grid) / clip_frames)
             pooled = np.stack([feats[c * clip_frames:(c + 1) * clip_frames].mean(0) for c in range(n_clips)])
             cache[video] = l2_normalize(pooled)
         labels = np.asarray([index.label(video, int(i), spec) for i in grid])
-        clip_labels, unsure = [], []
-        for c in range(len(cache[video])):
-            part = labels[c * clip_frames:(c + 1) * clip_frames]
-            seen = part[part != -100]
-            clip_labels.append(int(len(seen) > 0 and seen.mean() >= 0.5))
-            unsure.append(bool(len(seen) == 0 or (seen == 1).any()))   # present in a frame, or not annotated
+        clip_labels, observed, unsure = clip_targets(labels, len(cache[video]), clip_frames)
         # (shared by every sample of this video: which of its clips may NOT serve as a negative for `query`)
-        not_negative.setdefault(video, {})[query] = np.asarray(unsure)
+        not_negative.setdefault(video, {})[query] = unsure
         windows, start = [], None
-        for c, v in enumerate(clip_labels + [0]):              # runs of positive clips, in clip units
+        for c, v in enumerate(list(clip_labels) + [0]):        # runs of positive clips, in clip units
             if v and start is None:
                 start = c
             if not v and start is not None:
@@ -248,9 +284,27 @@ def build_samples(triplets, metadata, annotations, feature_dir, text_file, clip_
         if query not in texts:
             raise ValueError(f'no text features for {query!r}')
         samples.append(dict(video=video, query=query, vfeat=cache[video], tfeat=l2_normalize(texts[query].astype(np.float32)),
-                            windows=windows, grid=grid, labels=labels, source_fps=m['source_fps'],
+                            windows=windows, grid=grid, labels=labels, source_fps=m['source_fps'], observed=observed,
                             duration=m['frame_count'] / m['source_fps'], not_negative=not_negative.setdefault(video, {})))
     return samples
+
+
+def clip_targets(labels, n_clips, clip_frames):
+    """Per clip of one video for one query, from its frame labels (1, 0, or -100 = not annotated):
+    label    - the majority of its frames, for a clip whose frames are all annotated; otherwise 0;
+    observed - every frame of the clip is annotated: only such clips are supervised (foreground and intra-video
+               saliency losses); a clip with an unannotated frame is neither foreground nor background;
+    unsure   - the concept is present in a frame, or a frame is not annotated: the clip may not serve as a negative
+               for this query in the inter-video loss (a negative needs the concept known absent in every frame)."""
+    labels = np.asarray(labels)
+    clip_labels, observed, unsure = [], [], []
+    for c in range(n_clips):
+        part = labels[c * clip_frames:(c + 1) * clip_frames]
+        known = bool(len(part) > 0 and (part != -100).all())
+        observed.append(known)
+        clip_labels.append(int(known and part.mean() >= 0.5))
+        unsure.append(bool(len(part) == 0 or (part == 1).any() or (part == -100).any()))
+    return np.asarray(clip_labels, dtype=np.int64), np.asarray(observed, dtype=bool), np.asarray(unsure, dtype=bool)
 
 
 def targets_for(sample, rng):
@@ -269,8 +323,10 @@ def targets_for(sample, rng):
     if in_window.sum() < 1:
         in_window[max(0, min(int(sample['windows'][0][0]), ctx_l - 1))] = 1
     positives = torch.where(in_window > 0)[0].tolist()
+    observed = sample.get('observed')                   # (supervised clips; all when not given)
+    observed = torch.ones(ctx_l) if observed is None else torch.as_tensor(np.asarray(observed), dtype=torch.float32)
     return dict(timestamp=ts, timestamp_window=in_window, span_labels_nn=nn_window, saliency_scores=in_window.clone(),
-                saliency_pos_labels=[rng.choice(positives)])
+                saliency_pos_labels=[rng.choice(positives)], observed=observed)
 
 
 def video_input(sample):
@@ -298,8 +354,10 @@ def batch_inputs(samples, device, rng=None):
     if rng is None:
         return inputs, None
     parts = [targets_for(s, rng) for s in samples]
-    ts, ts_mask = pad([t['timestamp'] for t in parts])
-    targets = dict(timestamp=ts.to(device), timestamp_mask=ts_mask.to(device),
+    ts = pad([t['timestamp'] for t in parts])[0]
+    # timestamp_mask: the clips the losses supervise - every frame annotated (padding and unannotated clips are left
+    # out of the foreground and intra-video saliency losses; src_vid_mask, the padding mask, keeps them as input)
+    targets = dict(timestamp=ts.to(device), timestamp_mask=pad([t['observed'] for t in parts])[0].to(device),
                    timestamp_window=pad([t['timestamp_window'] for t in parts])[0].to(device),
                    span_labels_nn=pad([t['span_labels_nn'] for t in parts])[0].to(device),
                    saliency_scores=pad([t['saliency_scores'] for t in parts])[0].to(device),
@@ -329,18 +387,46 @@ def build(args_dict, device):
     from model.univtg import build_model
     opt = SimpleNamespace(**OFFICIAL, **args_dict, device=device, v_feat_dim=VIDEO_DIM + 2, t_feat_dim=TEXT_DIM)
     model, criterion = build_model(opt)
-    return model.to(device), masked_inter_loss(criterion).to(device), opt
+    return model.to(device), adapted_criterion(criterion).to(device), opt
 
 
-def masked_inter_loss(criterion):
-    """The official SetCriterion with one change, made here (official/ stays unmodified): its inter-video saliency
-    loss (an InfoNCE over the anchor clips and sentences of a batch, in both directions) leaves out the pairs that
-    targets['inter_valid'] marks as not being negatives (inter_negatives). Without the mask it is computed exactly
-    as the official loss_saliency; its intra-video part is the official one."""
+def aligned_giou(spans1, spans2):
+    """generalized_temporal_iou(spans1, spans2).diagonal() of the official utils/span_utils.py - the same
+    operations for each aligned pair (row i with row i) - without building the N x N matrix."""
+    spans1 = spans1.float()
+    spans2 = spans2.float()
+    assert (spans1[:, 1] >= spans1[:, 0]).all()
+    assert (spans2[:, 1] >= spans2[:, 0]).all()
+    areas1 = spans1[:, 1] - spans1[:, 0]
+    areas2 = spans2[:, 1] - spans2[:, 0]
+    inter = (torch.min(spans1[:, 1], spans2[:, 1]) - torch.max(spans1[:, 0], spans2[:, 0])).clamp(min=0)
+    union = areas1 + areas2 - inter
+    iou = inter / union
+    enclosing_area = (torch.max(spans1[:, 1], spans2[:, 1]) - torch.min(spans1[:, 0], spans2[:, 0])).clamp(min=0)
+    return iou - (enclosing_area - union) / enclosing_area
+
+
+def adapted_criterion(criterion):
+    """The official SetCriterion with two changes, made here (official/ stays unmodified):
+    * its inter-video saliency loss (an InfoNCE over the anchor clips and sentences of a batch, in both directions)
+      leaves out the pairs that targets['inter_valid'] marks as not being negatives (inter_negatives). Without the
+      mask it is computed exactly as the official loss_saliency; its intra-video part is the official one;
+    * its span loss computes the GIoU of the aligned pairs only (aligned_giou) instead of the diagonal of a
+      positives x positives matrix; its L1 part and both reductions are the official ones."""
     import torch.nn.functional as F
     from model.univtg import sim_matrix
 
     class MaskedSetCriterion(type(criterion)):
+        def loss_spans(self, outputs, targets, indices):
+            assert 'pred_spans' in outputs
+            src_spans = targets['timestamp'] + outputs['pred_spans']
+            gt_spans = targets['span_labels_nn']
+            mask_valid = targets['timestamp_window'].bool()
+            mask_valid_full = targets['timestamp_window'].unsqueeze(2).repeat(1, 1, 2)
+            loss_span = F.smooth_l1_loss(src_spans, gt_spans, reduction='none') * mask_valid_full
+            loss_giou = 1 - aligned_giou(src_spans[mask_valid], gt_spans[mask_valid])
+            return {'loss_b': loss_span.sum() / mask_valid.sum(), 'loss_g': loss_giou.mean()}
+
         def loss_saliency(self, outputs, targets, indices, log=True):
             losses = super().loss_saliency(outputs, targets, indices, log)
             valid = targets.get('inter_valid') if isinstance(targets, dict) else None

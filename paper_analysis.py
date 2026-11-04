@@ -661,6 +661,10 @@ class Method:
         self.threshold, self.problem = None, None
         if self.evaluated:
             self.threshold, self.problem = read_threshold(self.results / 'proposed_calibration.json')
+            refused = read_json(self.results / 'settings_refused.json')     # (main.py: settings_refused)
+            if refused is not None or (self.results / 'settings_refused.json').exists():
+                self.problem = 'trained with other settings than this protocol: ' + str(
+                    refused.get('problem') if isinstance(refused, dict) else 'see settings_refused.json')[:300]
 
     @property
     def evaluated(self):
@@ -837,10 +841,15 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     # analysis_status.json: how this analysis went, written whatever happens (main.py shows it in STATUS.md). A
     # failed analysis leaves the last complete PAPER_RESULTS.md in place (its header says when it was made).
-    status = dict(generated=time.ctime(), ok=False, error=None, analysed=None, excluded={}, missing=[])
+    status = dict(generated=time.ctime(), ok=False, error=None, problems=[], analysed=None, excluded={}, missing=[])
     try:
         rc = analyse(a, root, out, status)
-        status['ok'] = True
+        # Complete only if every finished run is in the tables and every figure was drawn (runs that have not
+        # finished yet are no failure): otherwise everything else is written, and the exit code says so.
+        status['ok'] = not status['problems']
+        if status['problems']:
+            log(f'!! the analysis is incomplete: {"; ".join(status["problems"])}')
+            return 1
         return rc
     except Exception as e:                               # noqa: BLE001  (recorded, then raised)
         status['error'] = f'{type(e).__name__}: {e}'[:1000]
@@ -900,6 +909,7 @@ def analyse(a, root, out, status):
               f' Not finished yet (left out below): {", ".join(missing)}.' if missing else '') + (
               ' Finished but left out because their outputs cannot be used: '
               + '; '.join(f'{k} ({v})' for k, v in excluded.items()) + '.' if excluded else ''), '']
+    status['problems'] = [f'left out: {k} ({v})' for k, v in excluded.items()]
     if frames is None:
         none = 'No usable test predictions yet.' if excluded else 'No run has finished yet.'
         atomic_text(out / 'PAPER_RESULTS.md', '\n'.join(md + [none]) + '\n')
@@ -1377,20 +1387,26 @@ def analyse(a, root, out, status):
                        'metric code; they are close to, but not the same as, the authors\' evaluation, so differences '
                        'of a few points need not indicate a different model.'), '']
 
-    # ---- figures
-    figs = []
-    try:
-        figs += reliability_figure(plt, out, frames, scores, main_methods)
-        figs += risk_coverage_figure(plt, out, frames, scores, unc, main_methods)
-        figs += timeline_figures(plt, out, frames, scores, meta, main_methods, stats)
-        figs += training_figure(plt, out, [x for x in (by_short('baseline', 'main'), by_short('advanced', 'main')) if x])
-        figs += per_query_figure(plt, out, frames, stats, main_methods)
-        if gen_rows:
-            figs += generalisation_figure(plt, out, report, stats, finished)
-    except Exception as e:                                                  # noqa: BLE001
-        import traceback
-        log(f'!! a figure failed: {e!r}\n{traceback.format_exc()}')
-        report['figure_error'] = repr(e)
+    # ---- figures (each on its own: one that fails costs only itself)
+    figs, figure_errors = [], {}
+    drawings = [('reliability', lambda: reliability_figure(plt, out, frames, scores, main_methods)),
+                ('risk_coverage', lambda: risk_coverage_figure(plt, out, frames, scores, unc, main_methods)),
+                ('timelines', lambda: timeline_figures(plt, out, frames, scores, meta, main_methods, stats)),
+                ('training_dynamics', lambda: training_figure(
+                    plt, out, [x for x in (by_short('baseline', 'main'), by_short('advanced', 'main')) if x])),
+                ('per_query_ap', lambda: per_query_figure(plt, out, frames, stats, main_methods))]
+    if gen_rows:
+        drawings.append(('generalisation', lambda: generalisation_figure(plt, out, report, stats, finished)))
+    for name, draw in drawings:
+        try:
+            figs += draw()
+        except Exception as e:                                              # noqa: BLE001
+            import traceback
+            log(f'!! figure {name} failed: {e!r}\n{traceback.format_exc()}')
+            figure_errors[name] = repr(e)[:300]
+            plt.close('all')
+    if figure_errors:
+        report['figure_error'] = figure_errors
     explanations = sorted((out / 'explanations').glob('*/explanation_*.png')) if (out / 'explanations').exists() else []
     md += ['## Figures', '', *[f'- `figures/{n}.png` (and .pdf)' for n in figs],
            *[f'- `{p.relative_to(out)}` - language-guided patch relevance (before the temporal head)' for p in explanations], '']
@@ -1404,7 +1420,8 @@ def analyse(a, root, out, status):
         report['methods'][m.name] = dict(label=m.label, kind=m.kind, group=m.group, seed=m.plan['seed'],
                                          threshold=m.threshold, inputs=shas[m.name], frame=st, segments=seg.get(m.name))
     report['seconds'] = round(time.time() - started, 1)
-    status.update(excluded=excluded)
+    status.update(excluded=excluded, problems=[f'left out: {k} ({v})' for k, v in excluded.items()]
+                  + [f'figure {k} failed: {v}' for k, v in figure_errors.items()])
     parts = {k: v for k, v in excluded.items() if ':' in k}         # single outputs of runs that are in the tables
     if parts:
         md += ['## Outputs left out', '', *[f'* {k}: {v}' for k, v in parts.items()], '']

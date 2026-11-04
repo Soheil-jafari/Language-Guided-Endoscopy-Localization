@@ -489,9 +489,11 @@ def test_univtg_trains_resumes_and_predicts_on_synthetic_features(tmp_path, monk
     feats = tmp_path / 'features'
     feats.mkdir()
     rng = np.random.default_rng(0)
+    from data_contract import sample_indices
     for v, m in meta.items():
-        n = len(range(0, m['frame_count'], 25))
-        np.save(feats / f'{v}.npy', rng.normal(size=(n, adapter.VIDEO_DIM)).astype(np.float16))
+        grid = sample_indices(m['frame_count'], m['source_fps'], 1.0)
+        np.save(feats / f'{v}.npy', rng.normal(size=(len(grid), adapter.VIDEO_DIM)).astype(np.float16))
+        (feats / f'{v}.frames.json').write_text(json.dumps([int(i) for i in grid]))   # (as the features step)
     texts = {q: rng.normal(size=(5, adapter.TEXT_DIM)).astype(np.float16) for q in PHRASES}
     torch.save(texts, tmp_path / 'text.pt')
     out = tmp_path / 'univtg'
@@ -971,12 +973,13 @@ def test_the_paper_analysis_writes_every_table_and_figure(tmp_path):
     # an unusable input of a finished run leaves that run out, by name and with the reason - never silently, and
     # never at the cost of the whole report
     (root / 'results' / 'paper_clip_zeroshot' / 'test_reference.csv').write_text('video_id,text_query,frame_idx,label\n')
-    assert pa.main(['--root', str(root), '--bootstrap', '5', '--permutations', '5']) == 0
+    assert pa.main(['--root', str(root), '--bootstrap', '5', '--permutations', '5']) == 1     # complete except that run
     report = json.loads((out / 'analysis.json').read_text())
     assert 'paper_clip_zeroshot' not in report['finished'] and 'frames differ' in report['excluded']['paper_clip_zeroshot']
     text = (out / 'PAPER_RESULTS.md').read_text()
     assert 'Runs analysed: **18 of 20**' in text and 'left out because their outputs cannot be used: paper_clip_zeroshot' in text
-    assert json.loads((out / 'analysis_status.json').read_text())['ok']
+    status = json.loads((out / 'analysis_status.json').read_text())
+    assert not status['ok'] and status['error'] is None and 'paper_clip_zeroshot' in status['problems'][0]
     # test rows or labels that differ between runs (different data) still stop the analysis - and say why
     df = pd.read_csv(root / 'results' / 'paper_tecno_s42' / 'test_reference.csv')
     df.loc[0, 'label'] = 1 - df.loc[0, 'label'] if df.loc[0, 'label'] in (0, 1) else 1
@@ -1110,8 +1113,12 @@ def test_univtg_feature_record_is_atomic_and_a_damaged_one_never_vouches_for_old
     first = (out / 'features.json').stat().st_mtime_ns
     adapter.feature_record(out, 'abc', 1.0)                          # unchanged: not rewritten
     assert (out / 'features.json').stat().st_mtime_ns == first
-    with pytest.raises(ValueError, match='other backbone weights'):
-        adapter.feature_record(out, 'other', 1.0)
+    np.save(out / 'v0.npy', np.zeros((3, 2)))
+    adapter.feature_record(out, 'other', 1.0)                        # other weights: moved aside, made again
+    assert not (out / 'v0.npy').exists() and json.loads((out / 'features.json').read_text())['weights_sha256'] == 'other'
+    for f in out.glob('unverified-*'):
+        __import__('shutil').rmtree(f)
+    adapter.feature_record(out, 'abc', 1.0)
     np.save(out / 'v1.npy', np.zeros((3, 2)))
     (out / 'features.json').write_text('{"weights_sha256": "ab')    # torn by a stop
     for _ in range(2):                                               # recovers at once, and stays recovered
@@ -1143,7 +1150,7 @@ def test_a_damaged_or_unfinished_run_never_stops_the_analysis_or_counts_as_finis
     (root / 'results' / 'paper_closedset_s42' / 'proposed_test.csv').unlink()
     # a finished run with a damaged optional file (its efficiency row shows n/a)
     (root / 'runs' / 'paper_baseline_s42' / 'parameter_counts.json').write_text('{"vision')
-    assert pa.main(['--root', str(root), '--bootstrap', '10', '--permutations', '5']) == 0
+    assert pa.main(['--root', str(root), '--bootstrap', '10', '--permutations', '5']) == 1   # incomplete: exit code 1
     report = json.loads((root / 'paper' / 'analysis.json').read_text())
     assert sorted(report['finished']) == ['paper_advanced_s42', 'paper_baseline_s42', 'paper_clip_zeroshot']
     assert set(report['excluded']) == {'paper_tecno_s42', 'paper_closedset_s42'}
@@ -1153,7 +1160,8 @@ def test_a_damaged_or_unfinished_run_never_stops_the_analysis_or_counts_as_finis
     text = (root / 'paper' / 'PAPER_RESULTS.md').read_text()
     assert 'Runs analysed: **3 of 20**' in text and 'paper_tecno_s42 (' in text
     status = json.loads((root / 'paper' / 'analysis_status.json').read_text())
-    assert status['ok'] and status['analysed'] == 3 and set(status['excluded']) == set(report['excluded'])
+    assert not status['ok'] and status['analysed'] == 3 and set(status['excluded']) == set(report['excluded'])
+    assert len(status['problems']) == 2 and status['error'] is None   # the not-finished UniVTG run is no problem
     eff = pd.read_csv(root / 'paper' / 'tables' / 'efficiency.csv', keep_default_na=False).set_index('Method')
     assert eff.loc['Baseline (ours)', 'Trainable (M)'] == 'n/a'
 
@@ -1244,3 +1252,273 @@ def test_a_tecno_run_counts_as_trained_only_when_its_last_stage_finished(tmp_pat
 def test_the_clipping_phase_wording_names_both_of_its_actions():
     para = protocol.load_paraphrases()
     assert para['A'][('phase', 2)] == 'clipping and division of the cystic duct and cystic artery'
+
+
+# --------------------------------------------------------------------------- round 16 (update 23)
+def _tiny_univtg(monkeypatch):
+    from comparison_models.univtg import adapter
+    for k, v in dict(hidden_dim=32, dim_feedforward=32, enc_layers=1, nheads=4).items():
+        monkeypatch.setitem(adapter.OFFICIAL, k, v)
+    settings = dict(clip_frames=4, sample_fps=1.0, epochs=1, lr=1e-4, batch_size=2, eval_every=1, seed=0,
+                    max_v_l=100000)
+    return adapter, adapter.build(settings, 'cpu')
+
+
+def test_univtg_supervises_only_clips_whose_frames_are_all_annotated(monkeypatch):
+    import random
+    adapter, (_, criterion, _) = _tiny_univtg(monkeypatch)
+    # clips of 4 frames: positive, wholly unannotated, partly unannotated, negative, positive
+    labels = [1, 1, 1, 0] + [-100] * 4 + [-100, 0, 0, 0] + [0, 0, 0, 0] + [1, 1, 1, 1]
+    clip, observed, unsure = adapter.clip_targets(labels, 5, 4)
+    assert clip.tolist() == [1, 0, 0, 0, 1] and observed.tolist() == [True, False, False, True, True]
+    assert unsure.tolist() == [True, True, True, False, True]        # [-100, 0, 0, 0] is no known absence
+    rng = np.random.default_rng(0)
+    sample = dict(query=PHRASES[7], vfeat=adapter.l2_normalize(rng.normal(size=(5, 8)).astype(np.float32)),
+                  tfeat=rng.normal(size=(3, 8)).astype(np.float32), windows=[[0, 1], [4, 5]], observed=observed)
+    _, targets = adapter.batch_inputs([sample, dict(sample, query=PHRASES[8])], 'cpu', random.Random(0))
+    assert targets['timestamp_mask'][0].tolist() == [1, 0, 0, 1, 1]
+    n, length, dim = 2, 5, 6
+    logits = torch.full((n, length, 1), 0.5, requires_grad=True)
+    vid = torch.randn(n, length, dim, requires_grad=True)
+    txt = torch.randn(n, 1, dim)
+    outputs = dict(pred_logits=logits, vid_mem_proj=vid, txt_mem_proj=txt)
+    criterion.loss_labels(outputs, targets, None)['loss_f'].backward()
+    assert logits.grad[:, 1:3].abs().sum() == 0 and logits.grad[:, [0, 3, 4]].abs().sum() > 0   # foreground loss
+    criterion.loss_saliency(outputs, targets, None)['loss_s_intra'].backward()
+    assert vid.grad[:, 1:3].abs().sum() == 0 and vid.grad[:, 3].abs().sum() > 0                  # intra saliency
+
+
+def test_a_partly_unannotated_clip_is_never_an_inter_video_negative():
+    from comparison_models.univtg import adapter
+    tool, phase = PHRASES[7], PHRASES[1]
+    # one video, clips of 4 frames; the tool is annotated everywhere, the phase misses one frame of clip 2
+    _, _, tool_unsure = adapter.clip_targets([0] * 8 + [1] * 4, 3, 4)
+    _, _, phase_unsure = adapter.clip_targets([0] * 8 + [-100, 0, 0, 0], 3, 4)
+    flags = {tool: tool_unsure, phase: phase_unsure}
+    a = dict(query=tool, not_negative=flags)                          # anchored at clip 2, where the tool is
+    b = dict(query=phase, not_negative=flags)
+    valid = adapter.inter_negatives([a, b], [2, 0])
+    assert not valid[0, 1]                         # the phase is not known absent from every frame of clip 2
+    assert valid[1, 0]                             # clip 0 is fully annotated and without the tool
+
+
+def test_without_unannotated_frames_the_univtg_targets_are_exactly_as_before(monkeypatch):
+    import random
+    adapter, _ = _tiny_univtg(monkeypatch)
+    rng = np.random.default_rng(1)
+    labels = rng.integers(0, 2, size=37)
+    clip, observed, unsure = adapter.clip_targets(labels, 10, 4)
+    for c in range(10):                                               # the rule of update 22, for annotated frames
+        part = labels[c * 4:(c + 1) * 4]
+        assert clip[c] == int(part.mean() >= 0.5) and unsure[c] == bool((part == 1).any()) and observed[c]
+    samples = [dict(query=PHRASES[i], vfeat=np.zeros((n, 8), np.float32), tfeat=np.zeros((2, 8), np.float32),
+                    windows=[[0, 2]], observed=np.ones(n, bool)) for i, n in enumerate((10, 7))]
+    inputs, targets = adapter.batch_inputs(samples, 'cpu', random.Random(0))
+    assert torch.equal(targets['timestamp_mask'], inputs['src_vid_mask'])     # = the padding mask, as before
+
+
+def test_univtg_span_loss_equals_the_official_diagonal_without_the_square_matrix(monkeypatch):
+    from utils.span_utils import generalized_temporal_iou
+    adapter, (_, criterion, _) = _tiny_univtg(monkeypatch)
+    torch.manual_seed(0)
+    a = torch.rand(50, 1) * 0.5
+    spans1 = torch.cat([a, a + 0.05 + torch.rand(50, 1) * 0.5], 1).requires_grad_()
+    b = torch.rand(50, 1) * 0.5
+    spans2 = torch.cat([b, b + 0.05 + torch.rand(50, 1) * 0.5], 1)
+    mine = adapter.aligned_giou(spans1, spans2)
+    (g_mine,) = torch.autograd.grad(mine.sum(), spans1)
+    theirs = generalized_temporal_iou(spans1, spans2).diagonal()
+    (g_theirs,) = torch.autograd.grad(theirs.sum(), spans1)
+    assert torch.allclose(mine, theirs, atol=1e-7) and torch.allclose(g_mine, g_theirs, atol=1e-7)
+    # the whole loss, against the official one, with the official targets
+    official = type(criterion).__mro__[1]
+    n, length = 3, 9
+    pred = (torch.rand(n, length, 2) * 0.1 * torch.tensor([-1.0, 1.0])).requires_grad_()
+    ts = ((torch.arange(length) + 0.5) / length).unsqueeze(1).repeat(1, 2).expand(n, -1, -1)
+    window = (torch.rand(n, length) > 0.4).float()
+    window[:, 0] = 1
+    gt = torch.cat([ts[..., :1] - 0.2, ts[..., 1:] + 0.3], -1)
+    targets = dict(timestamp=ts, timestamp_window=window, timestamp_mask=torch.ones(n, length), span_labels_nn=gt)
+    want = official.loss_spans(criterion, dict(pred_spans=pred), targets, None)
+    got = criterion.loss_spans(dict(pred_spans=pred), targets, None)
+    for k in ('loss_b', 'loss_g'):
+        assert torch.allclose(got[k], want[k], atol=1e-7), k
+        assert torch.allclose(torch.autograd.grad(got[k], pred, retain_graph=True)[0],
+                              torch.autograd.grad(want[k], pred, retain_graph=True)[0], atol=1e-7), k
+    empty = dict(targets, timestamp_window=torch.zeros(n, length))        # degenerate: as the official (NaN)
+    assert all(torch.isnan(criterion.loss_spans(dict(pred_spans=pred), empty, None)[k]) ==
+               torch.isnan(official.loss_spans(criterion, dict(pred_spans=pred), empty, None)[k]) for k in ('loss_b', 'loss_g'))
+    with pytest.raises(AssertionError):                                   # an inverted span: refused as the official
+        adapter.aligned_giou(torch.tensor([[0.5, 0.2]]), torch.tensor([[0.1, 0.3]]))
+    big = torch.rand(200_000, 1)                                          # 200,000 positive clips: linear memory
+    assert adapter.aligned_giou(torch.cat([big, big + 0.1], 1), torch.cat([big, big + 0.2], 1)).shape == (200_000,)
+
+
+def test_univtg_features_are_bound_to_their_source_frames_and_extraction(tmp_path, monkeypatch):
+    from comparison_models.univtg import adapter
+    from data_contract import sample_indices
+    d = make_prepared(tmp_path, n_videos=4, seconds=24)
+    meta = json.loads(d['metadata'].read_text())
+    feats = tmp_path / 'features'
+    feats.mkdir()
+    rng = np.random.default_rng(0)
+    for v, m in meta.items():
+        grid = sample_indices(m['frame_count'], m['source_fps'], 1.0)            # source frames 0, 25, 50, ...
+        np.save(feats / f'{v}.npy', rng.normal(size=(len(grid), adapter.VIDEO_DIM)).astype(np.float16))
+        (feats / f'{v}.frames.json').write_text(json.dumps([int(2 * i) for i in grid]))   # 0, 50, 100, ...
+    torch.save({q: rng.normal(size=(5, adapter.TEXT_DIM)).astype(np.float16) for q in PHRASES}, tmp_path / 'text.pt')
+    args = (str(d['triplets']('train')), str(d['metadata']), str(d['annotations']), str(feats), str(tmp_path / 'text.pt'),
+            4, 1.0, True)
+    with pytest.raises(ValueError, match='not made from the frames'):            # same row count, other frames
+        adapter.build_samples(*args)
+    for v, m in meta.items():
+        grid = sample_indices(m['frame_count'], m['source_fps'], 1.0)
+        assert not adapter.cached_frames_match(feats, v, grid)
+        (feats / f'{v}.frames.json').write_text(json.dumps([int(i) for i in grid]))
+        assert adapter.cached_frames_match(feats, v, grid)
+    assert adapter.build_samples(*args)
+    # a changed extraction (e.g. rebuilt metadata): the cache is moved aside, so every video is extracted again
+    first = adapter.extraction_signature(d['metadata'], 32, 4)
+    adapter.feature_record(feats, 'w', 1.0, first)
+    assert list(feats.glob('*.npy'))
+    meta[next(iter(meta))]['frame_count'] += 25
+    d['metadata'].write_text(json.dumps(meta))
+    second = adapter.extraction_signature(d['metadata'], 32, 4)
+    assert second['metadata_sha256'] != first['metadata_sha256']
+    adapter.feature_record(feats, 'w', 1.0, second)
+    assert not list(feats.glob('*.npy')) and not list(feats.glob('*.frames.json'))
+    assert json.loads((feats / 'features.json').read_text())['extraction'] == second
+    assert len(list(next(feats.glob('unverified-*')).glob('*.npy'))) == len(meta)
+
+
+def _finished(sp, plan_sets=('val', 'test')):
+    """A run that has trained, predicted and evaluated (markers and every expected output)."""
+    sp.state.mkdir(parents=True, exist_ok=True)
+    sp.results.mkdir(parents=True, exist_ok=True)
+    for s in ('train', 'predict', 'evaluate'):
+        pipeline.write_json(sp.marker(s), {})
+    for name in plan_sets:
+        (sp.results / f'proposed_{name}.csv').write_text('video_id,text_query,frame_idx,time_sec,score,label\n')
+        (sp.results / f'proposed_{name}.csv.manifest.json').write_text('{}')
+        (sp.results / f'{name}_reference.csv').write_text('video_id,text_query,frame_idx,label\n')
+    (sp.results / 'proposed_calibration.json').write_text('{"threshold": 0.5}')
+    for name in plan_sets:
+        if name != 'val':
+            pipeline.metrics_file(sp, name).write_text('{}')
+
+
+def test_a_finished_run_trained_with_other_settings_is_not_reused(tmp_path, monkeypatch):
+    import copy
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu'])
+    subs = pipeline.experiment_plans(a)
+    base = subs[0]
+    sp = pipeline.Paths(tmp_path, base.run_name)
+    quick = copy.copy(base)
+    quick.epochs, quick.subset_ratio = 2, 0.1                            # e.g. a quick test run in the same root
+    sp.run.mkdir(parents=True)
+    pipeline.write_json(sp.run_cfg, pipeline.proposed_config(quick, sp)[0])
+    (sp.run / 'latest_model.pth').write_bytes(b'x')
+    problem = pipeline.finished_settings_problem(base, sp)
+    assert problem and 'different settings' in problem and 'TRAIN' in problem
+    pipeline.write_json(sp.run_cfg, pipeline.proposed_config(base, sp)[0])
+    assert pipeline.finished_settings_problem(base, sp) is None          # the same settings: accepted
+    saved = json.loads(sp.run_cfg.read_text())                           # node-dependent choices never refuse it
+    saved['DATA']['NUM_WORKERS'], saved['TRAIN']['AMP_DTYPE'] = 3, 'bf16'
+    pipeline.write_json(sp.run_cfg, saved)
+    assert pipeline.finished_settings_problem(base, sp) is None
+    # a comparison method: its recipe signature, written when its training starts
+    tecno = next(s for s in subs if s.kind == 'tecno')
+    tp = pipeline.Paths(tmp_path, tecno.run_name)
+    (tp.run / 'tecno_tcn').mkdir(parents=True)
+    (tp.run / 'tecno_tcn' / 'FINISHED.json').write_text('{}')
+    assert pipeline.finished_settings_problem(tecno, tp) is None          # started before update 23: accepted
+    sig = json.loads((tp.run / 'recipe.json').read_text())                # ... and gets its signature
+    assert sig['recipe'] == json.loads(json.dumps(protocol.COMPARISONS['tecno'])) and sig['seed'] == tecno.seed
+    sig['recipe']['cnn_epochs'] = 2
+    pipeline.write_json(tp.run / 'recipe.json', sig)
+    assert 'different settings' in pipeline.finished_settings_problem(tecno, tp)
+    # the job: the refused run fails on its own (left out of the tables), never retrained, the others go on
+    _finished(sp, [n for n, _ in pipeline.prediction_sets(base, sp)])
+    pipeline.write_json(sp.run_cfg, pipeline.proposed_config(quick, sp)[0])
+    calls = []
+
+    def drive(a, p, stages, redo):
+        calls.append((a.run_name, list(stages)))
+        a.failed_stage = None
+        return 0
+    monkeypatch.setattr(pipeline, '_drive', drive)
+    monkeypatch.setattr(pipeline, 'write_report_bundle', lambda *x, **k: None)
+    monkeypatch.setattr(pipeline, 'paper_outputs', lambda a, plans: 0)
+    monkeypatch.setattr(pipeline, 'data_prepared', lambda p: True)
+    assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu']) == 1
+    assert base.run_name not in [n for n, _ in calls] and len(calls) == 19
+    assert (sp.results / 'settings_refused.json').exists()
+    m = pa.Method(next(p for p in protocol.plans('paper') if p['name'] == base.run_name), tmp_path)
+    assert not m.finished and 'other settings' in m.problem               # the analysis leaves it out, with why
+    pipeline.write_json(sp.run_cfg, pipeline.proposed_config(base, sp)[0])
+    calls.clear()
+    assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu']) == 0
+    assert calls[0] == (base.run_name, ['summary']) and not (sp.results / 'settings_refused.json').exists()
+
+
+def test_missing_outputs_of_a_finished_run_are_made_again_without_retraining(tmp_path, monkeypatch):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu'])
+    base = pipeline.experiment_plans(a)[0]
+    sp = pipeline.Paths(tmp_path, base.run_name)
+    sets = [n for n, _ in pipeline.prediction_sets(base, sp)]
+    _finished(sp, sets)
+    assert pipeline.repair_outputs(base, sp) is None                      # nothing missing: nothing redone
+    assert all(sp.marker(s).exists() for s in ('train', 'predict', 'evaluate'))
+    (sp.results / 'proposed_calibration.json').write_text('{"thres')       # damaged calibration: evaluation only
+    assert pipeline.repair_outputs(base, sp) == 'evaluate'
+    assert sp.marker('predict').exists() and not sp.marker('evaluate').exists() and sp.marker('train').exists()
+    _finished(sp, sets)
+    (sp.results / 'proposed_test.csv').unlink()                          # a deleted test CSV: predictions too
+    assert pipeline.repair_outputs(base, sp) == 'predict'
+    assert not sp.marker('predict').exists() and not sp.marker('evaluate').exists() and sp.marker('train').exists()
+    # the next job then runs this run's stages again (train only confirms it has finished) instead of its summary
+    _finished(sp, sets)
+    pipeline.write_json(sp.run_cfg, pipeline.proposed_config(base, sp)[0])
+    (sp.results / 'test_reference.csv').unlink()
+    calls = []
+
+    def drive(a, p, stages, redo):
+        calls.append((a.run_name, list(stages)))
+        a.failed_stage = None
+        return 0
+    monkeypatch.setattr(pipeline, '_drive', drive)
+    monkeypatch.setattr(pipeline, 'write_report_bundle', lambda *x, **k: None)
+    monkeypatch.setattr(pipeline, 'paper_outputs', lambda a, plans: 0)
+    monkeypatch.setattr(pipeline, 'data_prepared', lambda p: True)
+    assert pipeline.main(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu']) == 0
+    stages = dict(calls)[base.run_name]
+    assert stages != ['summary'] and {'train', 'predict', 'evaluate'} <= set(stages)
+
+
+def test_an_incomplete_analysis_says_so_and_one_failing_figure_costs_only_itself(tmp_path, monkeypatch):
+    root = tmp_path / 'root'
+    d = make_prepared(root, n_videos=6, seconds=30, split=dict(
+        train=['CHOLEC80__video01', 'CHOLEC80__video02', 'CHOLEC80__video03'], val=['CHOLEC80__video04'],
+        test=['CHOLEC80__video05', 'CHOLEC80__video06']))
+    rng = np.random.default_rng(0)
+    plans = {p['name']: p for p in protocol.plans('paper')}
+    for name in ('paper_baseline_s42', 'paper_advanced_s42', 'paper_clip_zeroshot'):
+        p = plans[name]
+        p['short'] = 'advanced' if p['flags'] == protocol.ADVANCED else p['kind']
+        _write_results(root, d, p, rng, quality=2.0)
+    assert pa.main(['--root', str(root), '--bootstrap', '10', '--permutations', '5']) == 0   # not finished: no failure
+    assert json.loads((root / 'paper' / 'analysis_status.json').read_text())['ok']
+
+    def broken(*x, **k):
+        raise RuntimeError('test: this figure cannot be drawn')
+    monkeypatch.setattr(pa, 'reliability_figure', broken)
+    for f in (root / 'paper' / 'figures').glob('*'):
+        f.unlink()
+    assert pa.main(['--root', str(root), '--bootstrap', '10', '--permutations', '5']) == 1
+    status = json.loads((root / 'paper' / 'analysis_status.json').read_text())
+    assert not status['ok'] and 'figure reliability failed' in status['problems'][0]
+    report = json.loads((root / 'paper' / 'analysis.json').read_text())
+    assert list(report['figure_error']) == ['reliability']
+    for fig in ('risk_coverage', 'training_dynamics', 'per_query_ap'):     # the others are still drawn
+        assert (root / 'paper' / 'figures' / f'{fig}.png').exists(), fig
+    assert not (root / 'paper' / 'figures' / 'reliability.png').exists()

@@ -449,14 +449,15 @@ def test_the_rehearsal_trains_each_model_for_two_steps_in_its_own_process(tmp_pa
     env = env_for(tmp_path)                              # (tiny backbone and crop through the test hook)
     cfg = tmp_path / 'cfg.json'
     cfg.write_text(json.dumps(dict(MODEL=dict(M2CRL_WEIGHTS_PATH=''), TRAIN=dict(AMP_DTYPE='bf16'))))
-    assert [x for x in pipeline.REHEARSAL_PARTS if x != 'advanced'] == ['closedset', 'tecno_cnn', 'tecno_tcn']
-    for part in ('closedset', 'tecno_cnn', 'tecno_tcn'):          # ('advanced' is main.py's own check)
+    assert [x for x in pipeline.REHEARSAL_PARTS if x != 'advanced'] == ['closedset', 'tecno_cnn', 'tecno_tcn', 'univtg']
+    for part in ('closedset', 'tecno_cnn', 'tecno_tcn', 'univtg'):    # ('advanced' is main.py's own check)
         out = tmp_path / f'{part}.json'
         run([REPO / 'comparison_models' / 'rehearsal.py', '--part', part, '--config', cfg, '--output', out,
-             '--device', 'cpu', '--closedset-batch', 2, '--tecno-batch', 4, '--tecno-size', 32, '--tcn-steps', 300],
-            env, tmp_path)
+             '--device', 'cpu', '--closedset-batch', 2, '--tecno-batch', 4, '--tecno-size', 32, '--tcn-steps', 300,
+             '--univtg-batch', 2, '--univtg-clip', 4, '--univtg-seconds', 160], env, tmp_path)
         result = json.loads(out.read_text())
         assert list(result) == [part] and result[part]['ok'], result
+    assert 'UniVTG' in result['univtg']['what'] and '40 clips' in result['univtg']['what']
 
 
 def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_the_job(tmp_path, monkeypatch):
@@ -482,7 +483,7 @@ def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_th
     monkeypatch.setattr(pipeline, 'run', ok)
     record = pipeline.rehearse_comparisons(sub, p)
     assert [part_of(c) for c, _ in calls] == list(pipeline.REHEARSAL_PARTS) == \
-        ['advanced', 'closedset', 'tecno_cnn', 'tecno_tcn']                                  # one process each
+        ['advanced', 'closedset', 'tecno_cnn', 'tecno_tcn', 'univtg']                        # one process each
     assert all(k['timeout'] == pipeline.REHEARSAL_TIMEOUT for _, k in calls)                 # each with a deadline
     advanced = calls[0][0]                                          # our advanced model at the TRAINING batch
     assert advanced[1].endswith('main.py') and advanced[2] == '_check_advanced' and advanced[4] == str(sub.batch_size) == '8'
@@ -491,31 +492,33 @@ def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_th
     cmd = calls[1][0]
     assert cmd[1].endswith('rehearsal.py') and cmd[cmd.index('--tecno-batch') + 1] == '80'
     assert cmd[cmd.index('--closedset-batch') + 1] == '8'
+    assert cmd[cmd.index('--univtg-batch') + 1] == '8' and cmd[cmd.index('--univtg-clip') + 1] == '4'
+    assert float(cmd[cmd.index('--univtg-seconds') + 1]) == 6000.0     # no data prepared yet: a long Cholec80 video
     assert record['gpu'] == 'NVIDIA A100-SXM4-80GB' and all(record[x]['ok'] for x in pipeline.REHEARSAL_PARTS)
     assert record['signature']['amp'] == 'bf16' and record['signature']['text_model'] == sub.text_model
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 4                                          # passed with the same settings: not repeated
+    assert len(calls) == 5                                          # passed with the same settings: not repeated
     sub.batch_size = 4
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 8                                          # another training batch: checked again
+    assert len(calls) == 10                                          # another training batch: checked again
     original_text_model, sub.text_model = sub.text_model, 'another/text-encoder'
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 12 and json.loads(Path(calls[-4][0][3]).read_text())['MODEL']['TEXT_ENCODER_MODEL'] == \
+    assert len(calls) == 15 and json.loads(Path(calls[-5][0][3]).read_text())['MODEL']['TEXT_ENCODER_MODEL'] == \
         'another/text-encoder'                                      # another text encoder: checked again, with it
     sub.text_model = original_text_model
     sub.amp_dtype = 'fp16'
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 16                                         # another precision: checked again
+    assert len(calls) == 20                                         # another precision: checked again
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 16
+    assert len(calls) == 20
     monkeypatch.setattr(pipeline, 'REHEARSAL_CODE', pipeline.REHEARSAL_CODE[:-1])   # (stands for a code change)
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 20                                         # other model code: checked again
+    assert len(calls) == 25                                         # other model code: checked again
     (p.state / 'comparison_rehearsal.json').write_text('[1]')      # an unreadable record is simply redone
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 24
+    assert len(calls) == 30
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 24                                         # (now passed again with these settings)
+    assert len(calls) == 30                                         # (now passed again with these settings)
     record_file, real_read = p.state / 'comparison_rehearsal.json', Path.read_text
 
     def unreadable(self, *x, **k):                                  # e.g. a transient file-system error
@@ -524,7 +527,7 @@ def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_th
         return real_read(self, *x, **k)
     monkeypatch.setattr(Path, 'read_text', unreadable)
     pipeline.rehearse_comparisons(sub, p)
-    assert len(calls) == 28                                         # rehearsed again, not skipped or aborted
+    assert len(calls) == 35                                         # rehearsed again, not skipped or aborted
     monkeypatch.setattr(Path, 'read_text', real_read)
     assert json.loads(record_file.read_text())['advanced']['ok']
     sub.amp_dtype = 'auto'
@@ -551,7 +554,7 @@ def test_the_rehearsal_runs_once_per_gpu_type_with_a_deadline_and_never_stops_th
         Path(output_of(cmd)).write_text(text)
     monkeypatch.setattr(pipeline, 'run', odd_results)
     record = pipeline.rehearse_comparisons(sub, p)                 # still never raises
-    assert [record[x]['ok'] for x in pipeline.REHEARSAL_PARTS] == [False, False, False, True]
+    assert [record[x]['ok'] for x in pipeline.REHEARSAL_PARTS] == [False, False, False, True, True]
     assert record['tecno_cnn']['error'] == 'own message' and record['advanced']['error']
 
 
@@ -693,7 +696,7 @@ def test_only_checks_and_downloads_have_a_time_limit_never_training_or_predictio
             (limited if any(k.arg == 'timeout' for k in node.keywords) else unlimited).add(name)
     # (`name`: the transfers of download(), whose limit is the download's time budget - None for the dataset)
     assert limited == {"'gpu_check'", "'fetch_models'", "'check_advanced'", "f'rehearse_{part}'", "f'fetch_{family}'",
-                       "'peskavlp_setup'", "f'{model.lower()}_check'", 'name'}
+                       "'peskavlp_setup'", "f'{model.lower()}_check'", 'name', "'fetch_weights'"}
     assert {"'train'", "f'predict_{name}'", "'train_cnn'", "'train_tcn'", "'fetch_data'"} <= unlimited
     assert not (limited - {'name'}) & unlimited                     # (`name` also names other generic steps)
     assert pipeline.CHECK_TIMEOUT == 3600 and pipeline.FETCH_TIMEOUT == 7200

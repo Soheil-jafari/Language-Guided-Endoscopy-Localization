@@ -1,11 +1,14 @@
-"""Real-size GPU rehearsal of the two new trained comparison models (paper preset; about a minute).
+"""Real-size GPU rehearsal of the trained comparison models (paper preset; a few minutes).
 
 Before any long job depends on them, run two optimiser steps of one model at the size the paper protocol trains
 it (random weights and random inputs; nothing is saved), with the same cuDNN settings as their training:
   --part closedset   the closed-set model: our TimeSformer backbone and temporal head, batch 8 x 16 frames at
                      the configured crop, in the configured mixed precision;
   --part tecno_cnn   TeCNO stage 1: the two-head ResNet-50 at batch 80, float32 (as the authors);
-  --part tecno_tcn   TeCNO stage 2: the causal MS-TCN on a 6,000-step sequence (a long Cholec80 video at 1 fps).
+  --part tecno_tcn   TeCNO stage 2: the causal MS-TCN on a 6,000-step sequence (a long Cholec80 video at 1 fps);
+  --part univtg      UniVTG (the official model and our adapted criterion, float32 as its training) on random
+                     M2CRL-sized features as long as the longest video, at the protocol batch, most clips positive
+                     (its span and saliency losses grow with the positive clips).
 main.py runs each part in its own process (so no other model is in GPU memory while one is measured) with a
 deadline, once per GPU type, and only reports a failure; the run it concerns would then fail on its own and be
 retried by the next job. Writes {part: {ok, peak_gb, reserved_gb, seconds, what}} to --output.
@@ -22,7 +25,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / 'comparison_models' / 'closedset'))
 sys.path.insert(0, str(REPO / 'comparison_models' / 'tecno'))
-PARTS = ('closedset', 'tecno_cnn', 'tecno_tcn')
+PARTS = ('closedset', 'tecno_cnn', 'tecno_tcn', 'univtg')
 
 
 def closedset_steps(a, device):
@@ -79,6 +82,43 @@ def tecno_tcn_steps(a, device):
     return f'TeCNO stage 2 (MS-TCN), {a.tcn_steps} steps'
 
 
+def univtg_steps(a, device):
+    import math
+    import random
+    import numpy as np
+    from comparison_models.univtg import adapter
+    from data_contract import PHRASES
+    settings = dict(clip_frames=a.univtg_clip, sample_fps=1.0, epochs=1, lr=1e-4, batch_size=a.univtg_batch,
+                    eval_every=1, seed=0, max_v_l=100000)
+    model, criterion, opt = adapter.build(settings, device)
+    model.train()
+    criterion.train()
+    optimizer = torch.optim.AdamW([q for q in model.parameters() if q.requires_grad], lr=1e-4, weight_decay=opt.wd)
+    clips = math.ceil(a.univtg_seconds / a.univtg_clip)
+    rng = np.random.default_rng(0)
+    samples = []
+    for i in range(a.univtg_batch):                                     # distinct sentences, as in training
+        query = PHRASES[i % len(PHRASES)]
+        windows = [[s, min(clips, s + clips // 5)] for s in range(0, clips, clips // 4)]   # ~80 % of clips positive
+        samples.append(dict(query=query, vfeat=adapter.l2_normalize(rng.normal(size=(clips, adapter.VIDEO_DIM)).astype(
+                                np.float32)),
+                            tfeat=adapter.l2_normalize(rng.normal(size=(12, adapter.TEXT_DIM)).astype(np.float32)),
+                            windows=windows, observed=np.ones(clips, bool),
+                            not_negative={q: np.zeros(clips, bool) for q in PHRASES}))
+    weights = criterion.weight_dict
+    for step in range(2):
+        inputs, targets = adapter.batch_inputs(samples, device, random.Random(step))
+        loss_dict = criterion(model(**inputs), targets)
+        loss = sum(loss_dict[k] * weights[k] for k in loss_dict if k in weights)
+        optimizer.zero_grad()
+        loss.backward()
+        if opt.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
+        optimizer.step()
+    return (f'UniVTG, batch {a.univtg_batch} x {clips} clips of {a.univtg_clip} s ({a.univtg_seconds:.0f} s, the '
+            f'longest video), ~80 % of clips positive, float32')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--part', choices=PARTS, required=True)
@@ -87,6 +127,9 @@ def main():
     p.add_argument('--tecno-size', type=int, default=224)
     p.add_argument('--closedset-batch', type=int, default=8)
     p.add_argument('--tcn-steps', type=int, default=6000)
+    p.add_argument('--univtg-batch', type=int, default=8)
+    p.add_argument('--univtg-clip', type=int, default=4)
+    p.add_argument('--univtg-seconds', type=float, default=6000.0, help='length of the longest video')
     p.add_argument('--output', required=True)
     p.add_argument('--device', default='cuda', help='(cpu: for the tests only)')
     a = p.parse_args()
@@ -100,7 +143,8 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     started = time.time()
     try:
-        what = dict(closedset=closedset_steps, tecno_cnn=tecno_cnn_steps, tecno_tcn=tecno_tcn_steps)[a.part](a, device)
+        what = dict(closedset=closedset_steps, tecno_cnn=tecno_cnn_steps, tecno_tcn=tecno_tcn_steps,
+                    univtg=univtg_steps)[a.part](a, device)
         result = dict(ok=True, what=what, seconds=round(time.time() - started, 1))
         if device == 'cuda':
             torch.cuda.synchronize()

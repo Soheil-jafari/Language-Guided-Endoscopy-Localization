@@ -121,11 +121,18 @@ the file lists; not TeCNO and the closed-set model, which have no text input). A
 that is not stopped by its time limit, `paper_analysis.py` (CPU, minutes) rewrites all tables and figures
 from whatever has finished: `lgel_paper/paper/PAPER_RESULTS.md`, `paper/tables/*.csv|.tex`,
 `paper/figures/*.png|.pdf`, `paper/explanations/` (patch-relevance maps of our two models),
-`paper/analysis.json`. A run whose outputs turn out to be unusable is left out of the tables with the
-reason, never the whole analysis. `paper/STATUS.md` says, after every run and at the end of every job,
+`paper/analysis.json`. A run whose outputs turn out to be unusable, or that was trained with other
+settings than the protocol's, is left out of the tables with the reason, never the whole analysis; one
+figure that fails costs only itself. The analysis then still writes everything else, but
+`paper/analysis_status.json` says `ok: false` with the reasons and the job ends with exit code 1 (runs that
+have simply not finished yet are no failure). `paper/STATUS.md` says, after every run and at the end of every job,
 which runs have finished, when the tables were last written and from how many runs; a job stopped by its
 time limit only updates `STATUS.md` (no analysis in its last minutes) and the next job rewrites the
 tables. The report bundle in `lgel_paper/outbox/` includes them.
+* **Missing outputs repair themselves.** At the start of every job each finished run's outputs are checked
+  (per prediction set: the predictions, their manifest and the reference labels; then the calibration and the
+  metrics). If one is missing or unreadable, that run's predictions and evaluation (or only its evaluation)
+  are made again by the same job from its trained model; its training is never touched.
 
 * **Nothing is downloaded twice.** The first job reuses the Cholec80 videos already unpacked in
   `lgel/raw/extracted` and the M2CRL weights file the earlier runs used (`submit.sh` prints both); the
@@ -141,12 +148,14 @@ tables. The report bundle in `lgel_paper/outbox/` includes them.
   loop - two AdamW steps of two accumulated micro-batches, so the optimiser state and the gradients of the
   earlier micro-batch are held while a micro-batch runs, as in training (more micro-batches per step add no
   memory) - then an evaluation forward pass, with the training and the evaluation peaks measured
-  separately; and two training steps of the closed-set model and of TeCNO. Each runs in its own process
+  separately; and two training steps of the closed-set model, of TeCNO, and of UniVTG on random features as long
+  as the longest video (6,000 s before the data is prepared) at its training batch, most clips positive. Each runs in its own process
   with a 15-minute limit, so a memory problem shows in the first report rather than days later. It never
   stops the job. It is strong evidence, not a guarantee: real data, the data loaders and memory
   fragmentation over days are not part of it. It is repeated in a later job only while one of its parts
   has not passed, or when the GPU type, the batch or accumulation, the precision, the text encoder, the
-  model or training-loop code or the PyTorch/Mamba versions change.
+  model or training-loop code, the PyTorch/Mamba versions or the longest video change (so once more in the
+  second job, with the real longest video, after the first job has prepared the data).
 * **One run failing does not stop the others.** If, say, a comparison method's download fails, the job
   logs it, goes on with the next run, and ends with exit code 1; the failed run is retried (from where
   it stopped) by the next job. A failure that affects every run (the data, the GPU check, the Mamba
@@ -447,7 +456,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with the automated tests in `tests/` (305 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with the automated tests in `tests/` (315 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.

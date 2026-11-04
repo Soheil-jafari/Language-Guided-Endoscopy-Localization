@@ -324,30 +324,43 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
             proc = subprocess.Popen(cmd, cwd=REPO, env=env or stage_env(a, p), stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
                                     bufsize=1, start_new_session=hasattr(os, 'killpg'))
-            if timeout is None:
-                pump(lf)
-            else:
-                # The output is read in a thread, so that the time limit holds even if something outside the
-                # step's process group (it left the group) keeps the output open: once the group has been
-                # stopped, such output is no longer waited for.
-                failure = []
+            # The output is read in a thread, so that this step never waits forever for output that something
+            # it started keeps open: once its first process has ended, the rest gets PIPE_GRACE seconds to close
+            # it, then what is left of its process group is stopped (only then - a running training or prediction
+            # is never limited). With a time limit, output held by a process outside the group (it left the
+            # group) is no longer waited for once the group has been stopped.
+            failure = []
 
-                def reader():
-                    try:
-                        pump(lf)
-                    except BaseException as e:       # noqa: BLE001  (re-raised below, in this thread)
-                        failure.append(e)
-                pumping = threading.Thread(target=reader, daemon=True)
-                pumping.start()
+            def reader():
+                try:
+                    pump(lf)
+                except BaseException as e:           # noqa: BLE001  (re-raised below, in this thread)
+                    failure.append(e)
+            pumping = threading.Thread(target=reader, daemon=True)
+            pumping.start()
+            if timeout is not None:
                 watcher = threading.Thread(target=watchdog, daemon=True)
                 watcher.start()
-                while pumping.is_alive():
-                    pumping.join(0.5)
-                    if timed_out.is_set() and not watcher.is_alive() and pumping.is_alive():
+            ended = None
+            while pumping.is_alive():
+                pumping.join(0.5)
+                if not pumping.is_alive():
+                    break
+                if timed_out.is_set() and not watcher.is_alive():
+                    log(f'!! {name}: its output is still held open by a process outside its group; not waiting')
+                    break
+                if ended is None and proc.poll() is not None:
+                    ended = time.monotonic()
+                if ended is not None and time.monotonic() - ended > PIPE_GRACE:
+                    log(f'!! {name}: its first process ended (exit code {proc.returncode}) {PIPE_GRACE} s ago, but '
+                        f'something it started still holds its output open: stopping what is left of it')
+                    stop_process_group(proc)
+                    pumping.join(5)
+                    if pumping.is_alive():
                         log(f'!! {name}: its output is still held open by a process outside its group; not waiting')
-                        break
-                if failure:
-                    raise failure[0]
+                    break
+            if failure:
+                raise failure[0]
             rc = proc.wait()
     except BaseException:
         if proc is not None:                         # even if its first process has already ended
@@ -375,6 +388,9 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
         err.timed_out = timed_out.is_set()
         raise err
     return rc
+
+
+PIPE_GRACE = 120          # seconds a step's output may stay open after its first process has ended (see run)
 
 
 def stop_process_group(proc, grace=15):
@@ -1240,7 +1256,8 @@ def stage_fetch_weights(a, p):
     cfg_path = p.tmp / 'check_model.json'
     write_json(cfg_path, cfg)
     try:
-        run([sys.executable, __file__, '_check_model', cfg_path], a, p, 'fetch_weights')
+        run([sys.executable, __file__, '_check_model', cfg_path], a, p, 'fetch_weights',
+            timeout=CHECK_TIMEOUT)                      # a check, not training: a hang must not hold the job
     except StageError as e:
         if not a.weights_path and getattr(e, 'rc', None) == CHECKPOINT_REJECTED:   # our download, really unusable
             aside = discard_download(p.weights)
@@ -1311,7 +1328,7 @@ def stage_check_advanced(a, p):
             log(f'!! the full-size rehearsal could not run ({e!r}); the job continues.')
 
 
-REHEARSAL_PARTS = ('advanced', 'closedset', 'tecno_cnn', 'tecno_tcn')
+REHEARSAL_PARTS = ('advanced', 'closedset', 'tecno_cnn', 'tecno_tcn', 'univtg')
 REHEARSAL_TIMEOUT = 900                                    # seconds per model (normally well under a minute)
 # Time limits of the steps that are neither training nor prediction, so that a stalled download or a hung
 # GPU call costs at most this, not the rest of a 72-hour job (the job then fails clearly, or the run alone
@@ -1321,10 +1338,11 @@ FETCH_TIMEOUT = 7200                                       # model downloads, th
 # The code that decides what the rehearsed models allocate (sizes, crop, clip, layers, losses).
 REHEARSAL_CODE = ('main.py', 'train.py', 'project_config.py', 'models.py', 'losses.py', 'backbone/vision_transformer.py',
                   'backbone/endomamba.py', 'paper_protocol.py', 'comparison_models/rehearsal.py',
-                  'comparison_models/closedset/closedset.py', 'comparison_models/tecno/tecno.py')
+                  'comparison_models/closedset/closedset.py', 'comparison_models/tecno/tecno.py',
+                  'comparison_models/univtg/adapter.py', 'comparison_models/univtg/official/model/univtg.py')
 
 
-def rehearsal_signature(a, gpu, amp):
+def rehearsal_signature(a, gpu, amp, univtg_seconds=6000.0):
     """Everything a passed rehearsal depends on: a rehearsal is repeated when any of it differs (another GPU
     type, training batch or accumulation, precision, text encoder, model flags or sizes in the code, the training
     loop, PyTorch or Mamba)."""
@@ -1340,11 +1358,24 @@ def rehearsal_signature(a, gpu, amp):
     except Exception:                                   # noqa: BLE001  (the functional check has reported it)
         mamba = None
     tecno = protocol.COMPARISONS['tecno']
+    univtg = protocol.COMPARISONS['univtg']
     return dict(gpu=gpu, batch=int(a.batch_size), accumulation=int(getattr(a, 'accum', 1) or 1),
                 rehearsed_accumulation=REHEARSAL_ACCUMULATION, amp=amp, text_model=a.text_model, advanced_flags=ADVANCED_FLAGS,
+                univtg_batch=int(univtg['batch_size']), univtg_clip=int(univtg['clip_length']),
+                univtg_seconds=float(univtg_seconds),
                 closedset_batch=int(protocol.COMPARISONS['closedset']['batch_size']),
                 tecno_batch=int(tecno['cnn_batch_size']), tecno_size=int(tecno['input_size']),
                 torch=torch.__version__, mamba_ssm=mamba, code_sha256=code.hexdigest())
+
+
+def longest_video_seconds(p):
+    """The longest video's duration from the prepared metadata (6,000 s - a long Cholec80 video - before the data
+    is prepared): UniVTG's rehearsal uses it."""
+    try:
+        meta = json.loads(p.metadata.read_text())
+        return round(max(m['frame_count'] / m['source_fps'] for m in meta.values()), 1)
+    except Exception:                                   # noqa: BLE001  (not prepared yet, or unreadable)
+        return 6000.0
 
 
 def rehearse_comparisons(a, p):
@@ -1359,7 +1390,8 @@ def rehearse_comparisons(a, p):
         return None
     gpu = torch.cuda.get_device_name(0)
     amp = a.amp_dtype if a.amp_dtype != 'auto' else ('bf16' if native_bf16() else 'fp16')
-    signature = rehearsal_signature(a, gpu, amp)
+    longest = longest_video_seconds(p)
+    signature = rehearsal_signature(a, gpu, amp, longest)
     record = p.state / 'comparison_rehearsal.json'
     try:                                        # an unreadable record is no reason to skip: rehearse again
         done = json.loads(record.read_text()) if record.exists() else {}
@@ -1388,7 +1420,9 @@ def rehearse_comparisons(a, p):
         else:
             cmd = [sys.executable, 'comparison_models/rehearsal.py', '--part', part, '--config', cfg_path, '--output',
                    out, '--closedset-batch', protocol.COMPARISONS['closedset']['batch_size'], '--tecno-batch',
-                   tecno_cfg['cnn_batch_size'], '--tecno-size', tecno_cfg['input_size']]
+                   tecno_cfg['cnn_batch_size'], '--tecno-size', tecno_cfg['input_size'],
+                   '--univtg-batch', protocol.COMPARISONS['univtg']['batch_size'],
+                   '--univtg-clip', protocol.COMPARISONS['univtg']['clip_length'], '--univtg-seconds', longest]
         try:
             run(cmd, a, p, f'rehearse_{part}', timeout=REHEARSAL_TIMEOUT)
             r = json.loads(out.read_text())[part]
@@ -2032,27 +2066,21 @@ def stage_train(a, p):
                          f'model (it would only check it again). To train it again, use a new --run-name (or a new '
                          f'--root); to redo only its predictions and evaluation, use --force predict.')
     if getattr(a, 'kind', 'proposed') != 'proposed':
+        problem = comparison_settings_problem(a, p)
+        settings_refused(p, problem)
+        if problem:
+            raise StageError(problem)
         return COMPARISON_METHODS[a.kind]['train'](a, p)
     if uses_flow(a):
         require_flow_weights_offline(a, p)
-    amp = a.amp_dtype
-    if amp == 'auto':
-        amp = 'bf16' if native_bf16() else 'fp16'
-    # 16 frames are decoded per sample; with enough CPUs, more loader processes keep the GPU busy.
-    workers = a.train_workers if a.train_workers is not None else min(16, max(0, cpu_count() - 2))
-    cfg = train_config(a, p, workers, amp)
-    if p.run_cfg.exists():
-        saved = json.loads(p.run_cfg.read_text())
-        # node-dependent auto choices are frozen at first launch so a resume on another node still matches
-        if a.train_workers is None:
-            cfg['DATA']['NUM_WORKERS'] = saved['DATA']['NUM_WORKERS']
-        if a.amp_dtype == 'auto':
-            cfg['TRAIN']['AMP_DTYPE'] = saved['TRAIN']['AMP_DTYPE']
+    cfg, saved = proposed_config(a, p)
+    if saved is not None:
+        problem = proposed_settings_problem(a, p, cfg, saved)
+        settings_refused(p, problem)
+        if problem:
+            raise StageError(problem)
         if cfg != saved:
             diff = sorted(k for k in set(cfg) | set(saved) if cfg.get(k) != saved.get(k))
-            if p.run.exists() and any(p.run.rglob('*.pth')):
-                raise StageError(f'Run "{a.run_name}" already exists with different settings ({diff}). '
-                                 f'Use a different --run-name, or restore the original flags to resume it.')
             # Nothing trained yet (e.g. the first attempt ran out of GPU memory and you lowered
             # --batch-size): there is nothing to protect, so take the new settings.
             log(f'settings changed since the last launch ({diff}) but no checkpoint exists yet: using the new settings')
@@ -2076,6 +2104,95 @@ def stage_train(a, p):
     repair_metrics_journal(p, done)
     if done < cfg['TRAIN']['NUM_EPOCHS']:
         raise StageError('train.py ended before the configured number of epochs.')
+
+
+def proposed_config(a, p):
+    """(this invocation's training configuration of our model, the saved one or None), made comparable as a resume
+    compares them: the node-dependent automatic choices - the loader processes unless --train-workers is given, the
+    precision with --amp-dtype auto - are frozen at the first launch, so they are taken from the saved one."""
+    amp = a.amp_dtype
+    if amp == 'auto':
+        amp = 'bf16' if native_bf16() else 'fp16'
+    # 16 frames are decoded per sample; with enough CPUs, more loader processes keep the GPU busy.
+    workers = a.train_workers if a.train_workers is not None else min(16, max(0, cpu_count() - 2))
+    cfg = train_config(a, p, workers, amp)
+    saved = json.loads(p.run_cfg.read_text()) if p.run_cfg.exists() else None
+    if saved is not None:
+        if a.train_workers is None:
+            cfg['DATA']['NUM_WORKERS'] = saved['DATA']['NUM_WORKERS']
+        if a.amp_dtype == 'auto':
+            cfg['TRAIN']['AMP_DTYPE'] = saved['TRAIN']['AMP_DTYPE']
+    return cfg, saved
+
+
+def proposed_settings_problem(a, p, cfg=None, saved=None):
+    """Why our model's run cannot be continued or reused with this invocation's settings (None: it can): its saved
+    configuration differs and it has trained (a checkpoint exists). The comparison of a resume (stage_train)."""
+    if cfg is None:
+        cfg, saved = proposed_config(a, p)
+    if saved is None or cfg == saved or not (p.run.exists() and any(p.run.rglob('*.pth'))):
+        return None
+    diff = sorted(k for k in set(cfg) | set(saved) if cfg.get(k) != saved.get(k))
+    return (f'Run "{a.run_name}" already exists with different settings ({diff}). Use a different --run-name (or a '
+            f'new --root), or restore the original flags to resume it.')
+
+
+def recipe_signature(a, p):
+    """What a trained comparison method's training depends on besides the data (the run inputs, which every stage
+    checks): its protocol recipe (paper_protocol.COMPARISONS), the seed and the frame rate; for UniVTG also the
+    text encoder and the backbone features; for the closed-set models also our model's training configuration,
+    which they take (as their own resume compares it, without the loader processes)."""
+    sig = dict(kind=a.kind, recipe=protocol.COMPARISONS.get(a.kind), seed=a.seed, sample_fps=a.sample_fps)
+    if a.kind == 'univtg':
+        sig.update(text_model=a.text_model, features=univtg_features_dir(a, p).name)
+    if a.kind in ('closedset', 'closedset_matched'):
+        sig['config'] = closedset_comparable(closedset_config(a, p)[0])
+    return json.loads(json.dumps(sig))                     # (as stored: tuples become lists)
+
+
+def comparison_settings_problem(a, p):
+    """Why a trained comparison run cannot be continued or reused with this invocation's settings (None: it can).
+    Its recipe signature (recipe.json) is written when its training first starts; a run without one (started
+    before it existed) is accepted and gets it. A different signature is refused once the method has trained
+    anything; before that the new settings are taken."""
+    if COMPARISON_METHODS.get(a.kind, {}).get('trained') is None:
+        return None                                         # zero-shot: nothing is trained
+    want = recipe_signature(a, p)
+    f = p.run / 'recipe.json'
+    try:
+        have = json.loads(f.read_text()) if f.exists() else None
+    except (OSError, ValueError):
+        have = None                                         # unreadable: written again
+    if have == want:
+        return None
+    trained = p.run.exists() and (any(p.run.rglob('*.pt')) or any(p.run.rglob('*.pth'))
+                                  or any(p.run.glob('*/FINISHED.json')))
+    if have is not None and trained:
+        diff = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+        return (f'Run "{a.run_name}" was trained with different settings ({diff}). Use a new --root, or restore the '
+                f'original settings; nothing is retrained or deleted automatically.')
+    if have is not None:
+        log(f'{a.run_name}: settings changed before anything was trained: using the new ones')
+    write_json(f, want)
+    return None
+
+
+def finished_settings_problem(a, p):
+    """For a run that has already finished: why it cannot be reused with this invocation's settings (None: it
+    can) - the check its training would make if it continued."""
+    if getattr(a, 'kind', 'proposed') == 'proposed':
+        return proposed_settings_problem(a, p)
+    return comparison_settings_problem(a, p)
+
+
+def settings_refused(p, problem):
+    """Record (or clear, with problem=None) that this run's training settings do not match this invocation's:
+    the paper analysis leaves such a run out of the tables, with the reason."""
+    f = p.results / 'settings_refused.json'
+    if problem:
+        write_json(f, dict(problem=problem, written=time.ctime()))
+    else:
+        f.unlink(missing_ok=True)
 
 
 def _epoch_progress(total):
@@ -2132,6 +2249,66 @@ def stage_predict(a, p):
 
 def metrics_file(p, name):
     return p.results / ('proposed_test_metrics.json' if name == 'test' else f'proposed_{name}_metrics.json')
+
+
+def _usable_csv(path, columns):
+    """A prediction or reference file that can be read: present, with these columns in its header."""
+    try:
+        with open(path, errors='replace') as f:
+            header = f.readline().strip().split(',')
+    except OSError:
+        return False
+    return all(c in header for c in columns)
+
+
+def _usable_json(path):
+    try:
+        json.loads(Path(path).read_text())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def damaged_outputs(a, p):
+    """For an evaluated run: ('predict' or 'evaluate' - the first stage to redo -, the files missing or unreadable),
+    or (None, []) when every expected output is there: per prediction set the predictions, their manifest and the
+    reference labels (predict), then the calibration and the metrics (evaluate)."""
+    sets = prediction_sets(a, p)
+    bad = []
+    for name, _ in sets:
+        if not _usable_csv(p.results / f'proposed_{name}.csv', ('video_id', 'text_query', 'frame_idx', 'score')):
+            bad.append(f'proposed_{name}.csv')
+        if not _usable_json(p.results / f'proposed_{name}.csv.manifest.json'):
+            bad.append(f'proposed_{name}.csv.manifest.json')
+        if not _usable_csv(p.results / f'{name}_reference.csv', ('video_id', 'text_query', 'frame_idx', 'label')):
+            bad.append(f'{name}_reference.csv')
+    if bad:
+        return 'predict', bad
+    bad = [f.name for f in [p.results / 'proposed_calibration.json'] + [metrics_file(p, n) for n, _ in sets if n != 'val']
+           if not _usable_json(f)]
+    return ('evaluate', bad) if bad else (None, [])
+
+
+def repair_outputs(a, p):
+    """An evaluated run whose outputs are missing or unreadable (e.g. a deleted or damaged file) gets its predict
+    and evaluate markers removed (only evaluate, if only the calibration or metrics are affected), so that this
+    job's normal stages make them again - from the trained model: training is never touched. Never raises."""
+    try:
+        if not p.marker('evaluate').exists():
+            return None
+        stage, bad = damaged_outputs(a, p)
+        if stage is None:
+            return None
+        redo = ['predict', 'evaluate'] if stage == 'predict' else ['evaluate']
+        log(f'!! {a.run_name}: {", ".join(bad)} missing or unreadable: its '
+            + ('predictions and evaluation are' if stage == 'predict' else 'evaluation is')
+            + ' made again by this job (its training is not touched)')
+        for s in redo:
+            p.marker(s).unlink(missing_ok=True)
+        return stage
+    except Exception as e:                                  # noqa: BLE001
+        log(f'!! {a.run_name}: its outputs could not be checked ({e!r})')
+        return None
 
 
 def stage_evaluate(a, p):
@@ -2441,30 +2618,41 @@ def scored_predictions(a, p, sets, tag, command):
 
 
 # ----- our model without language (closed set): comparison_models/closedset/closedset.py
+def closedset_config(a, p):
+    """(the closed-set training configuration, the saved one or None): our model's own training configuration
+    (same backbone weights, optimiser, schedule, epochs, crop, clip, augmentation, seed) with the closed-set batch;
+    node-dependent choices are frozen at the first launch."""
+    spec = protocol.COMPARISONS[a.kind]
+    amp = a.amp_dtype
+    if amp == 'auto':
+        amp = 'bf16' if native_bf16() else 'fp16'
+    cfg = train_config(a, p, score_workers(a), amp)
+    cfg['TRAIN'].update(BATCH_SIZE=spec['batch_size'], GRADIENT_ACCUMULATION_STEPS=spec['accum'])
+    config_file = p.run / 'closedset_config.json'
+    saved = json.loads(config_file.read_text()) if config_file.exists() else None
+    if saved is not None:
+        if a.train_workers is None:
+            cfg['DATA']['NUM_WORKERS'] = saved['DATA']['NUM_WORKERS']
+        if a.amp_dtype == 'auto':
+            cfg['TRAIN']['AMP_DTYPE'] = saved['TRAIN']['AMP_DTYPE']
+    return cfg, saved
+
+
+def closedset_comparable(c):
+    """A closed-set configuration without the loader process count (which does not change the training)."""
+    return {k: ({kk: vv for kk, vv in v.items() if kk != 'NUM_WORKERS'} if k == 'DATA' else v) for k, v in c.items()}
+
+
 def closedset_train(a, p):
     spec = protocol.COMPARISONS[a.kind]
     out = p.run / 'closedset'
     if finished_marker(out).exists():
         log('closed-set training already finished')
         return
-    amp = a.amp_dtype
-    if amp == 'auto':
-        amp = 'bf16' if native_bf16() else 'fp16'
-    # Our model's own training configuration (same backbone weights, optimiser, schedule, epochs, crop, clip,
-    # augmentation, seed), with the closed-set batch.
-    cfg = train_config(a, p, score_workers(a), amp)
-    cfg['TRAIN'].update(BATCH_SIZE=spec['batch_size'], GRADIENT_ACCUMULATION_STEPS=spec['accum'])
+    cfg, saved = closedset_config(a, p)
     config_file = p.run / 'closedset_config.json'
-    if config_file.exists():
-        saved = json.loads(config_file.read_text())
-        if a.train_workers is None:                     # node-dependent choices are frozen at the first launch
-            cfg['DATA']['NUM_WORKERS'] = saved['DATA']['NUM_WORKERS']
-        if a.amp_dtype == 'auto':
-            cfg['TRAIN']['AMP_DTYPE'] = saved['TRAIN']['AMP_DTYPE']
-        def comparable(c):                              # the loader process count does not change the training
-            return {k: ({kk: vv for kk, vv in v.items() if kk != 'NUM_WORKERS'} if k == 'DATA' else v)
-                    for k, v in c.items()}
-        if comparable(cfg) != comparable(saved) and (out / 'latest.pt').exists():
+    if saved is not None:
+        if closedset_comparable(cfg) != closedset_comparable(saved) and (out / 'latest.pt').exists():
             raise StageError(f'Run "{a.run_name}" was started with different settings; restore them to resume it.')
     p.run.mkdir(parents=True, exist_ok=True)
     write_json(config_file, cfg)
@@ -3029,14 +3217,30 @@ def main(argv=None):
             if len(plans) > 1:
                 log(f'##### run {i + 1} of {len(plans)}: {sub.label} (run {sub.run_name})')
             stages = selected
+            refused = None
+            if paper and selected[-1] == STAGES[-1]:
+                repair_outputs(sub, sp)                     # missing outputs of a finished run: made again
             if i < len(plans) - 1 and not redo and model_finished(sp) and selected[-1] == STAGES[-1]:
                 # Trained, predicted and evaluated: only its summary is redone (which also checks that the
-                # data has not changed since, and exports its weights if that was interrupted). Its
-                # training settings are not compared, so this command's settings can differ for the next model.
-                log(f'{sub.run_name} has already finished (trained, predicted and evaluated): only its summary is redone')
-                stages = ['summary']
+                # data has not changed since, and exports its weights if that was interrupted). In the paper
+                # protocol only once its training settings are known to be this command's (the check a resume
+                # makes); otherwise they are not compared, so this command's settings can differ for the next model.
+                if paper:
+                    try:
+                        refused = finished_settings_problem(sub, sp)
+                    except Exception as e:                  # noqa: BLE001  (e.g. an unreadable saved config)
+                        refused = f'its training settings could not be checked ({e!r})'
+                    settings_refused(sp, refused)
+                if not refused:
+                    log(f'{sub.run_name} has already finished (trained, predicted and evaluated): only its summary is '
+                        f'redone')
+                    stages = ['summary']
             # data stages are redone (--force) once; run stages for every model
-            rc_run = _drive(sub, sp, stages, redo if i == 0 else [s for s in redo if s in RUN_SCOPED])
+            if refused:
+                log(f'!! {sub.run_name} has finished, but not with this command\'s settings: {refused}')
+                sub.failed_stage, rc_run = 'train', 1          # this run only (left out of the paper tables)
+            else:
+                rc_run = _drive(sub, sp, stages, redo if i == 0 else [s for s in redo if s in RUN_SCOPED])
             if rc_run != 0:
                 failed.append(sub.run_name)
             if paper:
@@ -3122,7 +3326,9 @@ def paper_status(a, plans, failed=(), note=None):
         if last.get('generated'):
             analysed = last.get('analysed')
             lines += [f'Last analysis (paper_analysis.py): {last["generated"]}, '
-                      + (f'**failed**: {last.get("error")}. PAPER_RESULTS.md is from the last analysis that succeeded.'
+                      + (f'**incomplete**: {"; ".join(last["problems"])}. PAPER_RESULTS.md has everything else.'
+                         if not last.get('ok') and last.get('problems') and not last.get('error') else
+                         f'**failed**: {last.get("error")}. PAPER_RESULTS.md is from the last analysis that succeeded.'
                          if not last.get('ok') else
                          f'{analysed} finished run(s) in the tables'
                          + (f'; {finished - analysed} run(s) finished since then are not in them yet.'
@@ -3174,7 +3380,15 @@ def paper_outputs(a, plans):
         log(f'PAPER: all tables and figures are in {p.paper} (start with PAPER_RESULTS.md)')
     except Exception as e:                                  # noqa: BLE001
         rc = 1
-        log(f'!! paper_analysis.py failed ({e}); the runs themselves are intact - the next job redoes the analysis')
+        try:
+            status = json.loads((p.paper / 'analysis_status.json').read_text())
+        except (OSError, ValueError):
+            status = {}
+        if isinstance(status, dict) and status.get('problems') and not status.get('error'):
+            log(f'!! the paper analysis is incomplete: {"; ".join(status["problems"])[:2000]}. Everything else is '
+                f'in {p.paper} (see STATUS.md); the next job analyses again.')
+        else:
+            log(f'!! paper_analysis.py failed ({e}); the runs themselves are intact - the next job redoes the analysis')
     return rc
 
 

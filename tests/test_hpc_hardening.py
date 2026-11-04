@@ -1163,3 +1163,20 @@ def test_a_step_at_its_time_limit_always_fails_and_never_waits_for_its_output(tm
     with pytest.raises(pipeline.StageError) as e:
         pipeline.run(cmd, a, p, 'held', timeout=1)
     assert e.value.timed_out and 'time limit' in str(e.value) and time.time() - started < 25
+
+
+# ------------------------------------------------------------------ round 16: untimed steps whose output stays open
+@posix_only
+@pytest.mark.parametrize('code', [0, 3])
+def test_an_untimed_step_whose_child_keeps_its_output_open_ends_with_its_own_exit_code(tmp_path, monkeypatch, code):
+    monkeypatch.setattr(pipeline, 'PIPE_GRACE', 2)
+    a, p = argparse.Namespace(offline=True), pipeline.Paths(tmp_path, 'r')
+    cmd = ['bash', '-c', f'(sleep 60; echo late) & echo started; exit {code}']     # no time limit (like training)
+    started = time.time()
+    if code == 0:
+        assert pipeline.run(cmd, a, p, 'held') == 0
+    else:
+        with pytest.raises(pipeline.StageError) as e:
+            pipeline.run(cmd, a, p, 'held')
+        assert e.value.rc == code and not e.value.timed_out
+    assert time.time() - started < 25                                    # the grace period, then the group is stopped
