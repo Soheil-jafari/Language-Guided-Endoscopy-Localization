@@ -31,9 +31,13 @@ Deviations from the published QVHighlights recipe, and why (our videos are 30-10
     there: the pair is masked out, in both directions; adapted_criterion). In QVHighlights every query is
     unique and describes one moment, so the official loss needs no mask;
   * the GIoU span loss is computed for the aligned (prediction, target) pairs only (aligned_giou), not as the
-    diagonal of a positives x positives matrix: the same values and gradients, without the quadratic memory
-    (a Cholec80 batch can have about 12,000 positive clips, a QVHighlights batch a few hundred);
-  * the best epoch is chosen on the validation videos by window mAP (mean over tIoU 0.3, 0.5, 0.7).
+    diagonal of a positives x positives matrix: the same values and gradients for valid (non-degenerate) spans,
+    without the quadratic memory (a Cholec80 batch can have about 12,000 positive clips, a QVHighlights batch a
+    few hundred);
+  * the best epoch is chosen on the validation videos by window mAP (mean over tIoU 0.3, 0.5, 0.7), with the
+    model's own windows evaluated on the annotated frames only, exactly like the frame-derived segments: each
+    window is cut to the annotated regions it overlaps (window_map; the predict command saves them uncut, and
+    the paper analysis cuts them the same way when it evaluates them).
 Everything else (architecture, losses and their weights, optimiser, learning-rate schedule, dropout,
 feature normalisation, temporal-element features, NMS threshold) follows the published QVHighlights
 fine-tuning script (scripts/qvhl_pretrain.sh) and main/config.py.
@@ -59,10 +63,10 @@ sys.path.insert(0, str(HERE / 'official'))          # the official `model` and `
 
 from data_contract import AnnotationIndex, load_video_metadata, sample_indices, window_positions  # noqa: E402
 from comparison_models.frame_scores import manifest_pairs  # noqa: E402
-from metrics import temporal_ap  # noqa: E402
+from metrics import observed_regions, restrict_to_observed, temporal_ap  # noqa: E402
 from checkpoint_utils import atomic_write_text, commit_best, pending_best_path  # noqa: E402
 
-SCHEMA = 'univtg-adapter-4'               # 4: unannotated clips unsupervised (3: masked inter-video negatives)
+SCHEMA = 'univtg-adapter-5'               # 5: windows evaluated on annotated time (4: unannotated clips unsupervised)
 # Official QVHighlights fine-tuning settings (scripts/qvhl_pretrain.sh, main/config.py defaults), except as noted above.
 OFFICIAL = dict(dset_type='mr', train_path='ours', model_id='univtg', span_loss_type='l1', hidden_dim=1024,
                 enc_layers=4, dec_layers=2, dim_feedforward=1024, nheads=8, input_dropout=0.5, dropout=0.0,
@@ -112,8 +116,10 @@ def l2_normalize(x, eps=1e-5):
 # --------------------------------------------------------------------------- features
 def move_aside(out, files, why):
     """Move cached features whose origin is unknown or different into <out>/unverified-<time>-<pid>/ (kept, never
-    reused), so that they are computed again: an unattended job recovers by itself."""
-    files = [f for f in files if Path(f).exists()]
+    reused), so that they are computed again: an unattended job recovers by itself. The record (features.json) is
+    moved last: a stop in between leaves it with the features it describes, and the next run finishes the move.
+    Features found without a record are never adopted (feature_record)."""
+    files = sorted((f for f in files if Path(f).exists()), key=lambda f: Path(f).name == 'features.json')
     if not files:
         return None
     aside = Path(out) / f'unverified-{time.strftime("%Y%m%d-%H%M%S")}-{os.getpid()}'
@@ -143,6 +149,9 @@ def feature_record(out, weights_sha, sample_fps, extraction=None):
     wanted = dict(weights_sha256=weights_sha, sample_fps=sample_fps, dim=VIDEO_DIM, extraction=extraction,
                   description='M2CRL (pretrained, frozen) per-frame mean of patch tokens')
     old = None
+    if not info.exists():                               # features without a record (e.g. an interrupted move):
+        move_aside(out, [*out.glob('*.npy'), *out.glob('*.frames.json')],     # their origin is unknown
+                   f'{out}: cached features without a record')
     if info.exists():
         try:
             old = json.loads(info.read_text())
@@ -392,7 +401,8 @@ def build(args_dict, device):
 
 def aligned_giou(spans1, spans2):
     """generalized_temporal_iou(spans1, spans2).diagonal() of the official utils/span_utils.py - the same
-    operations for each aligned pair (row i with row i) - without building the N x N matrix."""
+    operations for each aligned pair (row i with row i) - without building the N x N matrix. Values and gradients
+    equal the official diagonal's for non-degenerate spans."""
     spans1 = spans1.float()
     spans2 = spans2.float()
     assert (spans1[:, 1] >= spans1[:, 0]).all()
@@ -513,10 +523,15 @@ def run_model(model, samples, device, batch_size, opt):
     return results
 
 
+def frame_times(sample):
+    """(start, end) in seconds of every sampled frame of a sample (the last ends at the video's end)."""
+    times = sample['grid'] / sample['source_fps']
+    return times, np.r_[times[1:], sample['duration']]
+
+
 def gt_spans(sample):
     """Ground-truth spans in seconds from the 1-fps labels: runs of positive frames, [first, last + 1 step)."""
-    times = sample['grid'] / sample['source_fps']
-    ends = np.r_[times[1:], sample['duration']]
+    times, ends = frame_times(sample)
     spans, start = [], None
     for i, v in enumerate(list(sample['labels'] == 1) + [False]):
         if v and start is None:
@@ -528,10 +543,15 @@ def gt_spans(sample):
 
 
 def window_map(model, samples, device, batch_size, opt):
+    """Window mAP (tIoU 0.3, 0.5, 0.7) on the validation samples, used to select the best epoch. The model's windows
+    are evaluated on the annotated time only (restrict_to_observed), as the ground truth and the frame-derived
+    segments are: a window is not penalised for unannotated time it covers."""
     preds, truth = {}, {}
     for s, (_, windows) in zip(samples, run_model(model, samples, device, batch_size, opt)):
         key = (s['video'], s['query'])
-        preds[key], truth[key] = windows, gt_spans(s)
+        times, ends = frame_times(s)
+        preds[key] = restrict_to_observed(windows, observed_regions(times, ends, np.asarray(s['labels']) != -100))
+        truth[key] = gt_spans(s)
     values = [temporal_ap(preds, truth, t) for t in (0.3, 0.5, 0.7)]
     return float(np.mean([v for v in values if v is not None])) if any(v is not None for v in values) else 0.0
 

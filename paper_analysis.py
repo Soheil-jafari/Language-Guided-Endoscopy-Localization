@@ -47,7 +47,7 @@ REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
 import paper_protocol as protocol  # noqa: E402
-from metrics import binary_metrics, temporal_iou  # noqa: E402
+from metrics import binary_metrics, observed_regions, restrict_to_observed, temporal_iou  # noqa: E402
 
 VERSION = 'paper-analysis-2'
 KEYS = ['video_id', 'text_query', 'frame_idx']
@@ -285,8 +285,9 @@ def segment_pairs(frames, scores, threshold, meta, min_duration, merge_gap, nati
         gt = [g[:2] for g in runs(times, ends, labels == 1, np.ones(len(times)))]
         if native is None:
             pred = runs(times, ends, positive, s, merge_gap, min_duration)
-        else:
-            pred = [[float(w[0]), float(w[1]), float(w[2])] for w in native[(video, query)]]
+        else:                                       # the method's own windows, cut to the annotated time
+            pred = restrict_to_observed([[float(w[0]), float(w[1]), float(w[2])] for w in native[(video, query)]],
+                                        observed_regions(times, ends, observed))
         truth = labels == 1
         frame_iou = float(np.sum(positive & truth) / np.sum(positive | truth)) if gt else None
         if native is not None:
@@ -1102,7 +1103,8 @@ def analyse(a, root, out, status):
                            'mAP: pooled over all video-query pairs; mIoU: tIoU of the top-1 segment; frame IoU: '
                            'Jaccard index of predicted and true frames; absent-query false alarms: share of '
                            'video-query pairs without the concept that still get a segment. UniVTG is also '
-                           'evaluated on its own windows (after its NMS).'), '']
+                           'evaluated on its own windows (after its NMS), on the annotated frames only, exactly like '
+                           'the frame-derived segments: each window is cut to the annotated regions it overlaps.'), '']
     report['segments'] = seg
 
     # ---- phase recognition and tool presence

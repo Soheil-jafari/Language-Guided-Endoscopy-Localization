@@ -3,6 +3,7 @@ job driver's failure isolation. Everything runs offline on synthetic data and ti
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 import zipfile
@@ -1361,6 +1362,7 @@ def test_univtg_features_are_bound_to_their_source_frames_and_extraction(tmp_pat
     meta = json.loads(d['metadata'].read_text())
     feats = tmp_path / 'features'
     feats.mkdir()
+    adapter.feature_record(feats, 'w', 1.0, adapter.extraction_signature(d['metadata'], 32, 4))   # (as the step)
     rng = np.random.default_rng(0)
     for v, m in meta.items():
         grid = sample_indices(m['frame_count'], m['source_fps'], 1.0)            # source frames 0, 25, 50, ...
@@ -1397,14 +1399,17 @@ def _finished(sp, plan_sets=('val', 'test')):
     sp.results.mkdir(parents=True, exist_ok=True)
     for s in ('train', 'predict', 'evaluate'):
         pipeline.write_json(sp.marker(s), {})
+    metrics = {k: 0.5 for k in pipeline.SUMMARY_KEYS}
     for name in plan_sets:
-        (sp.results / f'proposed_{name}.csv').write_text('video_id,text_query,frame_idx,time_sec,score,label\n')
-        (sp.results / f'proposed_{name}.csv.manifest.json').write_text('{}')
-        (sp.results / f'{name}_reference.csv').write_text('video_id,text_query,frame_idx,label\n')
-    (sp.results / 'proposed_calibration.json').write_text('{"threshold": 0.5}')
+        (sp.results / f'proposed_{name}.csv').write_text('video_id,text_query,frame_idx,time_sec,score,label\n'
+                                                          'v,q,0,0.0,0.4,1\nv,q,25,1.0,0.6,0\n')
+        (sp.results / f'proposed_{name}.csv.manifest.json').write_text(json.dumps(dict(parameters=1, seconds=1.0,
+                                                                                       frame_scores=2)))
+        (sp.results / f'{name}_reference.csv').write_text('video_id,text_query,frame_idx,label\nv,q,0,1\nv,q,25,0\n')
+    (sp.results / 'proposed_calibration.json').write_text(json.dumps(dict(metrics, split='validation')))
     for name in plan_sets:
         if name != 'val':
-            pipeline.metrics_file(sp, name).write_text('{}')
+            pipeline.metrics_file(sp, name).write_text(json.dumps(dict(metrics, split='test')))
 
 
 def test_a_finished_run_trained_with_other_settings_is_not_reused(tmp_path, monkeypatch):
@@ -1522,3 +1527,154 @@ def test_an_incomplete_analysis_says_so_and_one_failing_figure_costs_only_itself
     for fig in ('risk_coverage', 'training_dynamics', 'per_query_ap'):     # the others are still drawn
         assert (root / 'paper' / 'figures' / f'{fig}.png').exists(), fig
     assert not (root / 'paper' / 'figures' / 'reliability.png').exists()
+
+
+# --------------------------------------------------------------------------- round 17 (update 24)
+def _pair(labels):
+    """One UniVTG validation sample at 1 fps (frames 0..n-1 at 25 fps), as build_samples makes it."""
+    labels = np.asarray(labels)
+    return dict(video='v', query='q', grid=np.arange(len(labels)) * 25, source_fps=25.0, duration=float(len(labels)),
+                labels=labels)
+
+
+def test_univtg_own_windows_are_evaluated_on_annotated_time_only(monkeypatch):
+    from comparison_models.univtg import adapter
+    from metrics import observed_regions, restrict_to_observed, temporal_ap
+    s = _pair([1, 1, 1, 1, -100, -100, 1, 1, 1, 1])
+    assert adapter.gt_spans(s) == [[0.0, 4.0], [6.0, 10.0]]
+    times, ends = adapter.frame_times(s)
+    regions = observed_regions(times, ends, s['labels'] != -100)
+    cut = restrict_to_observed([[0.0, 10.0, 0.9]], regions)
+    assert cut == [[0.0, 4.0, 0.9], [6.0, 10.0, 0.9]]                    # one window per annotated piece
+    assert temporal_ap({'k': [[0.0, 10.0, 0.9]]}, {'k': adapter.gt_spans(s)}, 0.5) == 0.0      # uncut: penalised
+    assert temporal_ap({'k': cut}, {'k': adapter.gt_spans(s)}, 0.5) == 1.0
+    # window_map (the best-epoch selection) uses the same rule
+    monkeypatch.setattr(adapter, 'run_model', lambda model, samples, *a: [(None, [[0.0, 10.0, 0.9]]) for _ in samples])
+    assert adapter.window_map(None, [s], 'cpu', 1, None) == 1.0
+    # annotated negative time stays inside the window: still a false positive there
+    neg = _pair([1, 1, 0, 0, -100, -100, 0, 0, 0, 0])
+    t, e = adapter.frame_times(neg)
+    pieces = restrict_to_observed([[2.0, 4.0, 0.95], [0.0, 2.0, 0.8]], observed_regions(t, e, neg['labels'] != -100))
+    assert pieces == [[2.0, 4.0, 0.95], [0.0, 2.0, 0.8]]                  # kept whole
+    assert temporal_ap({'k': pieces}, {'k': [[0.0, 2.0]]}, 0.5) == 0.5      # the top window is a false positive
+    # a window entirely in unannotated time disappears without error
+    assert restrict_to_observed([[4.2, 5.8, 0.7]], regions) == []
+    # every frame annotated: everything exactly as before
+    full = _pair([1, 1, 0, 0, 1])
+    t, e = adapter.frame_times(full)
+    assert observed_regions(t, e, full['labels'] != -100) is None
+    windows = [[0.3, 2.7, 0.9], [3.9, 5.0, 0.2]]
+    assert restrict_to_observed(windows, None) == windows
+    monkeypatch.setattr(adapter, 'run_model', lambda model, samples, *a: [(None, windows) for _ in samples])
+    plain = {('v', 'q'): windows}
+    truth = {('v', 'q'): adapter.gt_spans(full)}
+    want = float(np.mean([v for v in (temporal_ap(plain, truth, x) for x in (0.3, 0.5, 0.7)) if v is not None]))
+    assert adapter.window_map(None, [full], 'cpu', 1, None) == want
+    assert adapter.SCHEMA == 'univtg-adapter-5'
+
+
+def test_the_segment_table_cuts_univtg_windows_to_annotated_time(tmp_path):
+    from types import SimpleNamespace
+    labels = np.array([1, 1, 1, 1, -100, -100, 1, 1, 1, 1])
+    frames = SimpleNamespace(groups=[(0, 10)], video_ids=['v'], video=np.zeros(10, np.int64), queries=['q'],
+                             query=np.zeros(10, np.int64), frame_idx=np.arange(10) * 25, label=labels)
+    meta = {'v': dict(source_fps=25.0, frame_count=250)}
+    pairs = pa.segment_pairs(frames, np.full(10, 0.9), 0.5, meta, 0, 0, native={('v', 'q'): [[0.0, 10.0, 0.9]]})
+    assert pairs[0]['pred'] == [[0.0, 4.0, 0.9], [6.0, 10.0, 0.9]] and pairs[0]['gt'] == [[0.0, 4.0], [6.0, 10.0]]
+    full = SimpleNamespace(**dict(vars(frames), label=np.array([1, 1, 1, 1, 0, 0, 1, 1, 1, 1])))
+    pairs = pa.segment_pairs(full, np.full(10, 0.9), 0.5, meta, 0, 0, native={('v', 'q'): [[0.0, 10.0, 0.9]]})
+    assert pairs[0]['pred'] == [[0.0, 10.0, 0.9]]                      # nothing unannotated: as before
+
+
+def test_an_interrupted_feature_migration_never_lets_old_features_be_adopted(tmp_path, monkeypatch):
+    from comparison_models.univtg import adapter
+    out = tmp_path / 'features'
+    out.mkdir()
+    adapter.feature_record(out, 'old', 1.0, {'metadata_sha256': 'a'})
+    grid = [0, 25, 50]
+    np.save(out / 'v1.npy', np.ones((3, 2)))
+    (out / 'v1.frames.json').write_text(json.dumps(grid))
+    # the state an interrupted move could leave: the record gone, the old arrays still there
+    (out / 'features.json').unlink()
+    adapter.feature_record(out, 'new', 1.0, {'metadata_sha256': 'b'})       # restart
+    assert not (out / 'v1.npy').exists() and not adapter.cached_frames_match(out, 'v1', grid)   # extracted again
+    assert any((d / 'v1.npy').exists() for d in out.glob('unverified-*'))
+    # a stop in the middle of a move: the record is moved last, so it still describes what is left
+    np.save(out / 'v2.npy', np.ones((3, 2)))
+    (out / 'v2.frames.json').write_text(json.dumps(grid))
+    real, moved = os.replace, []
+
+    def stop_after_first(src, dst):
+        if moved:
+            raise KeyboardInterrupt('test: the job is stopped')
+        moved.append(Path(src).name)
+        return real(src, dst)
+    monkeypatch.setattr(adapter.os, 'replace', stop_after_first)
+    with pytest.raises(KeyboardInterrupt):
+        adapter.feature_record(out, 'newer', 1.0, {'metadata_sha256': 'c'})
+    monkeypatch.setattr(adapter.os, 'replace', real)
+    assert moved[0] != 'features.json' and (out / 'features.json').exists()
+    adapter.feature_record(out, 'newer', 1.0, {'metadata_sha256': 'c'})        # the next job finishes the move
+    assert not list(out.glob('*.npy')) and not list(out.glob('*.frames.json'))
+    assert json.loads((out / 'features.json').read_text())['weights_sha256'] == 'newer'
+    adapter.feature_record(out, 'newer', 1.0, {'metadata_sha256': 'c'})        # and is quiet once done
+    assert json.loads((out / 'features.json').read_text())['weights_sha256'] == 'newer'
+
+
+
+@pytest.mark.parametrize('damage,stage', [
+    ('header-only predictions', 'predict'), ('row count differs from the manifest', 'predict'),
+    ('manifest without its keys', 'predict'), ('empty calibration', 'evaluate'),
+    ('calibration threshold not a probability', 'evaluate'), ('metrics without a key the summary reads', 'evaluate')])
+def test_damaged_but_valid_outputs_are_made_again_without_retraining(tmp_path, damage, stage):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu'])
+    base = pipeline.experiment_plans(a)[0]
+    sp = pipeline.Paths(tmp_path, base.run_name)
+    sets = [n for n, _ in pipeline.prediction_sets(base, sp)]
+    _finished(sp, sets)
+    assert pipeline.repair_outputs(base, sp) is None and pipeline.repair_outputs(base, sp) is None   # healthy: no loop
+    r = sp.results
+    if damage == 'header-only predictions':
+        (r / 'proposed_test.csv').write_text('video_id,text_query,frame_idx,time_sec,score,label\n')
+    elif damage == 'row count differs from the manifest':
+        with open(r / 'proposed_test.csv', 'a') as f:
+            f.write('v,q,50,2.0,0.5,1\n')
+    elif damage == 'manifest without its keys':
+        (r / 'proposed_test.csv.manifest.json').write_text('{}')
+    elif damage == 'empty calibration':
+        (r / 'proposed_calibration.json').write_text('{}')
+    elif damage == 'calibration threshold not a probability':
+        cal = json.loads((r / 'proposed_calibration.json').read_text())
+        (r / 'proposed_calibration.json').write_text(json.dumps(dict(cal, threshold=1.7)))
+    else:
+        m = json.loads((r / 'proposed_test_metrics.json').read_text())
+        del m['ece']
+        (r / 'proposed_test_metrics.json').write_text(json.dumps(m))
+    assert pipeline.repair_outputs(base, sp) == stage
+    assert sp.marker('train').exists() and not sp.marker('evaluate').exists()
+    assert sp.marker('predict').exists() == (stage == 'evaluate')
+    _finished(sp, sets)                                                     # made again: healthy, left alone
+    assert pipeline.repair_outputs(base, sp) is None and sp.marker('predict').exists() and sp.marker('evaluate').exists()
+
+
+def test_the_status_page_never_counts_a_refused_run_as_finished(tmp_path, monkeypatch):
+    a = _args(['--preset', 'paper', '--root', str(tmp_path), '--single-job', '--allow-cpu'])
+    subs = pipeline.experiment_plans(a)
+    plans = [(s, pipeline.Paths(tmp_path, s.run_name)) for s in subs]
+    for _, sp in plans[:2]:
+        _finished(sp, ['val', 'test'])
+    pipeline.settings_refused(plans[0][1], 'Run "x" already exists with different settings ([\'TRAIN\'])')
+    pipeline.paper_status(a, plans)
+    status = (tmp_path / 'paper' / 'STATUS.md').read_text()
+    assert 'Runs finished: **1 of 20**' in status
+    assert f'| 1 | {subs[0].run_name} |' in status and 'refused (left out of the tables)' in status
+    assert f'| 2 | {subs[1].run_name} | {subs[1].label} | finished |' in status
+    # explanation maps are made only for finished runs that were not refused
+    launched = []
+    monkeypatch.setattr(pipeline, 'run', lambda cmd, a_, p, name, **k: launched.append(name))
+    for _, sp in plans[:2]:
+        (sp.run / 'best_model.pth').parent.mkdir(parents=True, exist_ok=True)
+        (sp.run / 'best_model.pth').write_bytes(b'x')
+    a.run_name_given = False
+    pipeline.paper_outputs(a, plans)
+    assert 'paper_explain_baseline_s42' not in launched and 'paper_explain_advanced_s42' in launched

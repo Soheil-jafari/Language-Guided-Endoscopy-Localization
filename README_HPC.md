@@ -126,13 +126,17 @@ settings than the protocol's, is left out of the tables with the reason, never t
 figure that fails costs only itself. The analysis then still writes everything else, but
 `paper/analysis_status.json` says `ok: false` with the reasons and the job ends with exit code 1 (runs that
 have simply not finished yet are no failure). `paper/STATUS.md` says, after every run and at the end of every job,
-which runs have finished, when the tables were last written and from how many runs; a job stopped by its
+which runs have finished (a run refused for its training settings is shown as refused, not finished),
+when the tables were last written and from how many runs; a job stopped by its
 time limit only updates `STATUS.md` (no analysis in its last minutes) and the next job rewrites the
 tables. The report bundle in `lgel_paper/outbox/` includes them.
 * **Missing outputs repair themselves.** At the start of every job each finished run's outputs are checked
-  (per prediction set: the predictions, their manifest and the reference labels; then the calibration and the
-  metrics). If one is missing or unreadable, that run's predictions and evaluation (or only its evaluation)
-  are made again by the same job from its trained model; its training is never touched.
+  (per prediction set: the predictions - their columns and at least one row, as many as their manifest records
+  where it records them -, their manifest and the reference labels; then the calibration - its validation split
+  and a threshold between 0 and 1 - and the metrics, with the values the summary reads). If one is missing,
+  unreadable, empty or inconsistent, that run's predictions and evaluation (or only its evaluation) are made
+  again by the same job from its trained model; its training is never touched. A prediction file is read whole
+  only when it has changed since the last check (`state/output_rows.json`).
 
 * **Nothing is downloaded twice.** The first job reuses the Cholec80 videos already unpacked in
   `lgel/raw/extracted` and the M2CRL weights file the earlier runs used (`submit.sh` prints both); the
@@ -456,7 +460,7 @@ The per-step logs in `<root>/logs/` contain the full output of every underlying 
 
 ## 10. What has and has not been verified
 
-**Verified** with the automated tests in `tests/` (315 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
+**Verified** with the automated tests in `tests/` (326 at the time of writing) plus end-to-end runs on synthetic Cholec80-format data with a
 deliberately **tiny** model on CPU:
 
 * **The complete chain:** download/extract, frame extraction, annotation repair, splits, audit, training, prediction, evaluation and summary.

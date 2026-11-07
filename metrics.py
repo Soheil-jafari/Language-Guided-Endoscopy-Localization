@@ -92,6 +92,32 @@ def temporal_iou(a,b):
     return intersection/max(a[1]-a[0]+b[1]-b[0]-intersection,1e-12)
 
 
+def observed_regions(times,ends,observed):
+    """[start, end] of every connected run of annotated frames of one video-query pair (frame i covers
+    [times[i], ends[i])), or None when every frame is annotated (then nothing needs restricting)."""
+    observed=np.asarray(observed,dtype=bool)
+    if observed.all(): return None
+    regions,start=[],None
+    for i,v in enumerate(list(observed)+[False]):
+        if v and start is None: start=i
+        if not v and start is not None:
+            regions.append((float(times[start]),float(ends[i-1]))); start=None
+    return regions
+
+
+def restrict_to_observed(proposals,regions):
+    """A method's own scored windows [start, end, score] on the annotated time of their pair only: each window is
+    cut to every connected annotated region it overlaps (one window per piece, same score); unannotated time is
+    removed, annotated negative time stays. regions=None (every frame annotated): the windows unchanged."""
+    if regions is None: return [list(p) for p in proposals]
+    out=[]
+    for p in proposals:
+        for r0,r1 in regions:
+            a,b=max(float(p[0]),r0),min(float(p[1]),r1)
+            if b>a: out.append([a,b,p[2]])
+    return out
+
+
 def temporal_ap(predictions,ground_truth,iou_threshold=.5):
     """Pooled AP over explicitly supplied video-query pairs; each item is a span list.
     Pred spans are [start,end,score], GT spans [start,end]. Empty GT still costs FP.

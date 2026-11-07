@@ -35,10 +35,12 @@ import concurrent.futures as cf
 import contextlib
 import errno
 import hashlib
+import importlib
 import json
 import math
 import os
 import platform
+import queue
 import re
 import shutil
 import signal
@@ -309,13 +311,21 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
             log(f'!! {name} is still running after {timeout / 60:.0f} min: stopping it')
             stop_process_group(proc)                 # the whole group, even if its first process has ended
 
-    def pump(lf):
-        for line in proc.stdout:
-            line = redact(line)
-            console(line)
-            lf.write(line)
-            if on_line is not None:
-                on_line(line)
+    lines, closed = queue.Queue(), threading.Event()
+    done = object()                                  # (the reader's end-of-output mark)
+
+    def reader():
+        # Only reads: every line goes to this step's own thread, which writes the log, the console and calls
+        # on_line. Once that thread has stopped forwarding (`closed`), late output is read and dropped.
+        try:
+            for line in proc.stdout:
+                if not closed.is_set():
+                    lines.put(line)
+        except Exception as e:                       # noqa: BLE001  (e.g. the pipe closed under it: reported)
+            if not closed.is_set():
+                lines.put(e)
+        finally:
+            lines.put(done)
     try:
         with open(logfile, 'a') as lf:
             lf.write(f'\n===== {time.ctime()} :: {shown}\n')
@@ -328,41 +338,47 @@ def run(cmd, a, p, name, progress_path=None, heartbeat=600, env=None, on_line=No
             # it started keeps open: once its first process has ended, the rest gets PIPE_GRACE seconds to close
             # it, then what is left of its process group is stopped (only then - a running training or prediction
             # is never limited). With a time limit, output held by a process outside the group (it left the
-            # group) is no longer waited for once the group has been stopped.
-            failure = []
-
-            def reader():
-                try:
-                    pump(lf)
-                except BaseException as e:           # noqa: BLE001  (re-raised below, in this thread)
-                    failure.append(e)
-            pumping = threading.Thread(target=reader, daemon=True)
-            pumping.start()
+            # group) is no longer waited for once the group has been stopped. The lines are written here, in
+            # this thread, so nothing is written after the log file is closed and on_line is never called late.
+            threading.Thread(target=reader, daemon=True).start()
             if timeout is not None:
                 watcher = threading.Thread(target=watchdog, daemon=True)
                 watcher.start()
-            ended = None
-            while pumping.is_alive():
-                pumping.join(0.5)
-                if not pumping.is_alive():
+            ended, drain_until = None, None
+            while True:
+                try:
+                    item = lines.get(timeout=0.5)
+                except queue.Empty:
+                    item = None
+                if item is done:
                     break
+                if isinstance(item, Exception):
+                    raise item
+                if item is not None:
+                    line = redact(item)
+                    console(line)
+                    lf.write(line)
+                    if on_line is not None:
+                        on_line(line)
+                if drain_until is not None:              # the group has been stopped: a last few seconds
+                    if time.monotonic() > drain_until:
+                        log(f'!! {name}: its output is still held open by a process outside its group; not waiting')
+                        break
+                    continue
                 if timed_out.is_set() and not watcher.is_alive():
-                    log(f'!! {name}: its output is still held open by a process outside its group; not waiting')
-                    break
+                    drain_until = time.monotonic() + 5
+                    continue
                 if ended is None and proc.poll() is not None:
                     ended = time.monotonic()
                 if ended is not None and time.monotonic() - ended > PIPE_GRACE:
                     log(f'!! {name}: its first process ended (exit code {proc.returncode}) {PIPE_GRACE} s ago, but '
                         f'something it started still holds its output open: stopping what is left of it')
                     stop_process_group(proc)
-                    pumping.join(5)
-                    if pumping.is_alive():
-                        log(f'!! {name}: its output is still held open by a process outside its group; not waiting')
-                    break
-            if failure:
-                raise failure[0]
+                    drain_until = time.monotonic() + 5
+            closed.set()
             rc = proc.wait()
     except BaseException:
+        closed.set()
         if proc is not None:                         # even if its first process has already ended
             try:
                 if proc.poll() is None:
@@ -1476,7 +1492,7 @@ def _check_advanced(cfg_path, batch=2, report=None):
     try:
         import mamba_ssm
         if not on_cpu:
-            import selective_scan_cuda  # noqa: F401  pyflakes: ignore (Mamba's compiled GPU kernels)
+            importlib.import_module('selective_scan_cuda')        # Mamba's compiled GPU kernels must load
     except Exception as e:                                      # noqa: BLE001
         print(f'MAMBA NOT AVAILABLE: {e!r}', flush=True)
         sys.exit(MAMBA_MISSING)
@@ -2185,6 +2201,17 @@ def finished_settings_problem(a, p):
     return comparison_settings_problem(a, p)
 
 
+def settings_refusal(p):
+    """Why this run was refused for its training settings (settings_refused), or None."""
+    f = p.results / 'settings_refused.json'
+    if not f.exists():
+        return None
+    try:
+        return str(json.loads(f.read_text()).get('problem') or 'see settings_refused.json')
+    except (OSError, ValueError, AttributeError):
+        return 'see settings_refused.json'
+
+
 def settings_refused(p, problem):
     """Record (or clear, with problem=None) that this run's training settings do not match this invocation's:
     the paper analysis leaves such a run out of the tables, with the reason."""
@@ -2252,40 +2279,102 @@ def metrics_file(p, name):
 
 
 def _usable_csv(path, columns):
-    """A prediction or reference file that can be read: present, with these columns in its header."""
+    """A prediction or reference file that can be used: present, with these columns in its header and at least one
+    data row (two lines are read, not the file)."""
     try:
         with open(path, errors='replace') as f:
             header = f.readline().strip().split(',')
+            first = f.readline().strip()
     except OSError:
         return False
-    return all(c in header for c in columns)
+    return all(c in header for c in columns) and bool(first)
 
 
-def _usable_json(path):
+def _json_object(path):
+    """The JSON object in `path`, or None if it is missing, unreadable or not an object."""
     try:
-        json.loads(Path(path).read_text())
-        return True
+        value = json.loads(Path(path).read_text())
     except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+# The keys of evaluate.py's output that are read later: the run's summary reads all of these from the calibration
+# (validation) and the test metrics, the other test sets' rows of it these (stage_summary).
+SUMMARY_KEYS = ('n', 'positives', 'threshold', 'average_precision', 'auroc', 'f1', 'precision', 'recall', 'brier', 'ece')
+UNSEEN_KEYS = ('average_precision', 'auroc', 'f1', 'precision', 'recall')
+# Every method's prediction manifest has these (the efficiency table reads them); frame_scores, where a method
+# records it, is the number of rows of its prediction file.
+MANIFEST_KEYS = ('parameters', 'seconds')
+
+
+def _usable_calibration(path):
+    m = _json_object(path)
+    if m is None or m.get('split') != 'validation' or not all(k in m for k in SUMMARY_KEYS):
         return False
+    t = m.get('threshold')
+    return isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 0 <= t <= 1
+
+
+def _csv_rows(path, counts):
+    """Data rows of a CSV file, counted by streaming its bytes once; `counts` ({path: [size, mtime_ns, rows]}, kept
+    in <root>/state/output_rows.json) spares the count while the file is unchanged."""
+    st = Path(path).stat()
+    key = str(path)
+    known = counts.get(key)
+    if isinstance(known, list) and known[:2] == [st.st_size, st.st_mtime_ns]:
+        return known[2]
+    lines, last = 0, b'\n'
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 22), b''):
+            lines += block.count(b'\n')
+            last = block[-1:]
+    rows = lines - 1 + (last != b'\n')                  # (a last line without its newline is a row too)
+    counts[key] = [st.st_size, st.st_mtime_ns, rows]
+    return rows
 
 
 def damaged_outputs(a, p):
-    """For an evaluated run: ('predict' or 'evaluate' - the first stage to redo -, the files missing or unreadable),
-    or (None, []) when every expected output is there: per prediction set the predictions, their manifest and the
-    reference labels (predict), then the calibration and the metrics (evaluate)."""
+    """For an evaluated run: ('predict' or 'evaluate' - the first stage to redo -, the files missing or unusable),
+    or (None, []) when every expected output is usable: per prediction set the predictions (their columns and at
+    least one row - as many as their manifest records, where it records them), their manifest and the reference
+    labels (predict); then the calibration (its validation split and a threshold in [0, 1]) and the metrics of
+    every test set (the keys the summary reads) (evaluate). Cheap enough for every job: a prediction file is read
+    whole only when it has changed since it was last counted."""
     sets = prediction_sets(a, p)
+    record = p.state / 'output_rows.json'
+    counts = _json_object(record) or {}
+    before = dict(counts)
     bad = []
     for name, _ in sets:
-        if not _usable_csv(p.results / f'proposed_{name}.csv', ('video_id', 'text_query', 'frame_idx', 'score')):
-            bad.append(f'proposed_{name}.csv')
-        if not _usable_json(p.results / f'proposed_{name}.csv.manifest.json'):
+        pred = p.results / f'proposed_{name}.csv'
+        if not _usable_csv(pred, ('video_id', 'text_query', 'frame_idx', 'score')):
+            bad.append(pred.name)
+        manifest = _json_object(p.results / f'proposed_{name}.csv.manifest.json')
+        if manifest is None or not all(k in manifest for k in MANIFEST_KEYS):
             bad.append(f'proposed_{name}.csv.manifest.json')
+        elif pred.name not in bad and isinstance(manifest.get('frame_scores'), int):
+            try:
+                rows = _csv_rows(pred, counts)
+            except OSError:
+                rows = None
+            if rows != manifest['frame_scores']:
+                bad.append(f'{pred.name} ({rows} rows, its manifest records {manifest["frame_scores"]})')
         if not _usable_csv(p.results / f'{name}_reference.csv', ('video_id', 'text_query', 'frame_idx', 'label')):
             bad.append(f'{name}_reference.csv')
+    if counts != before:
+        try:
+            write_json(record, counts)
+        except OSError:
+            pass
     if bad:
         return 'predict', bad
-    bad = [f.name for f in [p.results / 'proposed_calibration.json'] + [metrics_file(p, n) for n, _ in sets if n != 'val']
-           if not _usable_json(f)]
+    bad = [] if _usable_calibration(p.results / 'proposed_calibration.json') else ['proposed_calibration.json']
+    for name, _ in sets:
+        if name != 'val':
+            m = _json_object(metrics_file(p, name))
+            if m is None or not all(k in m for k in (SUMMARY_KEYS if name == 'test' else UNSEEN_KEYS)):
+                bad.append(metrics_file(p, name).name)
     return ('evaluate', bad) if bad else (None, [])
 
 
@@ -3304,10 +3393,13 @@ def paper_status(a, plans, failed=(), note=None):
         p = plans[0][1]
         rows, finished = [], 0
         for sub, sp in plans:
-            if model_finished(sp):
-                state, finished = 'finished', finished + 1
+            refused = settings_refusal(sp)
+            if refused:                                     # complete outputs, but not this protocol's settings
+                state = f'refused (left out of the tables): {refused}'
             elif sub.run_name in failed:
                 state = 'failed in this job (retried by the next job)'
+            elif model_finished(sp):
+                state, finished = 'finished', finished + 1
             elif sp.run_inputs.exists():
                 state = 'started'
             else:
@@ -3360,7 +3452,7 @@ def paper_outputs(a, plans):
     prefix = a.run_name if a.run_name_given else 'paper'
     for key in (f'baseline_s{protocol.MAIN_SEED}', f'advanced_s{protocol.MAIN_SEED}'):
         sub, sp = by_name.get(f'{prefix}_{key}', (None, None))
-        if sp is None or not model_finished(sp) or not (sp.run / 'best_model.pth').exists():
+        if sp is None or not model_finished(sp) or settings_refusal(sp) or not (sp.run / 'best_model.pth').exists():
             continue
         out = p.paper / 'explanations' / key
         try:

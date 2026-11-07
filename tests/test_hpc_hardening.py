@@ -1180,3 +1180,26 @@ def test_an_untimed_step_whose_child_keeps_its_output_open_ends_with_its_own_exi
             pipeline.run(cmd, a, p, 'held')
         assert e.value.rc == code and not e.value.timed_out
     assert time.time() - started < 25                                    # the grace period, then the group is stopped
+
+
+@posix_only
+def test_late_output_after_the_grace_is_dropped_never_written_after_the_log_closes(tmp_path, monkeypatch, capsys):
+    import threading as _threading
+    monkeypatch.setattr(pipeline, 'PIPE_GRACE', 1)
+    errors = []
+    monkeypatch.setattr(_threading, 'excepthook', lambda args: errors.append(args.exc_value))
+    a, p = argparse.Namespace(offline=True), pipeline.Paths(tmp_path, 'r')
+    seen, returned = [], []
+
+    def on_line(line):
+        seen.append((line.strip(), bool(returned)))
+    # an escaped descendant (its own session) keeps the output open and writes after the grace
+    cmd = ['bash', '-c', 'setsid bash -c "sleep 9; echo LATE-LINE" & echo early; exit 4']
+    with pytest.raises(pipeline.StageError) as e:
+        pipeline.run(cmd, a, p, 'escaped', on_line=on_line)
+    returned.append(True)
+    assert e.value.rc == 4 and not e.value.timed_out
+    time.sleep(6)                                                       # the late line is written meanwhile
+    assert ('early', False) in seen and not any(x == 'LATE-LINE' for x, _ in seen)
+    assert 'LATE-LINE' not in [x.strip() for x in (p.logs / 'escaped.log').read_text().splitlines()]
+    assert 'LATE-LINE' not in [x.strip() for x in capsys.readouterr().out.splitlines()] and not errors
